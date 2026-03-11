@@ -7,8 +7,10 @@ import sys
 import torch
 
 from megatron.core import Timers
+from megatron.core.config import set_experimental_flag
+from megatron.core.energy_monitor import EnergyMonitor
 from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator, unset_num_microbatches_calculator
-from megatron.training import dist_signal_handler
+from megatron.training.dist_signal_handler import DistributedSignalHandler
 from megatron.training.tokenizer import build_tokenizer
 
 _GLOBAL_ARGS = None
@@ -18,7 +20,9 @@ _GLOBAL_WANDB_WRITER = None
 _GLOBAL_ONE_LOGGER = None
 _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
+_GLOBAL_ENERGY_MONITOR = None
 _GLOBAL_SIGNAL_HANDLER = None
+_GLOBAL_INTERNALS_LOGGER = None
 
 def get_args():
     """Return arguments."""
@@ -60,16 +64,27 @@ def get_timers():
     _ensure_var_is_initialized(_GLOBAL_TIMERS, 'timers')
     return _GLOBAL_TIMERS
 
+def get_energy_monitor():
+    """Return energy monitor."""
+    _ensure_var_is_initialized(_GLOBAL_ENERGY_MONITOR, 'energy monitor')
+    return _GLOBAL_ENERGY_MONITOR
 
 def get_signal_handler():
     _ensure_var_is_initialized(_GLOBAL_SIGNAL_HANDLER, 'signal handler')
     return _GLOBAL_SIGNAL_HANDLER
 
 
-def _set_signal_handler():
+def get_internals_logger():
+    """Return internals logger. It can be None so no need
+    to check if it is initialized."""
+    return _GLOBAL_INTERNALS_LOGGER
+
+
+def _set_signal_handler(exit_signal):
+
     global _GLOBAL_SIGNAL_HANDLER
     _ensure_var_is_not_initialized(_GLOBAL_SIGNAL_HANDLER, 'signal handler')
-    _GLOBAL_SIGNAL_HANDLER = dist_signal_handler.DistributedSignalHandler().__enter__()
+    _GLOBAL_SIGNAL_HANDLER = DistributedSignalHandler(exit_signal).__enter__()
 
 
 
@@ -96,9 +111,14 @@ def set_global_variables(args, build_tokenizer=True):
     _set_one_logger(args)
     _set_adlr_autoresume(args)
     _set_timers(args)
+    _set_energy_monitor(args)
+    _set_internals_logger(args)
+
+    if args.enable_experimental:
+        set_experimental_flag(True)
 
     if args.exit_signal_handler:
-        _set_signal_handler()
+        _set_signal_handler(args.exit_signal)
 
 
 def unset_global_variables():
@@ -115,7 +135,9 @@ def unset_global_variables():
     global _GLOBAL_ONE_LOGGER
     global _GLOBAL_ADLR_AUTORESUME
     global _GLOBAL_TIMERS
+    global _GLOBAL_ENERGY_MONITOR
     global _GLOBAL_SIGNAL_HANDLER
+    global _GLOBAL_INTERNALS_LOGGER
 
     _GLOBAL_ARGS = None
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
@@ -125,7 +147,9 @@ def unset_global_variables():
     _GLOBAL_ONE_LOGGER = None
     _GLOBAL_ADLR_AUTORESUME = None
     _GLOBAL_TIMERS = None
+    _GLOBAL_ENERGY_MONITOR = None
     _GLOBAL_SIGNAL_HANDLER = None
+    _GLOBAL_INTERNALS_LOGGER = None
 
     unset_num_microbatches_calculator()
 
@@ -183,11 +207,19 @@ def _set_wandb_writer(args):
         else:
             # Defaults to the save dir.
             save_dir = os.path.join(args.save, 'wandb')
+        wandb_config = vars(args)
+        if 'kitchen_config_file' in wandb_config and wandb_config['kitchen_config_file'] is not None:
+            # Log the contents of the config for discovery of what the quantization
+            # settings were.
+            with open(wandb_config['kitchen_config_file'], "r") as f:
+                wandb_config['kitchen_config_file_contents'] = f.read()
         wandb_kwargs = {
             'dir': save_dir,
             'name': args.wandb_exp_name,
             'project': args.wandb_project,
-            'config': vars(args)}
+            'config': wandb_config}
+        if args.wandb_entity:
+            wandb_kwargs['entity'] = args.wandb_entity
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
         wandb.init(**wandb_kwargs)
         _GLOBAL_WANDB_WRITER = wandb
@@ -241,6 +273,39 @@ def _set_timers(args):
     _ensure_var_is_not_initialized(_GLOBAL_TIMERS, 'timers')
     _GLOBAL_TIMERS = Timers(args.timing_log_level, args.timing_log_option)
 
+def _set_energy_monitor(args):
+    """Initialize energy monitor."""
+    global _GLOBAL_ENERGY_MONITOR
+    _ensure_var_is_not_initialized(_GLOBAL_ENERGY_MONITOR, 'energy monitor')
+    _GLOBAL_ENERGY_MONITOR = EnergyMonitor()
+
+
+def _set_internals_logger(args):
+    """Initialize internals logger for model internals logging to W&B."""
+    global _GLOBAL_INTERNALS_LOGGER
+    _ensure_var_is_not_initialized(_GLOBAL_INTERNALS_LOGGER, 'internals logger')
+
+    if getattr(args, 'log_model_internals', False):
+        # Initialize on ALL ranks so all DP ranks can participate in gradient
+        # metric all-reduce. Only the logging rank (last rank) writes to W&B.
+        from megatron.training.internals_logging import (
+            InternalsLoggingConfig,
+            InternalsHookManager,
+            InternalsStateManager,
+            InternalsLogger,
+        )
+
+        is_logging_rank = (args.rank == (args.world_size - 1))
+        config = InternalsLoggingConfig.from_args(args)
+        hook_manager = InternalsHookManager(config)
+        state_manager = InternalsStateManager(weights_on_gpu=config.weights_on_gpu)
+        _GLOBAL_INTERNALS_LOGGER = InternalsLogger(
+            config, hook_manager, state_manager, is_logging_rank=is_logging_rank,
+        )
+
+        if args.rank == 0:
+            print('> setting up model internals logger ...', flush=True)
+
 
 def _ensure_var_is_initialized(var, name):
     """Make sure the input variable is not None."""
@@ -273,5 +338,11 @@ def destroy_global_vars():
     global _GLOBAL_TIMERS
     _GLOBAL_TIMERS = None
 
+    global _GLOBAL_ENERGY_MONITOR
+    _GLOBAL_ENERGY_MONITOR = None
+
     global _GLOBAL_SIGNAL_HANDLER
     _GLOBAL_SIGNAL_HANDLER = None
+
+    global _GLOBAL_INTERNALS_LOGGER
+    _GLOBAL_INTERNALS_LOGGER = None

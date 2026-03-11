@@ -1,5 +1,9 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+from typing import TypeVar
+
 import torch
+
+T = TypeVar('T')
 
 
 class IdentityOp(torch.nn.Module):
@@ -7,11 +11,30 @@ class IdentityOp(torch.nn.Module):
     This is a placeholder for IdentityOp(x) -> x
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: object, **kwargs: object):
         super().__init__()
 
-    def forward(self, x, *args, **kwargs):
+    def forward(self, x: T, *args: object, **kwargs: object) -> T:
+        """Forward pass.
+
+        Returns x unchanged.
+        """
         return x
+
+
+class LoggingProbe(IdentityOp):
+    """Identity op that marks a point in the forward pass for activation logging.
+
+    When placed in a model's forward path, hook managers can detect instances of
+    this class via isinstance() and register forward hooks on them. The probe
+    stores metadata (logging_name, layer_number) so hook registration doesn't
+    need hardcoded knowledge of the model architecture.
+    """
+
+    def __init__(self, logging_name: str, layer_number: int):
+        super().__init__()
+        self.logging_name = logging_name
+        self.layer_number = layer_number
 
 
 class IdentityFuncOp(IdentityOp):
@@ -21,8 +44,12 @@ class IdentityFuncOp(IdentityOp):
     return a function at runtime based on passed arguments
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: object, **kwargs: object):
         super().__init__()
 
-    def forward(self, *args, **kwargs):
+    def forward(self, *args: object, **kwargs: object):
+        """Forward pass.
+
+        Returns a function which returns its first argument unchanged, and discards all others.
+        """
         return super().forward
