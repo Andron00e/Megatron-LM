@@ -22,6 +22,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.serialization import get_default_load_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import \
     FullyParallelSaveStrategyWrapper, FullyParallelLoadStrategyWrapper
+from megatron.core.dist_checkpointing.core import OldXieluException
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.utils import is_float8tensor
 from megatron.core.rerun_state_machine import get_rerun_state_machine
@@ -423,6 +424,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         )
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
+        state_dict['tokens_so_far'] = args.consumed_train_samples * args.seq_length
         if ckpt_type == CheckpointType.GLOBAL:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 # TODO Handle non-empty directories (e.g., after a crash during saving).
@@ -852,24 +854,28 @@ def _load_base_checkpoint(
     non_persistent_iteration = _get_non_persistent_iteration(
         non_persistent_global_dir, args, checkpointing_context
     )
-    iteration, release = -1, False
-    tracker_filename = 'because load directory is not defined'
-    if load_dir is not None:
-        tracker_filename = get_checkpoint_tracker_filename(load_dir)
-        if os.path.isfile(tracker_filename):
-            iteration, release = read_metadata(tracker_filename)
-    if non_persistent_iteration != -1:  # there is a non-persistent checkpoint
-        if non_persistent_iteration >= iteration:
-            return _load_non_persistent_base_checkpoint(
-                non_persistent_global_dir,
-                args,
-                rank0,
-                sharded_state_dict,
-                non_persistent_iteration,
-                checkpointing_context,
-            )
-        else:
-            print_rank_0('WARNING: non-persistent checkpoints are older than persistent checkpoint')
+    if args.ckpt_step is None:
+        iteration, release = -1, False
+        tracker_filename = 'because load directory is not defined'
+        if load_dir is not None:
+            tracker_filename = get_checkpoint_tracker_filename(load_dir)
+            if os.path.isfile(tracker_filename):
+                iteration, release = read_metadata(tracker_filename)
+        if non_persistent_iteration != -1:  # there is a non-persistent checkpoint
+            if non_persistent_iteration >= iteration:
+                return _load_non_persistent_base_checkpoint(
+                    non_persistent_global_dir,
+                    args,
+                    rank0,
+                    sharded_state_dict,
+                    non_persistent_iteration,
+                    checkpointing_context,
+                )
+            else:
+                print_rank_0('WARNING: non-persistent checkpoints are older than persistent checkpoint')
+    else:
+        iteration = args.ckpt_step
+        release = False
 
     # Otherwise we are dealing with global checkpoints
     # If no tracker file, return nothing
@@ -909,7 +915,7 @@ def _load_base_checkpoint(
     else:
         checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=False)
     try:
-        state_dict = torch.load(checkpoint_name, map_location='cpu')
+        state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
     except ModuleNotFoundError:
         from megatron.legacy.fp16_deprecated import loss_scaler
 
@@ -998,7 +1004,7 @@ def load_args_from_checkpoint(
     # Model args.
     _set_arg('num_layers')
     _set_arg('hidden_size')
-    _set_arg('ffn_hidden_size')
+    _set_arg('ffn_hidden_size', force=True)
     _set_arg('seq_length')
     _set_arg('num_attention_heads')
     _set_arg('num_query_groups', force=True)
@@ -1021,6 +1027,8 @@ def load_args_from_checkpoint(
     _set_arg('apply_query_key_layer_scaling', force=True)
     _set_arg('attention_dropout', force=True)
     _set_arg('hidden_dropout', force=True)
+
+    _set_arg('norm_epsilon', force=True)
 
     _set_arg('hybrid_override_pattern', force=True)
     _set_arg('spec', force=True)
@@ -1046,6 +1054,21 @@ def load_args_from_checkpoint(
 
     # Checkpoint args.
     _set_arg('ckpt_format')
+
+    # OP architecture.
+    _set_arg('qk_layernorm', force=True)
+    _set_arg('use_torchqknorm', force=True)
+    _set_arg('no_persist_layer_norm', force=True)
+    _set_arg('attn_layernorm', force=True)
+    _set_arg('mlp_layernorm', force=True)
+    _set_arg('final_layernorm', force=True)
+    _set_arg('post_layernorm', force=True)
+
+    _set_arg('qknorm_impl', force=True)
+    _set_arg('xielu', force=True)
+    _set_arg('layernorm_init', force=True)
+    _set_arg('input_embeddings_multiplier', force=True)
+    _set_arg('use_rope_scaling', force=True)
 
     # Model parallelism args.
     if args.use_mp_args_from_checkpoint_args:
@@ -1186,7 +1209,9 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
             # [ModelOpt]: IMPORTANT! Restoring modelopt_state (sharded or not) must be performed
             # after the model instance has been created and before _load_base_checkpoint is called.
-            if has_nvidia_modelopt:
+            
+            # NOTE(tj.solergibert) We started training with NGC25.01 which evaluated to False, but now in recent versions it's available. Hardcode to False, otherwise it will raise a error with virtual pipeline parallelism
+            if False: #has_nvidia_modelopt:
                 if ckpt_type == CheckpointType.LOCAL:
                     raise NotImplementedError('Local checkpointing does not support model opt')
                 if not args.use_dist_ckpt:
@@ -1209,15 +1234,28 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             # When "--fp8-param-gather" is disabled, this function doesn't modify anything.
             fix_fp8_params_lose_precision_when_loading_dist_ckpt(load_kwargs['sharded_state_dict'])
 
-    state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
-        load_dir, args, rank0=False, checkpointing_context=checkpointing_context,
-        **load_kwargs
-    )
+    if args.fix_old_xielu:
+       fix_xielu_weights(load_kwargs["sharded_state_dict"])
+
+    try:
+        state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
+            load_dir, args, rank0=False, checkpointing_context=checkpointing_context,
+            **load_kwargs
+        )
+    except BaseException as ex:
+        if len(ex.args) < 2 or len(ex.args[1]) == 0 or len(ex.args[1][0]) == 0 or not isinstance(ex.args[1][0][0], OldXieluException):
+            # We only want to handle OldXieluException here so we just raise any other exception directly.
+            raise ex
+        fix_xielu_weights(load_kwargs["sharded_state_dict"])
+        state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
+            load_dir, args, rank0=False, checkpointing_context=checkpointing_context,
+            **load_kwargs
+        )
 
     # Checkpoint not loaded.
     if state_dict is None:
-        # Iteration and num_floating_point_operations_so_far default to 0.
-        return 0, 0
+        # Iteration, num_floating_point_operations_so_far and tokens_so_far default to 0.
+        return 0, 0, 0
 
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
@@ -1236,6 +1274,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                              'iteration from checkpoint {}, exiting'.format(checkpoint_name))
                 sys.exit()
     num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
+    tokens_so_far = state_dict.get('tokens_so_far', 0)
 
     # Check arguments.
     assert args.consumed_train_samples == 0
@@ -1367,7 +1406,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         is_local_chkpt = (ckpt_type == CheckpointType.LOCAL)
         ft_integration.on_checkpoint_loaded(is_local_chkpt=is_local_chkpt)
 
-    return iteration, num_floating_point_operations_so_far
+    return iteration, num_floating_point_operations_so_far, tokens_so_far
 
 
 def load_biencoder_checkpoint(model, only_query_model=False,
@@ -1411,3 +1450,32 @@ def load_biencoder_checkpoint(model, only_query_model=False,
         print(' successfully loaded {}'.format(checkpoint_name))
 
     return model
+
+
+def fix_xielu_weights(state_dict: dict[str, torch.Tensor]):
+    def filterfn(key: str) -> bool:
+            return "mlp.activation_func.alpha" in key
+
+    print("Old xielu weights detected" + " with optimizer!" if "optimizer" in state_dict else "!")    
+    shape = state_dict["model"]["decoder.layers.0.mlp.activation_func.alpha_p"].global_shape
+    assert len(shape) == 2 and shape[1] == 1
+    new_shape = (shape[0],)
+    for key in filter(filterfn, state_dict["model"]):
+        print(f"Updating model/{key}")
+        sh_ten = state_dict["model"][key]
+        sh_ten.global_shape = (sh_ten.global_shape[0],)
+        sh_ten.global_offset = (sh_ten.global_offset[0],)
+        sh_ten.prepend_axis_num = 0
+        sh_ten.axis_fragmentations = (sh_ten.axis_fragmentations[0],)
+
+    if "optimizer" in state_dict:
+        for i in state_dict["optimizer"]["param_state"]:
+            for k in state_dict["optimizer"]["param_state"][i]:
+                sh_ten = state_dict["optimizer"]["param_state"][i][k]
+                if filterfn(sh_ten.key):
+                    print(f"Updating optimizer/{i}/{k}/{sh_ten.key}")
+                    sh_ten.global_shape = (sh_ten.global_shape[0],)
+                    sh_ten.global_offset = (sh_ten.global_offset[0],)
+                    sh_ten.prepend_axis_num = 0
+                    sh_ten.axis_fragmentations = (sh_ten.axis_fragmentations[0],)
+    print("Done updating!")

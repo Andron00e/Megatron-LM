@@ -18,7 +18,13 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         return None
     args = get_args()
 
+    ########### DataLoader reset ###########
+    # print(f"[DEBUG] BEFORE Consumed train samples: {consumed_samples}")
+    # consumed_samples = consumed_samples - CONSUMED_SAMPLES_FROM_CHECKPOINT # NOTE(tj.solergibert) To reset dataloader states, offset `consumed_samples` by the consumed samples stored in the checkpoint state dict. Tip: Grab the consumed samples from the training logs  
+    # print(f"[DEBUG] Consumed train samples: {consumed_samples}")
     # Megatron sampler
+    ########################################
+    
     if args.dataloader_type == 'single':
         batch_sampler = MegatronPretrainingSampler(
             total_samples=len(dataset),
