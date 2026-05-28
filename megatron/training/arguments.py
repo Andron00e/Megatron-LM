@@ -2389,6 +2389,22 @@ def _add_regularization_args(parser):
     group.add_argument('--lion-beta2', type=float, default=0.98,
                        help='Second beta coefficient for Lion optimizer '
                        '(used in momentum EMA update). Default: 0.98.')
+    # schedulefree+ parameters
+    group.add_argument('--sf-beta1', type=float, default=0.9,
+                       help='Schedule-Free outer momentum used for the x -> y extrapolation. Default 0.9.')
+    group.add_argument('--sf-beta1-max', type=float, default=0.965,
+                       help='Target value for sf_beta1 at the end of the annealing schedule. Default 0.965.')
+    group.add_argument('--sf-beta1-anneal-steps', type=int, default=0,
+                       help='If greater than zero, sf_beta1 is annealed to sf_beta1_max over this many steps. Default 0.')
+    group.add_argument('--polyak-beta', type=float, default=0.0,
+                       help='EMA decay used for the running estimate of the gradient L1 norm in the Polyak step-size rule. Default 0.0.')
+    group.add_argument('--c-warmup', type=int, default=0,
+                       help='Number of initial steps during which the averaging weight ckp1 is forced to 1.0. Default 0.')
+    group.add_argument('--r', type=float, default=0.0,
+                       help='Polynomial weighting power used in the Schedule-Free averaging weights. Default 0.0.')
+    group.add_argument('--weight-lr-power', type=float, default=2.0,
+                       help='Exponent used to weight the per-step contribution to the Schedule-Free average. Default 2.0.')
+
 
     # Master optimizer (Adam/AdEMAMix + optional Muon orthogonalized updates +
     # L2 hypersphere weight clipping + learnable per-axis gains). Flag-gated
@@ -2712,7 +2728,7 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon', 'aurora', 'rmnp', 'muown', 'normuown', 'master'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon', 'aurora', 'rmnp', 'muown', 'normuown', 'master', 'schedulefree_plus'],
                        help='Optimizer function. '
                             'Note: dist_muon is deprecated; use --optimizer muon '
                             'with --use-distributed-optimizer instead.')

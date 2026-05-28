@@ -491,7 +491,30 @@ class OptimizerConfig:
     ademamix_beta3_warmup: Optional[int] = None
     """Half-life-linear warmup steps for ademamix_beta3. None disables warmup."""
 
+    # schedulefree+ parameters
+    sf_beta1: float = 0.9
+    """Schedule-Free outer momentum used for the x -> y extrapolation."""
+
+    sf_beta1_max: float = 0.965
+    """Target value for sf_beta1 at the end of the annealing schedule."""
+
+    sf_beta1_anneal_steps: int = 0
+    """If greater than zero, sf_beta1 is annealed to sf_beta1_max over this many steps."""
+
+    polyak_beta: float = 0.0
+    """EMA decay used for the running estimate of the gradient L1 norm in the Polyak step-size rule."""
+
+    c_warmup: int = 0
+    """Number of initial steps during which the averaging weight ckp1 is forced to 1.0."""
+
+    r: float = 0.0
+    """Polynomial weighting power used in the Schedule-Free averaging weights."""
+
+    weight_lr_power: float = 2.0
+    """Exponent used to weight the per-step contribution to the Schedule-Free average."""
+
     #######################
+
     # Distributed optimizer
     #######################
     use_distributed_optimizer: bool = False

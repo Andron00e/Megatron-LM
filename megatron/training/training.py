@@ -265,7 +265,34 @@ from . import ft_integration
 
 stimer = StragglerDetector()
 
-from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+def _set_optimizer_mode(opt, train=True):
+    """Recursively set train or eval mode on schedulefree_plus optimizers."""
+    if opt is None:
+        return
+    if train:
+        if hasattr(opt, 'train'):
+            opt.train()
+    else:
+        if hasattr(opt, 'eval'):
+            opt.eval()
+    if hasattr(opt, 'optimizer'):
+        _set_optimizer_mode(opt.optimizer, train)
+    if hasattr(opt, 'chained_optimizers'):
+        for chained_opt in opt.chained_optimizers:
+            _set_optimizer_mode(chained_opt, train)
+
+
+def _set_optimizer_loss_val(opt, loss_val):
+    """Recursively set the loss_val attribute on schedulefree_plus optimizers."""
+    if opt is None:
+        return
+    if hasattr(opt, 'loss_val'):
+        opt.loss_val = loss_val
+    if hasattr(opt, 'optimizer'):
+        _set_optimizer_loss_val(opt.optimizer, loss_val)
+    if hasattr(opt, 'chained_optimizers'):
+        for chained_opt in opt.chained_optimizers:
+            _set_optimizer_loss_val(chained_opt, loss_val)
 
 
 def destroy_global_state():
@@ -1252,6 +1279,7 @@ def pretrain(
         iteration = args.iteration
 
     if args.do_valid:
+        _set_optimizer_mode(optimizer, train=False)
         prefix = f'iteration {iteration} on validation set'
         if args.perform_rl_step:
             rl_eval_model = model
@@ -1280,8 +1308,10 @@ def pretrain(
                 verbose=True, write_to_tensorboard=not cfg_container.validation.skip_train,
                 non_loss_data_func=non_loss_data_func
             )
+        _set_optimizer_mode(optimizer, train=True)
 
     if args.do_test:
+        _set_optimizer_mode(optimizer, train=False)
         prefix = f'iteration {iteration} on test set'
         evaluate_and_print_results(
             prefix,
@@ -1295,6 +1325,7 @@ def pretrain(
             write_to_tensorboard=not cfg_container.validation.skip_train,
             non_loss_data_func=non_loss_data_func,
         )
+        _set_optimizer_mode(optimizer, train=True)
 
     wandb_writer = get_wandb_writer()
     if wandb_writer:
@@ -1973,10 +2004,32 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
-    # Update parameters.
+    # Extract and broadcast loss for Polyak step size in schedulefree+
+    loss_val = 0.0
+    if mpu.is_pipeline_last_stage(ignore_virtual=True) and losses_reduced:
+        lm_losses = []
+        for x in losses_reduced:
+            if 'lm loss' in x:
+                lm_losses.append(x['lm loss'])
+            elif 'loss' in x:
+                lm_losses.append(x['loss'])
+        if lm_losses:
+            loss_val = sum(val.item() for val in lm_losses) / len(lm_losses)
+
+    if torch.distributed.is_initialized():
+        loss_tensor = torch.tensor([loss_val], dtype=torch.float32, device='cuda')
+        torch.distributed.broadcast(
+            loss_tensor,
+            src=mpu.get_pipeline_model_parallel_last_rank(),
+            group=mpu.get_pipeline_model_parallel_group()
+        )
+        loss_val = loss_tensor[0].item()
+
+    _set_optimizer_loss_val(optimizer, loss_val)
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
@@ -2494,6 +2547,7 @@ def save_checkpoint_and_time(
     if should_report_memory:
         # Track memory before checkpoint save.
         report_memory(f"(before save_checkpoint for iteration {iteration})")
+    _set_optimizer_mode(optimizer, train=False)
     # Save checkpoint.
     save_checkpoint(
         iteration,
@@ -2506,6 +2560,7 @@ def save_checkpoint_and_time(
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
     )
+    _set_optimizer_mode(optimizer, train=True)
     
     # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
     timers(timer_key).stop(barrier=True)
@@ -2760,6 +2815,7 @@ def train(
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
     timers = get_timers()
+    _set_optimizer_mode(optimizer, train=True)
     fault_injector_kwargs = {}
     for f in dataclasses.fields(FaultInjectorConfig):
         if hasattr(args, f.name):
@@ -3327,6 +3383,7 @@ def train(
         # Evaluation.
         if args.eval_interval and iteration % args.eval_interval == 0 and args.do_valid \
                 and (args.start_eval_at_iter is None or iteration >= args.start_eval_at_iter):
+            _set_optimizer_mode(optimizer, train=False)
             if args.log_energy:
                 energy_monitor.pause()
             timers('interval-time').stop()
@@ -3382,6 +3439,7 @@ def train(
                 energy_monitor.resume()
             if args.num_experts is not None:
                 clear_aux_losses_tracker()
+            _set_optimizer_mode(optimizer, train=True)
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
         # Some of these only happen at specific iterations. Capture updated FLOPs accumulator

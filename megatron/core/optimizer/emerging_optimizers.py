@@ -43,6 +43,7 @@ except ImportError:
 from .aurora import TensorParallelAurora
 from .rmnp import TensorParallelRMNP
 from .muown import Muown
+from .schedulefree_plus import AdamCScheduleFreePlusPaper
 
 
 logger = logging.getLogger(__name__)
@@ -474,6 +475,24 @@ def _default_adam_based_eopt_config_to_kwargs(
     return kwargs
 
 
+def _schedulefree_plus_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
+    """Convert OptimizerConfig to AdamCScheduleFreePlusPaper constructor kwargs."""
+    kwargs = dict(
+        lr=config.lr,
+        betas=(config.adam_beta1, config.adam_beta2),
+        sf_beta1=getattr(config, "sf_beta1", 0.9),
+        eps=config.adam_eps,
+        weight_decay=config.weight_decay,
+        r=getattr(config, "r", 0.0),
+        polyak_beta=getattr(config, "polyak_beta", 0.0),
+        c_warmup=getattr(config, "c_warmup", 0),
+        sf_beta1_anneal_steps=getattr(config, "sf_beta1_anneal_steps", 0),
+        sf_beta1_max=getattr(config, "sf_beta1_max", 0.965),
+        weight_lr_power=getattr(config, "weight_lr_power", 2.0),
+    )
+    return kwargs
+
+
 # -----------------------------------------------------------------------
 # Master optimizer (Adam/AdEMAMix + optional Muon + L2 hypersphere clipping)
 # -----------------------------------------------------------------------
@@ -661,6 +680,12 @@ _EMERGING_OPTIMIZERS.update(
                     )
                 ): {'optimizer': 'adam'}
             },
+        ),
+        "schedulefree_plus": EmergingOptimizerEntry(
+            optimizer_cls=AdamCScheduleFreePlusPaper,
+            init_state_fn=_eopt_init_state_fn,
+            config_to_kwargs=_schedulefree_plus_config_to_kwargs,
+            default_param_overrides={},
         ),
     }
 )
