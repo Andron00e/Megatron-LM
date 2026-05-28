@@ -275,11 +275,11 @@ def _set_optimizer_mode(opt, train=True):
     else:
         if hasattr(opt, 'eval'):
             opt.eval()
-    if hasattr(opt, 'optimizer'):
-        _set_optimizer_mode(opt.optimizer, train)
     if hasattr(opt, 'chained_optimizers'):
         for chained_opt in opt.chained_optimizers:
             _set_optimizer_mode(chained_opt, train)
+    elif hasattr(opt, 'optimizer'):
+        _set_optimizer_mode(opt.optimizer, train)
 
 
 def _set_optimizer_loss_val(opt, loss_val):
@@ -288,11 +288,11 @@ def _set_optimizer_loss_val(opt, loss_val):
         return
     if hasattr(opt, 'loss_val'):
         opt.loss_val = loss_val
-    if hasattr(opt, 'optimizer'):
-        _set_optimizer_loss_val(opt.optimizer, loss_val)
     if hasattr(opt, 'chained_optimizers'):
         for chained_opt in opt.chained_optimizers:
             _set_optimizer_loss_val(chained_opt, loss_val)
+    elif hasattr(opt, 'optimizer'):
+        _set_optimizer_loss_val(opt.optimizer, loss_val)
 
 
 def destroy_global_state():
