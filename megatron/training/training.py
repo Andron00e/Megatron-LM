@@ -2014,7 +2014,19 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             elif 'loss' in x:
                 lm_losses.append(x['loss'])
         if lm_losses:
-            loss_val = sum(val.item() for val in lm_losses) / len(lm_losses)
+            if lm_losses[0].numel() == 2:
+                local_val = torch.stack([v.view(-1) for v in lm_losses]).sum(dim=0)
+                if torch.distributed.is_initialized():
+                    val_to_reduce = local_val.clone().detach()
+                    torch.distributed.all_reduce(
+                        val_to_reduce,
+                        group=mpu.get_data_parallel_group(with_context_parallel=True)
+                    )
+                    loss_val = (val_to_reduce[0] / val_to_reduce[1]).item()
+                else:
+                    loss_val = (local_val[0] / local_val[1]).item()
+            else:
+                loss_val = sum(val.item() for val in lm_losses) / len(lm_losses)
 
     if torch.distributed.is_initialized():
         loss_tensor = torch.tensor([loss_val], dtype=torch.float32, device='cuda')
