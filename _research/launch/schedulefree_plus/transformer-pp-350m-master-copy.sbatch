@@ -1,8 +1,27 @@
 #!/bin/bash
 #
-# Transformer++ 350M-active MoE on 1 GH200 node (4 GPUs) using ScheduleFree+ with outer momentum annealing.
+# Transformer++ 350M-active MoE on 1 GH200 node (4 GPUs).
+# 24L / 1024H / 16h / 4kv (GQA). MoE: 16 routed experts top-1 + 1 shared,
+# ffn-hidden 1280 (iso-active to dense 2560). QK-LayerNorm. FP8 blockwise.
+# SwiGLU, RMSNorm, RoPE, master optimizer, WSD.
+# 15B tokens on ClimbMix, ~57220 steps at 262K tokens/step (MBS=8).
 #
-#SBATCH --job-name=transformer-pp-350m-sf_plus-anneal
+# Architecture matches the 350m-wsdmc MoE runs for apples-to-apples comparison.
+#
+# Master = Adam/AdEMAMix + Muon-style orthogonalized updates + L2 hypersphere
+# weight clipping + learnable per-axis gains. Embedding + LM head ALWAYS use
+# the Adam branch (hardcoded). This recipe uses --master-min-lr-mode absolute
+# so every per-group LR floor is MIN_LR.
+#
+# Fork of transformer-pp-350m-muon.sbatch with the optimizer block replaced:
+# --optimizer master + hypersphere flat (matrices) / row (embed+LM head),
+# rowcol gains (none for embed+LM head), shape_up muon scale,
+# --use-orthogonal-updates, --matrix-lr $MLR, --embedding-lr-multiplier 3.
+# Tune $MLR independently of $LR.
+#
+# --overlap-param-gather intentionally omitted (breaks Muon-style NS5).
+#
+#SBATCH --job-name=transformer-pp-350m-master
 #SBATCH --time=10:00:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
@@ -52,9 +71,11 @@ GBS=128
 SEQ_LEN=4096
 TRAIN_SAMPLES=3662109
 
-# Schedule-Free learning rate is typically set constant.
-# Adjust LR as needed.
+# Master LR knobs. Tune $MLR independently of $LR — they control different
+# param groups (embedding/LM-head/biases use $LR, matrices use $MLR).
+# Override via env: MLR=1e-2 sbatch ... or LR=3e-4 sbatch ...
 LR=${LR:-1e-3}
+MLR=${MLR:-8e-3}
 MIN_LR=${MIN_LR:-1e-5}
 
 TP=1
@@ -62,7 +83,7 @@ PP=1
 CP=1
 
 PROJECT=${WANDB_PROJECT:-megatron-lm-research-baseline}
-EXP_NAME=transformer-pp-350m-sf_plus-anneal-lr${LR}-$(git rev-parse --short HEAD)
+EXP_NAME=transformer-pp-350m-master-lr${LR}-mlr${MLR}-$(git rev-parse --short HEAD)
 CKPT_DIR=${MASTER_CKPT_DIR:-$WORKDIR/_research/results/ckpts/$EXP_NAME}
 mkdir -p $CKPT_DIR
 
@@ -125,7 +146,7 @@ TRAINING_ARGS=(
     --log-interval 1
     --eval-interval $TRAIN_SAMPLES
     --eval-iters 0
-    --optimizer schedulefree_plus
+    --optimizer master
     --dataloader-type single
     --manual-gc
     --manual-gc-interval 50
@@ -137,34 +158,49 @@ TRAINING_ARGS=(
 REGULARIZATION_ARGS=(
     --attention-dropout 0.0
     --hidden-dropout 0.0
-    # Decoupled weight decay for Schedule-Free+ is scaled by lr**2.
-    # Standard values should be much larger (e.g. 20.0 or 50.0).
-    --weight-decay 20.0
+    --weight-decay 0.0
     --adam-beta1 0.9
-    --adam-beta2 0.95
+    --adam-beta2 0.99
 )
 
-SCHEDULEFREE_PLUS_ARGS=(
-    --sf-beta1 0.9
-    --sf-beta1-max 0.965
-    # Anneal outer momentum from 0.9 to 0.965 over 10000 steps.
-    --sf-beta1-anneal-steps 10000
-    --polyak-beta 0.0
-    --c-warmup 0
-    --r 0.0
-    --weight-lr-power 2.0
+# Master canonical recipe: AdEMAMix off (alpha=0), Muon orthogonalized updates
+# on the matrix branch, L2 hypersphere clipping (flat for matrices, row for
+# embedding+LM head), rowcol learnable gains (none for emb/head), shape_up
+# muon scale. Embedding+LM head stay in master (Adam branch) via
+# --hypersphere-embedding-mode row; they NEVER orthogonalize (hardcoded).
+MASTER_ARGS=(
+    --use-orthogonal-updates
+    --ademamix-alpha 0
+    --hypersphere-mode flat
+    --hypersphere-embedding-mode row
+    --hypersphere-gains-mode rowcol
+    --hypersphere-gains-mode-embedding none
+    --muon-momentum 0.95
+    --muon-nesterov
+    --muon-scale-mode shape_up
+    --matrix-lr $MLR
+    --embedding-lr-multiplier 3
+    # router: use adam branch, and normalize row-wise.
+    --master-router-use-orthogonal-updates false
+    --hypersphere-router-mode row
+    # 'absolute': every group decays to MIN_LR (clamped to <= max_lr).
+    # Switch to 'relative' to decay each group by min_lr/lr fraction instead.
+    --master-min-lr-mode absolute
 )
 
 LEARNING_RATE_ARGS=(
     --lr $LR
     --min-lr $MIN_LR
-    --lr-decay-style constant
+    --lr-decay-style WSD
     --lr-warmup-samples 0
+    --lr-wsd-decay-style minus_sqrt
+    --lr-wsd-decay-samples 732422
 )
 
 INITIALIZATION_ARGS=(
     --seed 42
     --init-method-std 0.02
+    # Fixed scalar multiplied into embeddings in forward (HIDDEN=1024 -> sqrt(1024)=32).
     --embedding-multiplier 32.0
 )
 
@@ -211,13 +247,17 @@ DATA_ARGS=(
     --num-workers 4
 )
 
+# Flat array so `interactive-run.sh` (which expands "${MEGATRON_ARGS[@]}")
+# sees each token as its own argv element. Concatenating into a string and
+# referencing it as ${VAR[@]} collapses to a single argv element under
+# argparse, which fails with "unrecognized arguments: <everything>".
 MEGATRON_ARGS=(
     "${TRANSFORMER_ENGINE_ARGS[@]}"
     "${NETWORK_SIZE_ARGS[@]}"
     "${MOE_ARGS[@]}"
     "${TRAINING_ARGS[@]}"
     "${REGULARIZATION_ARGS[@]}"
-    "${SCHEDULEFREE_PLUS_ARGS[@]}"
+    "${MASTER_ARGS[@]}"
     "${LEARNING_RATE_ARGS[@]}"
     "${INITIALIZATION_ARGS[@]}"
     "${MIXED_PRECISION_ARGS[@]}"

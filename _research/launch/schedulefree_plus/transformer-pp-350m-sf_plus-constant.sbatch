@@ -234,6 +234,9 @@ if [ -n "${WANDB_API_KEY:-}" ]; then
         --wandb-exp-name "$EXP_NAME-$SLURM_JOB_ID"
         --wandb-save-dir "$WORKDIR/_research/results/runs"
     )
+    if [ -n "${WANDB_ENTITY:-}" ]; then
+        MEGATRON_ARGS+=( --wandb-entity "$WANDB_ENTITY" )
+    fi
 else
     export WANDB_MODE=disabled
 fi
