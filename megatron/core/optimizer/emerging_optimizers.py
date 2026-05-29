@@ -477,6 +477,16 @@ def _default_adam_based_eopt_config_to_kwargs(
 
 def _schedulefree_plus_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
     """Convert OptimizerConfig to AdamCScheduleFreePlusPaper constructor kwargs."""
+    for model_chunk in model_chunks:
+        for name, param in model_chunk.named_parameters():
+            if not param.requires_grad:
+                continue
+            if ("linear_fc2" in name or "linear_proj" in name) and len(param.shape) == 2:
+                param.is_out_proj = True
+
+    model_cfg = model_chunks[0].config
+    qkv_split_shapes = _get_qkv_split_shapes(model_cfg)
+
     kwargs = dict(
         lr=config.lr,
         betas=(config.adam_beta1, config.adam_beta2),
@@ -489,6 +499,34 @@ def _schedulefree_plus_config_to_kwargs(config, model_chunks, pg_collection) -> 
         sf_beta1_anneal_steps=getattr(config, "sf_beta1_anneal_steps", 0),
         sf_beta1_max=getattr(config, "sf_beta1_max", 0.965),
         weight_lr_power=getattr(config, "weight_lr_power", 2.0),
+        # Hypersphere
+        hypersphere_mode=getattr(config, "hypersphere_mode", None),
+        hypersphere_embedding_mode=getattr(config, "hypersphere_embedding_mode", None),
+        hypersphere_router_mode=getattr(config, "hypersphere_router_mode", None),
+        hypersphere_eps=getattr(config, "hypersphere_eps", 1e-8),
+        hypersphere_tangential_grad=getattr(config, "hypersphere_tangential_grad", False),
+        hypersphere_preserve_init=getattr(config, "hypersphere_preserve_init", False),
+        hypersphere_scale_out_proj_init=getattr(config, "hypersphere_scale_out_proj_init", False),
+        num_layers=model_cfg.num_layers,
+        # Muon
+        use_orthogonal_updates=getattr(config, "use_orthogonal_updates", False),
+        momentum_beta=getattr(config, "muon_momentum", 0.95),
+        use_nesterov=getattr(config, "muon_nesterov", True),
+        split_qkv=getattr(config, "muon_split_qkv", True),
+        is_qkv_fn=lambda p: getattr(p, "is_qkv", False),
+        qkv_split_shapes=qkv_split_shapes,
+        qkv_dim=model_cfg.kv_channels,
+        fp32_matmul_prec=getattr(config, "muon_fp32_matmul_prec", "medium"),
+        coefficient_type=getattr(config, "muon_coefficient_type", "quintic"),
+        num_ns_steps=getattr(config, "muon_num_ns_steps", 5),
+        scale_mode=getattr(config, "muon_scale_mode", "spectral"),
+        extra_scale_factor=getattr(config, "muon_extra_scale_factor", 1.0),
+        # NorMuon
+        use_normuon=getattr(config, "master_use_normuon", False),
+        normuon_beta2=getattr(config, "master_normuon_beta2", 0.95),
+        normuon_eps=getattr(config, "master_normuon_eps", 1e-8),
+        pg_collection=pg_collection,
+        tp_mode=getattr(config, "muon_tp_mode", "duplicated"),
     )
     return kwargs
 
