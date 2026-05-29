@@ -309,9 +309,18 @@ class AdamCScheduleFreePlusPaper(torch.optim.Optimizer):
                     ip_term_p = sf_beta1_k * (local_grad.mul(local_z - local_x)).sum()
                     ip_term_list.append(ip_term_p)
 
+        # Find device
+        device = 'cpu'
+        if torch.cuda.is_available():
+            device = 'cuda'
+        for group in self.param_groups:
+            for p in group['params']:
+                device = p.device
+                break
+
         # 2. Stack and sum the local scalars into single tensors on this device
-        local_grad_l1 = torch.stack(grad_l1_list).sum() if grad_l1_list else torch.tensor(0.0, device=grad.device)
-        local_ip_term = torch.stack(ip_term_list).sum() if ip_term_list else torch.tensor(0.0, device=grad.device)
+        local_grad_l1 = torch.stack(grad_l1_list).sum() if grad_l1_list else torch.tensor(0.0, device=device)
+        local_ip_term = torch.stack(ip_term_list).sum() if ip_term_list else torch.tensor(0.0, device=device)
 
         # 3. Perform global all_reduce over the network to get the final
         # values. We use self.process_group (set from Megatron wrappers) to
@@ -364,8 +373,9 @@ class AdamCScheduleFreePlusPaper(torch.optim.Optimizer):
             # Apply any warmup that's part of the lr sequence
             group_lr = lr * polyak_lr
 
-            # For plotting
-            group['grad_l1_ema'] = group['grad_l1_ema_corr'] = grad_l1_ema_corr
+            # For plotting / tracking
+            group['grad_l1_ema'] = grad_l1_ema
+            group['grad_l1_ema_corr'] = grad_l1_ema_corr
             group['function_value_ema'] = global_function_value + ip_term
             group['ip_term'] = ip_term
             group['scheduled_lr'] = group_lr  # For logging purposes

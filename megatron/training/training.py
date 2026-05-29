@@ -271,17 +271,28 @@ def _set_optimizer_mode(opt, train=True):
         return
     if hasattr(opt, 'config') and getattr(opt.config, 'optimizer', None) != 'schedulefree_plus':
         return
+    if hasattr(opt, 'chained_optimizers'):
+        for chained_opt in opt.chained_optimizers:
+            _set_optimizer_mode(chained_opt, train)
+    elif hasattr(opt, 'optimizer'):
+        _set_optimizer_mode(opt.optimizer, train)
+
     if train:
         if hasattr(opt, 'train'):
             opt.train()
     else:
         if hasattr(opt, 'eval'):
             opt.eval()
-    if hasattr(opt, 'chained_optimizers'):
-        for chained_opt in opt.chained_optimizers:
-            _set_optimizer_mode(chained_opt, train)
-    elif hasattr(opt, 'optimizer'):
-        _set_optimizer_mode(opt.optimizer, train)
+
+    if hasattr(opt, '_copy_main_params_to_model_params'):
+        opt._copy_main_params_to_model_params()
+
+    # Trigger parameter all-gather if using DistributedOptimizer with overlap_param_gather=False
+    if hasattr(opt, 'model_chunks') and hasattr(opt, 'ddp_config'):
+        if not getattr(opt.ddp_config, 'overlap_param_gather', False):
+            for model_chunk in opt.model_chunks:
+                if hasattr(model_chunk, 'start_param_sync'):
+                    model_chunk.start_param_sync()
 
 
 def _set_optimizer_loss_val(opt, loss_val):
