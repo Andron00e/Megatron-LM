@@ -183,6 +183,7 @@ class AdamCScheduleFreePlusPaper(torch.optim.Optimizer):
                         weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.loss_val = None
+        self.process_group = None
 
     @torch.no_grad()
     def eval(self):
@@ -310,22 +311,25 @@ class AdamCScheduleFreePlusPaper(torch.optim.Optimizer):
         local_grad_l1 = torch.stack(grad_l1_list).sum() if grad_l1_list else torch.tensor(0.0, device=grad.device)
         local_ip_term = torch.stack(ip_term_list).sum() if ip_term_list else torch.tensor(0.0, device=grad.device)
 
-        # 3. Perform ONE global all_reduce over the network to get the final
-        # values, but only when at least one parameter is sharded across ranks
-        # (i.e. its gradient is a DTensor). For replicated (non-DTensor)
-        # gradients, the local sums are already the global sums and an
-        # all_reduce would over-count by the world size.
-        if is_distributed and dist.is_available() and dist.is_initialized():
-            dist.all_reduce(local_grad_l1, op=dist.ReduceOp.SUM)
-            dist.all_reduce(local_ip_term, op=dist.ReduceOp.SUM)
+        # 3. Perform global all_reduce over the network to get the final
+        # values. We use self.process_group (set from Megatron wrappers) to
+        # correctly reduce over sharded parameter groups.
+        pg = getattr(self, 'process_group', None)
+        # Fallback for FSDP2/DTensor-based single-controller distributed setups
+        if pg is None and is_distributed and dist.is_available() and dist.is_initialized():
+            pg = dist.group.WORLD
+
+        if pg is not None and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(local_grad_l1, op=dist.ReduceOp.SUM, group=pg)
+            dist.all_reduce(local_ip_term, op=dist.ReduceOp.SUM, group=pg)
 
         grad_l1 = local_grad_l1.item()
         ip_term = local_ip_term.item()
 
-        if is_distributed and dist.is_available() and dist.is_initialized():
+        if pg is not None and dist.is_available() and dist.is_initialized():
             dist_tensor = torch.zeros(1).cuda()
             dist_tensor[0] = function_value
-            dist.all_reduce(dist_tensor, op=dist.ReduceOp.AVG)
+            dist.all_reduce(dist_tensor, op=dist.ReduceOp.AVG, group=pg)
             global_function_value = dist_tensor[0].item()
         else:
             global_function_value = float(function_value)

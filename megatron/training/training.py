@@ -269,6 +269,8 @@ def _set_optimizer_mode(opt, train=True):
     """Recursively set train or eval mode on schedulefree_plus optimizers."""
     if opt is None:
         return
+    if hasattr(opt, 'config') and getattr(opt.config, 'optimizer', None) != 'schedulefree_plus':
+        return
     if train:
         if hasattr(opt, 'train'):
             opt.train()
@@ -286,6 +288,8 @@ def _set_optimizer_loss_val(opt, loss_val):
     """Recursively set the loss_val attribute on schedulefree_plus optimizers."""
     if opt is None:
         return
+    if hasattr(opt, 'config') and getattr(opt.config, 'optimizer', None) != 'schedulefree_plus':
+        return
     if hasattr(opt, 'loss_val'):
         opt.loss_val = loss_val
     if hasattr(opt, 'chained_optimizers'):
@@ -293,6 +297,21 @@ def _set_optimizer_loss_val(opt, loss_val):
             _set_optimizer_loss_val(chained_opt, loss_val)
     elif hasattr(opt, 'optimizer'):
         _set_optimizer_loss_val(opt.optimizer, loss_val)
+
+
+def _set_optimizer_process_group(opt, pg):
+    """Recursively set the process_group attribute on schedulefree_plus optimizers."""
+    if opt is None:
+        return
+    if hasattr(opt, 'config') and getattr(opt.config, 'optimizer', None) != 'schedulefree_plus':
+        return
+    if hasattr(opt, 'process_group'):
+        opt.process_group = pg
+    if hasattr(opt, 'chained_optimizers'):
+        for chained_opt in opt.chained_optimizers:
+            _set_optimizer_process_group(chained_opt, pg)
+    elif hasattr(opt, 'optimizer'):
+        _set_optimizer_process_group(opt.optimizer, pg)
 
 
 def destroy_global_state():
@@ -1749,6 +1768,7 @@ def setup_model_and_optimizer(
             use_gloo_process_groups=args.use_gloo_process_groups,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
+        _set_optimizer_process_group(optimizer, optimizer.get_grad_stats_parallel_group())
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
@@ -2006,38 +2026,40 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Extract and broadcast loss for Polyak step size in schedulefree+
     loss_val = 0.0
-    if mpu.is_pipeline_last_stage(ignore_virtual=True) and losses_reduced:
-        lm_losses = []
-        for x in losses_reduced:
-            if 'lm loss' in x:
-                lm_losses.append(x['lm loss'])
-            elif 'loss' in x:
-                lm_losses.append(x['loss'])
-        if lm_losses:
-            if lm_losses[0].numel() == 2:
-                local_val = torch.stack([v.view(-1) for v in lm_losses]).sum(dim=0)
-                if torch.distributed.is_initialized():
-                    val_to_reduce = local_val.clone().detach()
-                    torch.distributed.all_reduce(
-                        val_to_reduce,
-                        group=mpu.get_data_parallel_group(with_context_parallel=True)
-                    )
-                    loss_val = (val_to_reduce[0] / val_to_reduce[1]).item()
+    if (optimizer is not None and 
+            getattr(optimizer.config, 'optimizer', None) == 'schedulefree_plus'):
+        if mpu.is_pipeline_last_stage(ignore_virtual=True) and losses_reduced:
+            lm_losses = []
+            for x in losses_reduced:
+                if 'lm loss' in x:
+                    lm_losses.append(x['lm loss'])
+                elif 'loss' in x:
+                    lm_losses.append(x['loss'])
+            if lm_losses:
+                if lm_losses[0].numel() == 2:
+                    local_val = torch.stack([v.view(-1) for v in lm_losses]).sum(dim=0)
+                    if torch.distributed.is_initialized():
+                        val_to_reduce = local_val.clone().detach()
+                        torch.distributed.all_reduce(
+                            val_to_reduce,
+                            group=mpu.get_data_parallel_group(with_context_parallel=True)
+                        )
+                        loss_val = (val_to_reduce[0] / val_to_reduce[1]).item()
+                    else:
+                        loss_val = (local_val[0] / local_val[1]).item()
                 else:
-                    loss_val = (local_val[0] / local_val[1]).item()
-            else:
-                loss_val = sum(val.item() for val in lm_losses) / len(lm_losses)
+                    loss_val = sum(val.item() for val in lm_losses) / len(lm_losses)
 
-    if torch.distributed.is_initialized():
-        loss_tensor = torch.tensor([loss_val], dtype=torch.float32, device='cuda')
-        torch.distributed.broadcast(
-            loss_tensor,
-            src=mpu.get_pipeline_model_parallel_last_rank(),
-            group=mpu.get_pipeline_model_parallel_group()
-        )
-        loss_val = loss_tensor[0].item()
+        if torch.distributed.is_initialized():
+            loss_tensor = torch.tensor([loss_val], dtype=torch.float32, device='cuda')
+            torch.distributed.broadcast(
+                loss_tensor,
+                src=mpu.get_pipeline_model_parallel_last_rank(),
+                group=mpu.get_pipeline_model_parallel_group()
+            )
+            loss_val = loss_tensor[0].item()
 
-    _set_optimizer_loss_val(optimizer, loss_val)
+        _set_optimizer_loss_val(optimizer, loss_val)
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
