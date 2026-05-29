@@ -184,6 +184,8 @@ class AdamCScheduleFreePlusPaper(torch.optim.Optimizer):
         super().__init__(params, defaults)
         self.loss_val = None
         self.process_group = None
+        self.grad_norm = None
+        self.clip_grad = 0.0
 
     @torch.no_grad()
     def eval(self):
@@ -323,8 +325,15 @@ class AdamCScheduleFreePlusPaper(torch.optim.Optimizer):
             dist.all_reduce(local_grad_l1, op=dist.ReduceOp.SUM, group=pg)
             dist.all_reduce(local_ip_term, op=dist.ReduceOp.SUM, group=pg)
 
-        grad_l1 = local_grad_l1.item()
-        ip_term = local_ip_term.item()
+        clip_coeff = 1.0
+        grad_norm_l2 = getattr(self, 'grad_norm', None)
+        clip_grad_val = getattr(self, 'clip_grad', 0.0)
+        if grad_norm_l2 is not None and clip_grad_val > 0.0:
+            if grad_norm_l2 > clip_grad_val:
+                clip_coeff = clip_grad_val / (grad_norm_l2 + 1e-6)
+
+        grad_l1 = local_grad_l1.item() / clip_coeff
+        ip_term = local_ip_term.item() / clip_coeff
 
         if pg is not None and dist.is_available() and dist.is_initialized():
             dist_tensor = torch.zeros(1).cuda()
@@ -413,4 +422,5 @@ class AdamCScheduleFreePlusPaper(torch.optim.Optimizer):
                 p.detach().copy_(y)
 
             group['k'] = k + 1
+        self.grad_norm = None
         return function_value

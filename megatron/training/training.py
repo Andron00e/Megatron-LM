@@ -314,6 +314,21 @@ def _set_optimizer_process_group(opt, pg):
         _set_optimizer_process_group(opt.optimizer, pg)
 
 
+def _set_optimizer_clip_grad(opt, clip_grad):
+    """Recursively set the clip_grad attribute on schedulefree_plus optimizers."""
+    if opt is None:
+        return
+    if hasattr(opt, 'config') and getattr(opt.config, 'optimizer', None) != 'schedulefree_plus':
+        return
+    if hasattr(opt, 'clip_grad'):
+        opt.clip_grad = clip_grad
+    if hasattr(opt, 'chained_optimizers'):
+        for chained_opt in opt.chained_optimizers:
+            _set_optimizer_clip_grad(chained_opt, clip_grad)
+    elif hasattr(opt, 'optimizer'):
+        _set_optimizer_clip_grad(opt.optimizer, clip_grad)
+
+
 def destroy_global_state():
     destroy_global_vars()
     destroy_num_microbatches_calculator()
@@ -1769,6 +1784,7 @@ def setup_model_and_optimizer(
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
         _set_optimizer_process_group(optimizer, optimizer.get_grad_stats_parallel_group())
+        _set_optimizer_clip_grad(optimizer, optimizer.config.clip_grad)
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 

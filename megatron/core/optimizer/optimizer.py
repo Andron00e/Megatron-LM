@@ -97,6 +97,21 @@ def _multi_tensor_copy_this_to_that(
 param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
 
 
+def _propagate_grad_stats_to_pytorch_optimizer(opt, grad_norm, clip_grad):
+    if opt is None:
+        return
+    if hasattr(opt, 'config') and getattr(opt.config, 'optimizer', None) != 'schedulefree_plus':
+        return
+    if hasattr(opt, 'chained_optimizers'):
+        for chained_opt in opt.chained_optimizers:
+            _propagate_grad_stats_to_pytorch_optimizer(chained_opt, grad_norm, clip_grad)
+    elif hasattr(opt, 'optimizer'):
+        _propagate_grad_stats_to_pytorch_optimizer(opt.optimizer, grad_norm, clip_grad)
+    else:
+        opt.grad_norm = grad_norm
+        opt.clip_grad = clip_grad
+
+
 class MegatronOptimizer(ABC):
     """
     Base class for all Megatron optimizers.
@@ -636,6 +651,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
 
+        _propagate_grad_stats_to_pytorch_optimizer(self, grad_norm, self.config.clip_grad)
+
         # Count the zeros in the grads.
         if timers is not None:
             timers('optimizer-count-zeros', log_level=1).start(
@@ -1017,6 +1034,8 @@ class FP32Optimizer(MegatronOptimizer):
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
 
+        _propagate_grad_stats_to_pytorch_optimizer(self, grad_norm, self.config.clip_grad)
+
         # Count the zeros in the grads.
         if timers is not None:
             timers('optimizer-count-zeros', log_level=1).start(
@@ -1378,6 +1397,7 @@ class ChainedOptimizer(MegatronOptimizer):
             parameters = optimizer.get_parameters()
             if len(parameters) == 0:
                 continue
+            _propagate_grad_stats_to_pytorch_optimizer(optimizer, grad_norm, optimizer.config.clip_grad)
             if optimizer.config.clip_grad > 0.0:
                 clip_grad_by_total_norm_fp32(
                     parameters,
