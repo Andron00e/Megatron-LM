@@ -44,6 +44,7 @@ from .aurora import TensorParallelAurora
 from .rmnp import TensorParallelRMNP
 from .muown import Muown
 from .schedulefree_plus import AdamCScheduleFreePlusPaper
+from .neutrino import Neutrino
 
 
 logger = logging.getLogger(__name__)
@@ -133,6 +134,14 @@ def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg
 def _is_nonlinear_or_embedding(param):
     """True for parameters that should NOT use the emerging optimizer."""
     return getattr(param, 'is_embedding_or_output_parameter', False) or len(param.shape) != 2
+
+
+def _is_nonlinear_or_embedding_for_neutrino(param):
+    """True for parameters that should NOT use the Neutrino optimizer.
+    Neutrino operates on 2D and 3D parameters. Others (1D, embeddings) go to Adam.
+    """
+    return getattr(param, 'is_embedding_or_output_parameter', False) or len(param.shape) not in (2, 3)
+
 
 
 def _get_qkv_split_shapes(model_cfg) -> List[int]:
@@ -531,6 +540,19 @@ def _schedulefree_plus_config_to_kwargs(config, model_chunks, pg_collection) -> 
     return kwargs
 
 
+def _neutrino_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
+    """Convert OptimizerConfig to Neutrino constructor kwargs."""
+    kwargs = _kwargs_from_config(Neutrino, "neutrino", config)
+    # Neutrino is structurally Muon-like, and reuses muon_momentum / muon_nesterov / tp_mode
+    kwargs["momentum"] = getattr(config, "muon_momentum", 0.95)
+    kwargs["nesterov"] = getattr(config, "muon_nesterov", True)
+    kwargs["tp_mode"] = getattr(config, "muon_tp_mode", "duplicated")
+    kwargs["pg_collection"] = pg_collection
+    kwargs["scale_mode"] = getattr(config, "muon_scale_mode", "spectral")
+    kwargs["basis_init"] = getattr(config, "neutrino_basis_init", "gaussian")
+    return kwargs
+
+
 # -----------------------------------------------------------------------
 # Master optimizer (Adam/AdEMAMix + optional Muon + L2 hypersphere clipping)
 # -----------------------------------------------------------------------
@@ -724,6 +746,18 @@ _EMERGING_OPTIMIZERS.update(
             init_state_fn=_eopt_init_state_fn,
             config_to_kwargs=_schedulefree_plus_config_to_kwargs,
             default_param_overrides={},
+        ),
+        "neutrino": EmergingOptimizerEntry(
+            optimizer_cls=Neutrino,
+            init_state_fn=_eopt_init_state_fn,
+            config_to_kwargs=_neutrino_config_to_kwargs,
+            default_param_overrides={
+                ParamKey(
+                    predicate=ParamPredicate(
+                        name="nonlinear_or_embedding_for_neutrino", fn=_is_nonlinear_or_embedding_for_neutrino
+                    )
+                ): {'optimizer': 'adam'}
+            },
         ),
     }
 )

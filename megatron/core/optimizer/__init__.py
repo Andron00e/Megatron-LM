@@ -66,6 +66,7 @@ from .emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
     _is_nonlinear_or_embedding,
+    _is_nonlinear_or_embedding_for_neutrino,
 )
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
@@ -798,6 +799,7 @@ def _get_megatron_emerging_optimizer(
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
+            param.param_name = name
             if 'experts' in name and 'shared' not in name:
                 param.expert_tp = True
             # TODO(deyuf): support MLA
@@ -816,14 +818,20 @@ def _get_megatron_emerging_optimizer(
     # Master shares this lever: --muon-scalar-lr / --muon-scalar-weight-decay
     # control the external-Adam group (1D biases/norms, and 2D embedding/output
     # when no hypersphere_embedding_mode is set).
-    if eopt_name in ('muon', 'adaptive_muon', 'aurora', 'rmnp', 'muown', 'normuown', 'master'):
+    if eopt_name in ('muon', 'adaptive_muon', 'aurora', 'rmnp', 'muown', 'normuown', 'master', 'neutrino'):
         muon_scalar_lr = getattr(config, 'muon_scalar_lr', None)
         muon_scalar_wd = getattr(config, 'muon_scalar_weight_decay', None)
+
+        routing_fn = (
+            _is_nonlinear_or_embedding_for_neutrino
+            if eopt_name == 'neutrino'
+            else _is_nonlinear_or_embedding
+        )
 
         if muon_scalar_lr is not None:
             lr_key = ParamKey(
                 predicate=ParamPredicate(
-                    name="muon_scalar_group_lr", fn=_is_nonlinear_or_embedding
+                    name="muon_scalar_group_lr", fn=routing_fn
                 )
             )
             if eopt_name == 'master':
@@ -858,7 +866,7 @@ def _get_megatron_emerging_optimizer(
             # shape-1 biases/norms — those already have wd_mult=0 from the
             # standard override (see get_standard_config_overrides).
             def _is_nonlinear_or_embedding_dim_not_1(param):
-                return len(param.shape) != 1 and _is_nonlinear_or_embedding(param)
+                return len(param.shape) != 1 and routing_fn(param)
 
             wd_key = ParamKey(
                 predicate=ParamPredicate(

@@ -368,6 +368,16 @@ class OptimizerConfig:
     """EMA coefficient for the per-row second moment when
     muown_use_normuon=True. Default 0.95."""
 
+    # Neutrino optimizer (Adam + low-rank projected Muon with error feedback)
+    neutrino_k: int = 512
+    """Projection rank for the Neutrino optimizer. Default 512."""
+
+    neutrino_no_momentum: bool = False
+    """If True, disable momentum tracking in Neutrino. Default False."""
+
+    neutrino_basis_init: str = "gaussian"
+    """Basis initialization distribution for Neutrino ('gaussian', 'rademacher', 'orthonormal', 'uniform')."""
+
     ##########################################################################
     # Master optimizer (Adam/AdEMAMix + optional Muon orthogonalized updates +
     # L2 hypersphere weight clipping + learnable per-axis gains). Flag-gated

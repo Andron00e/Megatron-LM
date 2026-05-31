@@ -2383,6 +2383,14 @@ def _add_regularization_args(parser):
     group.add_argument('--muown-normuon-beta2', type=float, default=0.95,
                        help='EMA coefficient for the per-row second moment when '
                        'NorMuown rescaling is enabled. Default 0.95.')
+    # Neutrino (Hat-Muon) parameters
+    group.add_argument('--neutrino-k', type=int, default=512,
+                       help='Projection rank/dimension for Neutrino optimizer. Default 512.')
+    group.add_argument('--neutrino-no-momentum', action='store_true',
+                       help='Disable momentum tracking in Neutrino (HAT-MUON-EF, NO-MOM).')
+    group.add_argument('--neutrino-basis-init', type=str, default='gaussian',
+                       choices=['gaussian', 'rademacher', 'orthonormal', 'uniform'],
+                       help='Basis initialization distribution for Neutrino. Default: gaussian.')
     group.add_argument('--lion-beta1', type=float, default=0.95,
                        help='First beta coefficient for Lion optimizer '
                        '(used in sign update). Default: 0.95.')
@@ -2728,7 +2736,7 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon', 'aurora', 'rmnp', 'muown', 'normuown', 'master', 'schedulefree_plus'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon', 'aurora', 'rmnp', 'muown', 'normuown', 'master', 'schedulefree_plus', 'neutrino'],
                        help='Optimizer function. '
                             'Note: dist_muon is deprecated; use --optimizer muon '
                             'with --use-distributed-optimizer instead.')
