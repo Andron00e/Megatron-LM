@@ -2307,7 +2307,7 @@ def _add_regularization_args(parser):
                        '--muon-scale-mode unit_rms_norm to use unit_rms_norm scaling, '
                        'or set --muon-scale-mode spectral to keep spectral scaling. '
                        "'shape_up' (= max(d_out/d_in, d_in/d_out)**0.5) is currently "
-                       'only consumed by --optimizer master.')
+                       'consumed by --optimizer master and neutrino.')
     group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
                        choices=['low', 'medium', 'high'],
                        help='FP32 matmul precision for Newton-Schulz iteration')

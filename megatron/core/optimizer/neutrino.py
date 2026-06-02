@@ -17,16 +17,22 @@ logger = logging.getLogger(__name__)
 
 
 try:
-    from emerging_optimizers.orthogonalized_optimizers import get_muon_scale_factor
+    from emerging_optimizers.orthogonalized_optimizers import (
+        get_muon_scale_factor as _emerging_get_muon_scale_factor,
+    )
 except ImportError:
+    _emerging_get_muon_scale_factor = None
 
-    def get_muon_scale_factor(size_out: int, size_in: int, mode: str = "spectral") -> float:
-        if mode == "shape_up":
-            return max(size_out / size_in, size_in / size_out) ** 0.5
-        if mode == "none":
-            return 1.0
-        # kimi's muon fallback
-        return 0.2 * (max(size_out, size_in) ** 0.5)
+
+def get_muon_scale_factor(size_out: int, size_in: int, mode: str = "spectral") -> float:
+    if mode == "shape_up":
+        return max(size_out / size_in, size_in / size_out) ** 0.5
+    if mode == "none":
+        return 1.0
+    if _emerging_get_muon_scale_factor is not None:
+        return _emerging_get_muon_scale_factor(size_out, size_in, mode=mode)
+    # kimi's muon fallback
+    return 0.2 * (max(size_out, size_in) ** 0.5)
 
 
 @torch.no_grad()
