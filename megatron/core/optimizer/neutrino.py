@@ -376,13 +376,13 @@ class Neutrino(Optimizer):
                         Gram = Gram_local
 
                         L = self._cholesky_qr(Gram)
-                        U_local = self._solve_triangular(L, Y_local)
+                        U = self._solve_triangular(L, Y_local)
 
                         if E is not None:
-                            update = torch.matmul(U_local, V.transpose(-2, -1))
+                            update = torch.matmul(U, V.transpose(-2, -1))
                             YV = torch.matmul(Y_local, V.transpose(-2, -1))
                         else:
-                            update = U_local @ V.T
+                            update = U @ V.T
                             YV = Y_local @ V.T
 
                     elif partition_dim == 1:
