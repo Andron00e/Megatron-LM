@@ -234,6 +234,17 @@ class Neutrino(Optimizer):
         except Exception:
             is_rank_0 = True
 
+        has_wandb = False
+        try:
+            import wandb
+
+            if wandb.run is not None:
+                has_wandb = True
+        except ImportError:
+            pass
+
+        is_logging_rank = is_rank_0 or has_wandb
+
         for group in self.param_groups:
             lr = group['lr']
             wd = group['weight_decay']
@@ -437,8 +448,8 @@ class Neutrino(Optimizer):
                 # error feedback update
                 state['error_buffer'].copy_(g_adj - YV)
 
-                # --- metrics (rank-0 only) ---
-                if is_rank_0:
+                # --- metrics (rank-0 or wandb logging rank) ---
+                if is_logging_rank:
                     err_norm = torch.linalg.vector_norm(g_adj - YV)
                     g_adj_norm = torch.linalg.vector_norm(g_adj)
                     error_ratio = (err_norm / (g_adj_norm + 1e-8)).item()
@@ -500,8 +511,8 @@ class Neutrino(Optimizer):
                     total_gram_cond += gram_cond
                     num_parameters += 1
 
-        # logging to wandb (rank-0 only)
-        if is_rank_0 and num_parameters > 0:
+        # logging to wandb
+        if has_wandb and num_parameters > 0:
             global_metrics = {
                 "neutrino/global_mean_error_ratio": total_error_ratio / num_parameters,
                 "neutrino/global_mean_update_ratio": total_update_ratio / num_parameters,

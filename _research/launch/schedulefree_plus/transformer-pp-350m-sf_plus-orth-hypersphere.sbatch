@@ -53,8 +53,7 @@ GBS=128
 SEQ_LEN=4096
 TRAIN_SAMPLES=3662109
 
-# Schedule-Free learning rate is typically set constant.
-# Adjust LR as needed.
+
 LR=${LR:-1e-3}
 MIN_LR=${MIN_LR:-1e-5}
 
@@ -140,7 +139,7 @@ REGULARIZATION_ARGS=(
     --hidden-dropout 0.0
     # Decoupled weight decay for Schedule-Free+ is scaled by lr**2.
     # Standard values should be much larger (e.g. 20.0 or 50.0).
-    --weight-decay 20.0
+    --weight-decay 0.0
     --adam-beta1 0.9
     --adam-beta2 0.95
 )
@@ -149,12 +148,12 @@ SCHEDULEFREE_PLUS_ARGS=(
     --sf-beta1 0.9
     --sf-beta1-max 0.965
     # Anneal outer momentum from 0.9 to 0.965 over 10000 steps.
-    --sf-beta1-anneal-steps 10000
-    --polyak-beta 0.0
+    --sf-beta1-anneal-steps 0
+    --polyak-beta 0.99
     --c-warmup 0
     --r 0.0
     --weight-lr-power 2.0
-    
+
     # Hypersphere Constraints & Orthogonal Updates
     --use-orthogonal-updates
     --hypersphere-mode flat
