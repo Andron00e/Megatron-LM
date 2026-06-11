@@ -109,6 +109,12 @@ class TestMultiTokenPredictionLayer:
         assert isinstance(mtp, MultiTokenPredictionBlock)
         assert mtp.config.mtp_detach_heads is True
 
+        # Verify all parameters are tagged for separate MTP grad-norm handling.
+        for name, param in mtp.named_parameters():
+            assert getattr(param, 'grad_norm_group', None) == 'mtp', (
+                f"Parameter {name} missing grad_norm_group attribute"
+            )
+
     def test_get_embeddings_detaches_decoder_input(self):
         """With mtp_detach_heads=True, _get_embeddings detaches decoder_input (severing
         gradient flow to the shared embedding) while still returning a hidden_states
