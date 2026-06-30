@@ -38,11 +38,8 @@ from megatron.training import (
     pretrain,
     print_rank_0,
 )
-from megatron.training.arguments import (
-    core_transformer_config_from_args,
-    parse_and_validate_args,
-    pretrain_cfg_container_from_args,
-)
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from pretrain_gpt import loss_func
 
 
@@ -451,9 +448,9 @@ if __name__ == "__main__":
     pretrain(
         full_config,
         train_valid_test_datasets_provider,
-        model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
+        model_provider,
         get_embedding_ranks=llava_embedding_ranks,
         get_position_embedding_ranks=llava_position_embedding_ranks,
     )

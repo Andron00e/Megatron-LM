@@ -892,12 +892,55 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
+# TODO: Remove after these three legacy callers migrate:
+# pretrain_mamba.py, examples/academic_paper_scripts/detxoify_lm/finetune_gpt.py,
+# and examples/post_training/modelopt/finetune.py.
+def _normalize_pretrain_args(
+    cfg_container,
+    train_valid_test_dataset_provider,
+    model_type,
+    forward_step_func,
+    model_provider,
+    process_non_loss_data_func,
+):
+    """Normalize legacy positional pretrain calls to the ModelBuilder order."""
+    if not isinstance(cfg_container, PretrainConfigContainer):
+        legacy_dataset = cfg_container
+        legacy_provider = train_valid_test_dataset_provider
+        cfg_container = None
+        train_valid_test_dataset_provider = legacy_dataset
+        if model_provider is None:
+            # Legacy non-config order: (dataset, provider, model_type, forward).
+            model_provider = legacy_provider
+        else:
+            # Legacy non-config order with a fifth positional callback:
+            # (dataset, provider, model_type, forward, process_non_loss_data_func).
+            if process_non_loss_data_func is None:
+                process_non_loss_data_func = model_provider
+            model_provider = legacy_provider
+    elif isinstance(forward_step_func, ModelType) and callable(model_type):
+        # Legacy config order: (cfg, dataset, provider, model_type, forward).
+        model_provider, model_type, forward_step_func = (
+            model_type,
+            forward_step_func,
+            model_provider,
+        )
+    return (
+        cfg_container,
+        train_valid_test_dataset_provider,
+        model_type,
+        forward_step_func,
+        model_provider,
+        process_non_loss_data_func,
+    )
+
+
 def pretrain(
     cfg_container,
     train_valid_test_dataset_provider=None,
-    model_provider=None,
     model_type=None,
     forward_step_func=None,
+    model_provider=None,
     process_non_loss_data_func=None,
     extra_args_provider=None,
     args_defaults={},
@@ -949,29 +992,21 @@ def pretrain(
         inprocess_call_wrapper: an optional instance of inprocess.CallWrapper,
             it is automatically injected when in-process restart is in use
     """
-    # Keep the pre-container API working for downstream fork callers while new
-    # launchers pass the container as the first argument.
-    if not isinstance(cfg_container, PretrainConfigContainer):
-        legacy_dataset = cfg_container
-        legacy_model_provider = train_valid_test_dataset_provider
-        legacy_model_type = model_provider
-        legacy_forward_step_func = model_type
-        legacy_process_non_loss_data_func = forward_step_func
-        (
-            cfg_container,
-            train_valid_test_dataset_provider,
-            model_provider,
-            model_type,
-            forward_step_func,
-            process_non_loss_data_func,
-        ) = (
-            None,
-            legacy_dataset,
-            legacy_model_provider,
-            legacy_model_type,
-            legacy_forward_step_func,
-            legacy_process_non_loss_data_func,
-        )
+    (
+        cfg_container,
+        train_valid_test_dataset_provider,
+        model_type,
+        forward_step_func,
+        model_provider,
+        process_non_loss_data_func,
+    ) = _normalize_pretrain_args(
+        cfg_container,
+        train_valid_test_dataset_provider,
+        model_type,
+        forward_step_func,
+        model_provider,
+        process_non_loss_data_func,
+    )
 
     # Capture timestamp right at top of pretrain, before initialize_megatron
     global _STARTUP_TIMESTAMPS
@@ -1139,7 +1174,11 @@ def pretrain(
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, checkpointing_context=checkpointing_context
+        model_type,
+        model_provider_func=model_provider,
+        checkpointing_context=checkpointing_context,
+        cfg_container=cfg_container,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     timers('model-and-optimizer-setup').stop()
@@ -1740,12 +1779,39 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
 
 
 
+def _dense_model_config_for_upcycling(model_config, moe_ffn_hidden_size, granularity):
+    """Return a dense copy for upcycling without changing the final MoE config."""
+    dense_model_config = copy.deepcopy(model_config)
+    dense_model_config.transformer.num_moe_experts = None
+    dense_model_config.transformer.expert_model_parallel_size = 1
+    dense_model_config.transformer.ffn_hidden_size = moe_ffn_hidden_size * granularity
+    return dense_model_config
+
+
+def _build_legacy_dense_model_for_upcycling(model_provider_func, model_type):
+    """Build a dense source through the legacy provider after args are adjusted."""
+    return get_model(model_provider_func, model_type)
+
+
+def _normalize_setup_model_args(model_type, model_provider_func):
+    """Normalize the historical (provider, model_type) positional order."""
+    if not isinstance(model_type, ModelType) and isinstance(model_provider_func, ModelType):
+        model_provider_func, model_type = model_type, model_provider_func
+    return model_type, model_provider_func
+
+
 def setup_model_and_optimizer(
-    model_provider_func,
     model_type,
+    model_provider_func=None,
     checkpointing_context=None,
+    pg_collection=None,
+    *,
+    cfg_container=None,
 ):
     """Setup model and optimizer."""
+    model_type, model_provider_func = _normalize_setup_model_args(
+        model_type, model_provider_func
+    )
     args = get_args()
     timers = get_timers()
     one_logger = get_one_logger()
@@ -1755,7 +1821,31 @@ def setup_model_and_optimizer(
     # (required for --rl-offload-optimizer-during-inference).
     skip_optimizer = args.skip_train and (not args.perform_rl_step or args.no_load_optim)
     wrap_with_ddp = not skip_optimizer
-    model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
+
+    def _build_model_wrapper(wrap_with_ddp, model_config=None):
+        if (
+            cfg_container is not None
+            and getattr(cfg_container, "model", None) is not None
+            and pg_collection is not None
+        ):
+            from megatron.training.utils import start_memory_history_recording
+
+            start_memory_history_recording(cfg_container.profiling)
+            model_config = model_config or cfg_container.model
+            builder = model_config.get_builder_cls()(model_config)
+            return builder.build_distributed_models(
+                pg_collection=pg_collection,
+                ddp_config=cfg_container.ddp,
+                overlap_param_gather_with_optimizer_step=cfg_container.optimizer.overlap_param_gather_with_optimizer_step,
+                use_megatron_fsdp=cfg_container.dist.use_megatron_fsdp,
+                use_torch_fsdp2=cfg_container.dist.use_torch_fsdp2,
+                wrap_with_ddp=wrap_with_ddp,
+                data_parallel_random_init=cfg_container.rng.data_parallel_random_init,
+            )
+        assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."
+        return get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp, pg_collection=pg_collection)
+
+    model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
@@ -1829,8 +1919,20 @@ def setup_model_and_optimizer(
         args.expert_model_parallel_size = 1
         args.ffn_hidden_size = moe_ffn_hidden_size * args.moe_upcycling_granularity
 
-        # get dense model
-        dense_model_for_upcycling = get_model(model_provider_func, model_type)
+        # Build the dense source model without mutating the final MoE model config.
+        if model_provider_func is not None:
+            # Legacy providers read the global args, so use the temporary dense values.
+            dense_model_for_upcycling = _build_legacy_dense_model_for_upcycling(
+                model_provider_func, model_type
+            )
+        else:
+            # Config-only callers need a separate config object for the dense model.
+            dense_model_config = _dense_model_config_for_upcycling(
+                cfg_container.model, moe_ffn_hidden_size, args.moe_upcycling_granularity
+            )
+            dense_model_for_upcycling = _build_model_wrapper(
+                wrap_with_ddp=True, model_config=dense_model_config
+            )
 
         # recover moe upcycling related args in global args before executing upcycling
         args.num_experts = num_experts

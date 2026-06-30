@@ -146,7 +146,8 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             The constructed model
 
         Note:
-            Virtual pipeline model parallelism is not supported for Hybrid models.
+            Virtual pipeline model parallelism requires an explicit pipe-delimited
+            hybrid layer pattern with one segment per virtual pipeline stage.
         """
         hybrid_stack_spec = self._model_config.hybrid_stack_spec
         if hybrid_stack_spec is None:
@@ -159,14 +160,6 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
                 )
             else:
                 hybrid_stack_spec = default_hybrid_stack_spec
-
-        assert (
-            getattr(self._model_config.transformer, "virtual_pipeline_model_parallel_size", None) is None
-            and vp_stage is None
-        ), (
-            "Virtual pipeline model parallelism is temporarily unsupported in Hybrid "
-            "models due to upstream MCore HybridModel API dependency"
-        )
 
         assert self._model_config.vocab_size is not None, "vocab_size must be configured before calling build_model()"
         if self._model_config.should_pad_vocab:

@@ -323,9 +323,18 @@ class TestHybridModelBuilderBuildModel:
     @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
     @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
     @patch("megatron.training.models.hybrid.HybridModel")
-    def test_virtual_pipeline_raises(self, mock_model, *_):
-        with pytest.raises(AssertionError, match="Virtual pipeline"):
-            self.builder.build_model(self.pg, vp_stage=0)
+    def test_virtual_pipeline_forwards_stage_with_explicit_segments(self, mock_model, *_):
+        pattern = "M-M*|M-M*"
+        self.config.hybrid_layer_pattern = pattern
+
+        self.builder.build_model(self.pg, pre_process=True, post_process=True, vp_stage=0)
+        self.builder.build_model(self.pg, pre_process=True, post_process=True, vp_stage=1)
+
+        assert [call.kwargs["vp_stage"] for call in mock_model.call_args_list] == [0, 1]
+        assert [call.kwargs["hybrid_layer_pattern"] for call in mock_model.call_args_list] == [
+            pattern,
+            pattern,
+        ]
 
     @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
     @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
