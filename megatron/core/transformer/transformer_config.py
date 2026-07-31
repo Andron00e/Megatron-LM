@@ -1222,6 +1222,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
+    moe_flex_dispatcher_num_sms: Optional[int] = None
+    """Optional common SM-count override for the flex dispatcher backends.
+    If None, each backend uses its legacy backend-specific value."""
+
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
 
