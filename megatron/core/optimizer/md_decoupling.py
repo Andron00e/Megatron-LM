@@ -42,7 +42,7 @@ from . import (
     get_standard_config_overrides,
 )
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
-from .muon_logging import _gain_log_family
+from .muon_logging import _gain_log_family, capture_muon_update_norms
 from .optimizer import (
     ChainedOptimizer,
     Float16OptimizerWithFloat16Params,
@@ -621,6 +621,8 @@ class _MDDecouplingBase(torch.optim.Optimizer):
 
             if not _will_normalize:
                 self._apply_weight_decay_inplace(p, group)
+
+        capture_muon_update_norms(p, update, group["lr"])
 
         # Apply update.
         p.add_(update, alpha=-group["lr"])

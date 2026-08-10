@@ -53,6 +53,122 @@ _GAIN_FAMILIES = (
     "unclassified",
 )
 
+_CAPTURE_NORMS = False
+_PENDING_NORMS = {"gradients": [], "updates": []}
+
+
+def _matrix_norm_stats_impl(tensor: torch.Tensor) -> torch.Tensor:
+    """Compute global RMS and row/column RMS tail statistics."""
+    rows, cols = tensor.shape[-2:]
+    experts = tensor.numel() // (rows * cols)
+    squares = tensor.float().reshape(experts, rows, cols).square()
+    row_rms = squares.mean(dim=2).sqrt().flatten()
+    col_rms = squares.mean(dim=1).sqrt().flatten()
+    quantiles = row_rms.new_tensor([0.0, 0.1, 0.5])
+    return torch.cat(
+        (
+            squares.mean().sqrt().reshape(1),
+            torch.quantile(row_rms, quantiles),
+            torch.quantile(col_rms, quantiles),
+        )
+    )
+
+
+_compiled_matrix_norm_stats = torch.compile(_matrix_norm_stats_impl, dynamic=False)
+
+
+def _matrix_norm_stats(tensor: torch.Tensor) -> torch.Tensor:
+    stats = _compiled_matrix_norm_stats if tensor.is_cuda else _matrix_norm_stats_impl
+    return stats(tensor)
+
+
+def set_muon_norm_logging(enabled: bool) -> None:
+    """Enable norm capture for the current step and discard stale values."""
+    global _CAPTURE_NORMS
+    _CAPTURE_NORMS = enabled
+    for values in _PENDING_NORMS.values():
+        values.clear()
+
+
+def _capture_norms(kind: str, param: torch.Tensor, tensor: torch.Tensor, scale=1.0) -> None:
+    if not _CAPTURE_NORMS or tensor.ndim not in {2, 3}:
+        return
+    _PENDING_NORMS[kind].append(
+        (
+            getattr(param, "md_gain_log_family", "unclassified"),
+            _matrix_norm_stats(tensor.detach()) * abs(scale),
+        )
+    )
+
+
+@torch.no_grad()
+def capture_finalized_gradient_norms(model: List[torch.nn.Module]) -> None:
+    """Capture synchronized model gradients before optimizer processing."""
+    if not _CAPTURE_NORMS:
+        return
+    _PENDING_NORMS["gradients"].clear()
+    for model_chunk in model:
+        for param in model_chunk.parameters():
+            if getattr(param, "md_gain_log_family", None) is None:
+                continue
+            grad = getattr(param, "main_grad", None)
+            if grad is None:
+                grad = param.grad
+            if grad is not None:
+                _capture_norms("gradients", param, grad)
+
+
+def capture_muon_update_norms(param: torch.Tensor, update: torch.Tensor, lr: float) -> None:
+    """Capture the momentum-processed MuonMD update, including its learning rate."""
+    _capture_norms("updates", param, update, lr)
+
+
+def collect_captured_muon_norms() -> Dict[str, float]:
+    """Aggregate captured RMS tail statistics by MuonMD parameter family."""
+    entries = [entry for values in _PENDING_NORMS.values() for entry in values]
+    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    if not entries and not distributed:
+        return {}
+    device = entries[0][1].device if entries else torch.device("cuda", torch.cuda.current_device())
+    kinds = (("gradients", "gradients"), ("updates", "updates"))
+    totals = torch.zeros(
+        (len(kinds), len(_GAIN_FAMILIES), 6), dtype=torch.float64, device=device
+    )
+    minima = torch.full(
+        (len(kinds), len(_GAIN_FAMILIES), 2),
+        float("inf"),
+        dtype=torch.float64,
+        device=device,
+    )
+    family_indices = {family: index for index, family in enumerate(_GAIN_FAMILIES)}
+    for kind_index, (kind, _) in enumerate(kinds):
+        for family, values in _PENDING_NORMS[kind]:
+            family_index = family_indices.get(family, family_indices["unclassified"])
+            totals[kind_index, family_index, :5] += values[[0, 2, 3, 5, 6]]
+            totals[kind_index, family_index, 5] += 1
+            minima[kind_index, family_index] = torch.minimum(
+                minima[kind_index, family_index], values[[1, 4]]
+            )
+    if distributed:
+        torch.distributed.all_reduce(totals)
+        torch.distributed.all_reduce(minima, op=torch.distributed.ReduceOp.MIN)
+    stats = {}
+    for kind_index, (_, name) in enumerate(kinds):
+        for family_index, family in enumerate(_GAIN_FAMILIES):
+            count = totals[kind_index, family_index, 5]
+            if count:
+                values = totals[kind_index, family_index, :5] / count
+                prefix = f"muon-md/{name}/{family}"
+                stats[f"{prefix}/rms"] = values[0].item()
+                stats[f"{prefix}/row-rms/min"] = minima[kind_index, family_index, 0].item()
+                stats[f"{prefix}/row-rms/p10"] = values[1].item()
+                stats[f"{prefix}/row-rms/median"] = values[2].item()
+                stats[f"{prefix}/col-rms/min"] = minima[kind_index, family_index, 1].item()
+                stats[f"{prefix}/col-rms/p10"] = values[3].item()
+                stats[f"{prefix}/col-rms/median"] = values[4].item()
+    set_muon_norm_logging(False)
+    return stats
+
 
 def _matrix_weight_stats(
     matrix_weights: torch.Tensor, thresholds: torch.Tensor
@@ -106,7 +222,7 @@ def _gain_log_family(name: str, param: torch.Tensor) -> str:
     if "fc2_latent_proj" in name:
         return "moe-latent-out"
     if "experts" in name:
-        return "expert-out" if is_out else "expert-in"
+        return "expert-out" if is_out or "linear_fc2" in name else "expert-in"
     if "attention" in name:
         return "attention-out" if is_out else "attention-in"
     if ".mlp." in name:

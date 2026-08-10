@@ -18,6 +18,28 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
 
 
+def test_muon_gradient_and_update_norms_are_grouped_by_family():
+    param = torch.nn.Parameter(torch.zeros(2, 3))
+    param.md_gain_log_family = "attention-in"
+    param.main_grad = torch.tensor([[3.0, 4.0, 0.0], [0.0, 0.0, 0.0]])
+    model = torch.nn.Module()
+    model.register_parameter("weight", param)
+
+    md_logging_module.set_muon_norm_logging(True)
+    md_logging_module.capture_finalized_gradient_norms([model])
+    md_logging_module.capture_muon_update_norms(
+        param, torch.tensor([[0.0, 0.0, 12.0], [0.0, 0.0, 0.0]]), 0.5
+    )
+    stats = md_logging_module.collect_captured_muon_norms()
+
+    prefix = "muon-md/gradients/attention-in"
+    assert stats[f"{prefix}/rms"] == pytest.approx(math.sqrt(25.0 / 6.0))
+    assert stats[f"{prefix}/row-rms/min"] == 0.0
+    assert stats[f"{prefix}/row-rms/p10"] == pytest.approx(math.sqrt(25.0 / 3.0) * 0.1)
+    assert stats[f"{prefix}/row-rms/median"] == pytest.approx(math.sqrt(25.0 / 3.0) * 0.5)
+    assert stats["muon-md/updates/attention-in/rms"] == pytest.approx(6.0 / math.sqrt(6.0))
+
+
 def test_md_gain_log_family_classifies_matrix_types():
     cases = [
         ("decoder.layers.0.mlp.router.weight", "is_router", "router"),
@@ -50,6 +72,12 @@ def test_md_gain_log_family_classifies_matrix_types():
         if attribute:
             setattr(param, attribute, True)
         assert _gain_log_family(name, param) == expected
+
+    grouped_fc2 = torch.nn.Parameter(torch.ones(2, 2, 2))
+    assert (
+        _gain_log_family("decoder.layers.0.mlp.experts.linear_fc2.weight", grouped_fc2)
+        == "expert-out"
+    )
 
 
 def test_collect_md_gain_stats_logs_layernorm_effective_gains():

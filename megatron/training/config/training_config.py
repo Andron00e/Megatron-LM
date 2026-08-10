@@ -233,6 +233,9 @@ class LoggerConfig:
     log_muon_param_rms: bool = False
     """If set, log weight RMS by Muon parameter family."""
 
+    log_muon_grad_norms: bool = False
+    """Log Muon-MD gradient and processed-update RMS tails by family."""
+
     log_muon_per_layer: bool = False
     """If set, additionally log all Muon statistics by global layer."""
 
