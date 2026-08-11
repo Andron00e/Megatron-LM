@@ -2086,7 +2086,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     set_muon_norm_logging(
         args.optimizer == "md_decoupling"
         and args.log_muon_grad_norms
-        and (iteration + 1) % muon_log_interval == 0
+        and (iteration + 1) % muon_log_interval == 0,
+        sparsity_thresholds=args.muon_sparsity_thresholds,
+        tensor_kinds=args.muon_log_tensor_kinds,
+        tensor_stats=args.muon_log_tensor_stats,
     )
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
@@ -3634,6 +3637,8 @@ def train(
                             log_gains=args.log_muon_gains,
                             log_sparsity=args.log_muon_sparsity,
                             log_param_rms=args.log_muon_param_rms,
+                            gain_stats=args.muon_log_gain_stats,
+                            param_stats=args.muon_log_param_stats,
                         )
                     )
         if optimizer is not None:

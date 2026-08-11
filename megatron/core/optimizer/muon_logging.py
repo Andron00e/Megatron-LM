@@ -30,6 +30,18 @@ from megatron.core.utils import (
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
 
 _GAIN_AXES = ("row", "col", "flat")
+_GAIN_STATS = (
+    "mean",
+    "rms",
+    "effective-rms",
+    "min",
+    "max",
+    "saturated-fraction",
+    "gain-field-rms",
+    "combined-log-scale",
+    "row-col-imbalance",
+)
+_PARAM_STATS = ("rms", "frobenius-norm")
 _MATRIX_SQUARE_SUM, _MATRIX_ELEMENT_COUNT, _MATRIX_LOG_SUM, _WEIGHT_SQUARE_SUM, _WEIGHT_ELEMENT_COUNT, _MATRIX_NEAR_ZERO_START = range(6)  # fmt: skip
 
 # Columns of ``totals``: element-weighted effective-gain distribution statistics.
@@ -39,7 +51,7 @@ _GAIN_SUM, _GAIN_SQUARE_SUM, _GAIN_ELEMENT_COUNT, _GAIN_SOFTPLUS_COUNT, _GAIN_SA
 _MATRIX_RMS_SUM, _MATRIX_COUNT, _MATRIX_AXIS_STAT_COUNT = range(3)
 
 # Fixed columns of ``matrix_totals``; one sparsity-sum column per threshold follows these.
-_SCALE_SUM, _PAIR_COUNT, _COMBINED_LOG_SCALE_SUM, _ROW_COL_IMBALANCE_SUM, _SOFTPLUS_PAIR_COUNT, _SPARSITY_MATRIX_COUNT, _PARAM_RMS_SUM, _PARAM_RMS_COUNT, _SPARSITY_SUM_START = range(9)  # fmt: skip
+_SCALE_SUM, _PAIR_COUNT, _COMBINED_LOG_SCALE_SUM, _ROW_COL_IMBALANCE_SUM, _SOFTPLUS_PAIR_COUNT, _SPARSITY_MATRIX_COUNT, _PARAM_RMS_SUM, _PARAM_FROBENIUS_SUM, _PARAM_RMS_COUNT, _SPARSITY_SUM_START = range(10)  # fmt: skip
 
 _GAIN_FAMILIES = (
     "router",
@@ -61,50 +73,119 @@ _GAIN_FAMILIES = (
 # Finalized-gradient, orthogonal-update, and processed-update norm logging
 # -----------------------------------------------------------------------------
 
+_TENSOR_KINDS = ("gradients", "orthogonal-updates", "updates")
+_TENSOR_STATS = ("rms", "frobenius-norm", "rms-tails", "sparsity")
 _CAPTURE_NORMS = False
-_PENDING_NORMS = {"gradients": [], "orthogonal-updates": [], "updates": []}
+_CAPTURE_KINDS = _TENSOR_KINDS
+_CAPTURE_STATS = _TENSOR_STATS
+_CAPTURE_SPARSITY_THRESHOLDS = (1e-20, 1e-10, 1e-30)
+_PENDING_NORMS = {kind: [] for kind in _TENSOR_KINDS}
 
 
-def _matrix_norm_stats_impl(tensor: torch.Tensor) -> torch.Tensor:
-    """Compute global RMS and row/column RMS tail statistics."""
+def _matrix_norm_stats_impl(
+    tensor: torch.Tensor,
+    scale: torch.Tensor,
+    sparsity_thresholds: torch.Tensor,
+    log_rms: bool,
+    log_frobenius: bool,
+    log_rms_tails: bool,
+    log_sparsity: bool,
+) -> torch.Tensor:
+    """Compute selected matrix norms, RMS tails, and near-zero fractions."""
     rows, cols = tensor.shape[-2:]
     experts = tensor.numel() // (rows * cols)
-    squares = tensor.float().reshape(experts, rows, cols).square()
-    row_rms = squares.mean(dim=2).sqrt().flatten()
-    col_rms = squares.mean(dim=1).sqrt().flatten()
-    quantiles = row_rms.new_tensor([0.0, 0.1, 0.5])
-    return torch.cat(
-        (
-            squares.mean().sqrt().reshape(1),
-            torch.quantile(row_rms, quantiles),
-            torch.quantile(col_rms, quantiles),
-        )
+    matrices = tensor.float().reshape(experts, rows, cols)
+    zeros = matrices.new_zeros(1)
+
+    if log_rms or log_frobenius or log_rms_tails:
+        squares = matrices.square()
+    rms = squares.mean().sqrt().mul(scale).reshape(1) if log_rms else zeros
+    frobenius = (
+        squares.sum(dim=(1, 2)).sqrt().mean().mul(scale).reshape(1)
+        if log_frobenius
+        else zeros
     )
+    if log_rms_tails:
+        row_rms = squares.mean(dim=2).sqrt().flatten()
+        col_rms = squares.mean(dim=1).sqrt().flatten()
+        quantiles = row_rms.new_tensor([0.0, 0.1, 0.5])
+        row_tails = torch.quantile(row_rms, quantiles) * scale
+        col_tails = torch.quantile(col_rms, quantiles) * scale
+    else:
+        row_tails = matrices.new_zeros(3)
+        col_tails = matrices.new_zeros(3)
+    if log_sparsity:
+        scaled_absolute = matrices.abs() * scale
+        sparsity = (
+            scaled_absolute.unsqueeze(-1) < sparsity_thresholds
+        ).to(torch.float32).mean(dim=(0, 1, 2))
+    else:
+        sparsity = matrices.new_zeros(sparsity_thresholds.numel())
+    return torch.cat((rms, frobenius, row_tails, col_tails, sparsity))
 
 
 _compiled_matrix_norm_stats = torch.compile(_matrix_norm_stats_impl, dynamic=False)
 
 
-def _matrix_norm_stats(tensor: torch.Tensor) -> torch.Tensor:
+def _matrix_norm_stats(tensor: torch.Tensor, scale=1.0) -> torch.Tensor:
     stats = _compiled_matrix_norm_stats if tensor.is_cuda else _matrix_norm_stats_impl
-    return stats(tensor)
+    scale_tensor = torch.as_tensor(abs(scale), dtype=torch.float32, device=tensor.device)
+    thresholds = torch.as_tensor(
+        _CAPTURE_SPARSITY_THRESHOLDS if "sparsity" in _CAPTURE_STATS else (),
+        dtype=torch.float32,
+        device=tensor.device,
+    )
+    return stats(
+        tensor,
+        scale_tensor,
+        thresholds,
+        "rms" in _CAPTURE_STATS,
+        "frobenius-norm" in _CAPTURE_STATS,
+        "rms-tails" in _CAPTURE_STATS,
+        "sparsity" in _CAPTURE_STATS,
+    )
 
 
-def set_muon_norm_logging(enabled: bool) -> None:
-    """Enable norm capture for the current step and discard stale values."""
-    global _CAPTURE_NORMS
+def set_muon_norm_logging(
+    enabled: bool,
+    sparsity_thresholds=(1e-20, 1e-10, 1e-30),
+    tensor_kinds=_TENSOR_KINDS,
+    tensor_stats=_TENSOR_STATS,
+) -> None:
+    """Configure capture for the current step and discard stale values."""
+    global _CAPTURE_NORMS, _CAPTURE_KINDS, _CAPTURE_STATS, _CAPTURE_SPARSITY_THRESHOLDS
     _CAPTURE_NORMS = enabled
+    _CAPTURE_KINDS = tuple(dict.fromkeys(tensor_kinds))
+    _CAPTURE_STATS = tuple(dict.fromkeys(tensor_stats))
+    unknown_kinds = set(_CAPTURE_KINDS).difference(_TENSOR_KINDS)
+    unknown_stats = set(_CAPTURE_STATS).difference(_TENSOR_STATS)
+    if unknown_kinds:
+        raise ValueError(f"Unknown Muon tensor logging kinds: {sorted(unknown_kinds)}")
+    if unknown_stats:
+        raise ValueError(f"Unknown Muon tensor logging stats: {sorted(unknown_stats)}")
+    _CAPTURE_NORMS = enabled and bool(_CAPTURE_KINDS) and bool(_CAPTURE_STATS)
+    _CAPTURE_SPARSITY_THRESHOLDS = tuple(
+        dict.fromkeys(float(value) for value in sparsity_thresholds)
+    )
+    if enabled and "sparsity" in _CAPTURE_STATS and (
+        not _CAPTURE_SPARSITY_THRESHOLDS
+        or any(
+            not math.isfinite(value) or value <= 0
+            for value in _CAPTURE_SPARSITY_THRESHOLDS
+        )
+    ):
+        raise ValueError("Muon gradient/update sparsity thresholds must be finite positive values")
     for values in _PENDING_NORMS.values():
         values.clear()
 
 
 def _capture_norms(kind: str, param: torch.Tensor, tensor: torch.Tensor, scale=1.0) -> None:
-    if not _CAPTURE_NORMS or tensor.ndim not in {2, 3}:
+    if not _CAPTURE_NORMS or kind not in _CAPTURE_KINDS or tensor.ndim not in {2, 3}:
         return
     _PENDING_NORMS[kind].append(
         (
             getattr(param, "md_gain_log_family", "unclassified"),
-            _matrix_norm_stats(tensor.detach()) * abs(scale),
+            _matrix_norm_stats(tensor.detach(), scale),
         )
     )
 
@@ -112,7 +193,7 @@ def _capture_norms(kind: str, param: torch.Tensor, tensor: torch.Tensor, scale=1
 @torch.no_grad()
 def capture_finalized_gradient_norms(model: List[torch.nn.Module]) -> None:
     """Capture synchronized model gradients before optimizer processing."""
-    if not _CAPTURE_NORMS:
+    if not _CAPTURE_NORMS or "gradients" not in _CAPTURE_KINDS:
         return
     _PENDING_NORMS["gradients"].clear()
     for model_chunk in model:
@@ -141,19 +222,24 @@ def capture_muon_update_block_norms(
 
 
 def collect_captured_muon_norms() -> Dict[str, float]:
-    """Aggregate captured RMS tail statistics by MuonMD parameter family."""
-    entries = [entry for values in _PENDING_NORMS.values() for entry in values]
+    """Aggregate selected captured statistics by MuonMD parameter family."""
+    if not _CAPTURE_KINDS:
+        set_muon_norm_logging(False)
+        return {}
+    entries = [entry for kind in _CAPTURE_KINDS for entry in _PENDING_NORMS[kind]]
     distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
     if not entries and not distributed:
         return {}
     device = entries[0][1].device if entries else torch.device("cuda", torch.cuda.current_device())
-    kinds = (
-        ("gradients", "gradients"),
-        ("orthogonal-updates", "orthogonal-updates"),
-        ("updates", "updates"),
+    kinds = _CAPTURE_KINDS
+    sparsity_count = (
+        len(_CAPTURE_SPARSITY_THRESHOLDS) if "sparsity" in _CAPTURE_STATS else 0
     )
+    average_stat_count = 6 + sparsity_count
     totals = torch.zeros(
-        (len(kinds), len(_GAIN_FAMILIES), 6), dtype=torch.float64, device=device
+        (len(kinds), len(_GAIN_FAMILIES), average_stat_count + 1),
+        dtype=torch.float64,
+        device=device,
     )
     minima = torch.full(
         (len(kinds), len(_GAIN_FAMILIES), 2),
@@ -161,32 +247,53 @@ def collect_captured_muon_norms() -> Dict[str, float]:
         dtype=torch.float64,
         device=device,
     )
+    average_indices = [0, 1, 3, 4, 6, 7, *range(8, 8 + sparsity_count)]
     family_indices = {family: index for index, family in enumerate(_GAIN_FAMILIES)}
-    for kind_index, (kind, _) in enumerate(kinds):
+    for kind_index, kind in enumerate(kinds):
         for family, values in _PENDING_NORMS[kind]:
             family_index = family_indices.get(family, family_indices["unclassified"])
-            totals[kind_index, family_index, :5] += values[[0, 2, 3, 5, 6]]
-            totals[kind_index, family_index, 5] += 1
-            minima[kind_index, family_index] = torch.minimum(
-                minima[kind_index, family_index], values[[1, 4]]
-            )
+            totals[kind_index, family_index, :average_stat_count] += values[
+                average_indices
+            ]
+            totals[kind_index, family_index, average_stat_count] += 1
+            if "rms-tails" in _CAPTURE_STATS:
+                minima[kind_index, family_index] = torch.minimum(
+                    minima[kind_index, family_index], values[[2, 5]]
+                )
     if distributed:
         torch.distributed.all_reduce(totals)
-        torch.distributed.all_reduce(minima, op=torch.distributed.ReduceOp.MIN)
+        if "rms-tails" in _CAPTURE_STATS:
+            torch.distributed.all_reduce(minima, op=torch.distributed.ReduceOp.MIN)
     stats = {}
-    for kind_index, (_, name) in enumerate(kinds):
+    for kind_index, name in enumerate(kinds):
         for family_index, family in enumerate(_GAIN_FAMILIES):
-            count = totals[kind_index, family_index, 5]
+            count = totals[kind_index, family_index, average_stat_count]
             if count:
-                values = totals[kind_index, family_index, :5] / count
+                values = totals[kind_index, family_index, :average_stat_count] / count
                 prefix = f"muon-md/{name}/{family}"
-                stats[f"{prefix}/rms"] = values[0].item()
-                stats[f"{prefix}/row-rms/min"] = minima[kind_index, family_index, 0].item()
-                stats[f"{prefix}/row-rms/p10"] = values[1].item()
-                stats[f"{prefix}/row-rms/median"] = values[2].item()
-                stats[f"{prefix}/col-rms/min"] = minima[kind_index, family_index, 1].item()
-                stats[f"{prefix}/col-rms/p10"] = values[3].item()
-                stats[f"{prefix}/col-rms/median"] = values[4].item()
+                if "rms" in _CAPTURE_STATS:
+                    stats[f"{prefix}/rms"] = values[0].item()
+                if "frobenius-norm" in _CAPTURE_STATS:
+                    stats[f"{prefix}/frobenius-norm"] = values[1].item()
+                if "rms-tails" in _CAPTURE_STATS:
+                    stats[f"{prefix}/row-rms/min"] = minima[
+                        kind_index, family_index, 0
+                    ].item()
+                    stats[f"{prefix}/row-rms/p10"] = values[2].item()
+                    stats[f"{prefix}/row-rms/median"] = values[3].item()
+                    stats[f"{prefix}/col-rms/min"] = minima[
+                        kind_index, family_index, 1
+                    ].item()
+                    stats[f"{prefix}/col-rms/p10"] = values[4].item()
+                    stats[f"{prefix}/col-rms/median"] = values[5].item()
+                if "sparsity" in _CAPTURE_STATS:
+                    sparsity_prefix = f"muon-md/{name}/sparsity/{family}"
+                    for threshold, sparsity in zip(
+                        _CAPTURE_SPARSITY_THRESHOLDS, values[6:]
+                    ):
+                        stats[f"{sparsity_prefix}/fraction-below-{threshold}"] = (
+                            sparsity.item()
+                        )
     set_muon_norm_logging(False)
     return stats
 
@@ -421,9 +528,12 @@ def _accumulate_reduced_matrix_batch(
     if log_param_rms:
         # ``params/.../rms`` = sqrt(sum(W_effective^2) / numel(W_effective)), computed per matrix
         # here and then averaged with equal weight across matrices in the same family/scope.
+        # And ``params/.../frobenius-norm`` = sqrt(sum(W_effective^2)), also averaged across matrices.
+        weight_square_sum = reduced[:, 0, _WEIGHT_SQUARE_SUM]
         matrix_values[:, _PARAM_RMS_SUM] = torch.sqrt(
-            reduced[:, 0, _WEIGHT_SQUARE_SUM] / weight_element_count.clamp_min(1)
+            weight_square_sum / weight_element_count.clamp_min(1)
         )
+        matrix_values[:, _PARAM_FROBENIUS_SUM] = torch.sqrt(weight_square_sum)
         matrix_values[:, _PARAM_RMS_COUNT] = weight_valid
 
     if log_gains:
@@ -637,14 +747,11 @@ def _append_md_gain_stats(
     matrix_axis_totals: List,
     matrix_totals: List,
     sparsity_thresholds: tuple[float, ...],
+    gain_stats: tuple[str, ...],
+    param_stats: tuple[str, ...],
     prefix: str = "muon-md",
 ) -> None:
-    """Turn reduced sufficient statistics into the final scalar metric values.
-
-    ``mean``, ``rms``, saturation, ``min``, and ``max`` describe all gain elements in a bucket.
-    ``effective-rms``, combined scale, gauge, and sparsity metrics instead average
-    already-computed matrix values, so differently sized matrices receive equal weight.
-    """
+    """Turn reduced sufficient statistics into selected scalar metric values."""
     for family_index, family in enumerate(_GAIN_FAMILIES):
         for axis_index, axis in enumerate(_GAIN_AXES):
             bucket = family_index * len(_GAIN_AXES) + axis_index
@@ -652,13 +759,18 @@ def _append_md_gain_stats(
             if count == 0:
                 continue
             gain_prefix = f"{prefix}/gains/{family}/{axis}"
-            stats[f"{gain_prefix}/mean"] = total / count
-            stats[f"{gain_prefix}/rms"] = math.sqrt(sum_square / count)
-            matrix_rms_sum, matrix_count = matrix_axis_totals[bucket]
-            stats[f"{gain_prefix}/effective-rms"] = matrix_rms_sum / matrix_count
-            stats[f"{gain_prefix}/min"] = minima[bucket]
-            stats[f"{gain_prefix}/max"] = maxima[bucket]
-            if softplus_count:
+            if "mean" in gain_stats:
+                stats[f"{gain_prefix}/mean"] = total / count
+            if "rms" in gain_stats:
+                stats[f"{gain_prefix}/rms"] = math.sqrt(sum_square / count)
+            if "effective-rms" in gain_stats:
+                matrix_rms_sum, matrix_count = matrix_axis_totals[bucket]
+                stats[f"{gain_prefix}/effective-rms"] = matrix_rms_sum / matrix_count
+            if "min" in gain_stats:
+                stats[f"{gain_prefix}/min"] = minima[bucket]
+            if "max" in gain_stats:
+                stats[f"{gain_prefix}/max"] = maxima[bucket]
+            if "saturated-fraction" in gain_stats and softplus_count:
                 stats[f"{gain_prefix}/saturated-fraction"] = (
                     saturated_count / softplus_count
                 )
@@ -666,15 +778,17 @@ def _append_md_gain_stats(
         scale_sum, pair_count, combined_sum, imbalance_sum, softplus_pair_count = (
             matrix_totals[family_index][:_SPARSITY_MATRIX_COUNT]
         )
-        if pair_count:
+        if "gain-field-rms" in gain_stats and pair_count:
             stats[f"{prefix}/gain-field/{family}/rms"] = scale_sum / pair_count
         if softplus_pair_count:
-            stats[f"{prefix}/gauge/{family}/combined-log-scale"] = (
-                combined_sum / softplus_pair_count
-            )
-            stats[f"{prefix}/gauge/{family}/row-col-imbalance"] = (
-                imbalance_sum / softplus_pair_count
-            )
+            if "combined-log-scale" in gain_stats:
+                stats[f"{prefix}/gauge/{family}/combined-log-scale"] = (
+                    combined_sum / softplus_pair_count
+                )
+            if "row-col-imbalance" in gain_stats:
+                stats[f"{prefix}/gauge/{family}/row-col-imbalance"] = (
+                    imbalance_sum / softplus_pair_count
+                )
         sparsity_matrix_count = matrix_totals[family_index][_SPARSITY_MATRIX_COUNT]
         if sparsity_matrix_count:
             for threshold_index, threshold in enumerate(sparsity_thresholds):
@@ -687,7 +801,13 @@ def _append_md_gain_stats(
         param_rms_sum = matrix_totals[family_index][_PARAM_RMS_SUM]
         param_rms_count = matrix_totals[family_index][_PARAM_RMS_COUNT]
         if param_rms_count:
-            stats[f"{prefix}/params/{family}/rms"] = param_rms_sum / param_rms_count
+            if "rms" in param_stats:
+                stats[f"{prefix}/params/{family}/rms"] = param_rms_sum / param_rms_count
+            if "frobenius-norm" in param_stats:
+                param_frobenius_sum = matrix_totals[family_index][_PARAM_FROBENIUS_SUM]
+                stats[f"{prefix}/params/{family}/frobenius-norm"] = (
+                    param_frobenius_sum / param_rms_count
+                )
 
 
 def collect_md_gain_stats(
@@ -697,6 +817,8 @@ def collect_md_gain_stats(
     log_gains: bool = True,
     log_sparsity: bool = True,
     log_param_rms: bool = True,
+    gain_stats=_GAIN_STATS,
+    param_stats=_PARAM_STATS,
 ) -> Dict[str, float]:
     """Collect selected global and optionally per-layer Muon-MD statistics."""
     from .md_decoupling import MDDecoupling
@@ -710,6 +832,8 @@ def collect_md_gain_stats(
         log_gains,
         log_sparsity,
         log_param_rms,
+        gain_stats,
+        param_stats,
     )
 
 
@@ -720,8 +844,10 @@ def collect_muon_stats(
     log_gains: bool = True,
     log_sparsity: bool = True,
     log_param_rms: bool = True,
+    gain_stats=_GAIN_STATS,
+    param_stats=_PARAM_STATS,
 ) -> Dict[str, float]:
-    """Collect standard Muon LayerNorm gain, weight sparsity, and RMS statistics."""
+    """Collect standard Muon LayerNorm gain and selected weight statistics."""
     from .muon import TensorParallelMuon
 
     return _collect_muon_stats(
@@ -733,6 +859,8 @@ def collect_muon_stats(
         log_gains,
         log_sparsity,
         log_param_rms,
+        gain_stats,
+        param_stats,
     )
 
 
@@ -749,6 +877,8 @@ def _collect_muon_stats(
     log_gains: bool,
     log_sparsity: bool,
     log_param_rms: bool,
+    gain_stats,
+    param_stats,
 ) -> Dict[str, float]:
     """Collect selected global and optionally per-layer Muon-family statistics.
 
@@ -756,6 +886,16 @@ def _collect_muon_stats(
     sufficient statistics are accumulated on-device, all scopes are reduced together, and only
     the final scalar divisions happen on CPU.
     """
+    gain_stats = tuple(dict.fromkeys(gain_stats))
+    param_stats = tuple(dict.fromkeys(param_stats))
+    unknown_gain_stats = set(gain_stats).difference(_GAIN_STATS)
+    unknown_param_stats = set(param_stats).difference(_PARAM_STATS)
+    if unknown_gain_stats:
+        raise ValueError(f"Unknown Muon gain logging stats: {sorted(unknown_gain_stats)}")
+    if unknown_param_stats:
+        raise ValueError(f"Unknown Muon parameter logging stats: {sorted(unknown_param_stats)}")
+    log_gains = log_gains and bool(gain_stats)
+    log_param_rms = log_param_rms and bool(param_stats)
     if not log_gains and not log_sparsity and not log_param_rms:
         return {}
     sparsity_thresholds = (
@@ -1020,6 +1160,8 @@ def _collect_muon_stats(
             matrix_axis_totals[scope],
             matrix_totals[scope],
             sparsity_thresholds,
+            gain_stats,
+            param_stats,
             prefix=prefix,
         )
     nvtx_range_pop(f"{namespace}/logging/format-statistics")

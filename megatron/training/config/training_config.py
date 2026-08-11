@@ -234,7 +234,53 @@ class LoggerConfig:
     """If set, log weight RMS by Muon parameter family."""
 
     log_muon_grad_norms: bool = False
-    """Log Muon-MD gradient and processed-update RMS tails by family."""
+    """Log selected Muon-MD gradient and update statistics by family."""
+
+    muon_log_tensor_kinds: list[
+        Literal["gradients", "orthogonal-updates", "updates"]
+    ] = field(
+        default_factory=lambda: ["gradients", "orthogonal-updates", "updates"]
+    )
+    """Muon-MD tensor stages to log when log_muon_grad_norms is enabled."""
+
+    muon_log_tensor_stats: list[
+        Literal["rms", "frobenius-norm", "rms-tails", "sparsity"]
+    ] = field(
+        default_factory=lambda: ["rms", "frobenius-norm", "rms-tails", "sparsity"]
+    )
+    """Statistics to compute for selected Muon-MD gradient and update stages."""
+
+    muon_log_gain_stats: list[
+        Literal[
+            "mean",
+            "rms",
+            "effective-rms",
+            "min",
+            "max",
+            "saturated-fraction",
+            "gain-field-rms",
+            "combined-log-scale",
+            "row-col-imbalance",
+        ]
+    ] = field(
+        default_factory=lambda: [
+            "mean",
+            "rms",
+            "effective-rms",
+            "min",
+            "max",
+            "saturated-fraction",
+            "gain-field-rms",
+            "combined-log-scale",
+            "row-col-imbalance",
+        ]
+    )
+    """Gain statistics to emit when log_muon_gains is enabled."""
+
+    muon_log_param_stats: list[Literal["rms", "frobenius-norm"]] = field(
+        default_factory=lambda: ["rms", "frobenius-norm"]
+    )
+    """Weight statistics to emit when log_muon_param_rms is enabled."""
 
     log_muon_per_layer: bool = False
     """If set, additionally log all Muon statistics by global layer."""
@@ -245,7 +291,7 @@ class LoggerConfig:
     muon_sparsity_thresholds: list[float] = field(
         default_factory=lambda: [1e-20, 1e-10, 1e-30]
     )
-    """Absolute weight thresholds used for Muon sparsity logging."""
+    """Absolute thresholds used for Muon weight, gradient, and update sparsity logging."""
 
     log_throughput: bool = False
     """If set, calculate and log throughput per GPU."""
