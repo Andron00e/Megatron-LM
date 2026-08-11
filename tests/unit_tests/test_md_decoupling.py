@@ -487,6 +487,61 @@ def test_md_muon_keeps_glu_blocks_separate_through_weight_projection(monkeypatch
 
 
 @requires_cuda_and_emerging
+@pytest.mark.parametrize(
+    ("shape", "glu_split_dim", "is_merged_expert"),
+    [
+        ((8, 4), 0, False),
+        ((3, 8, 4), 1, True),
+        ((3, 4, 4), None, True),
+    ],
+    ids=["glu", "merged-fc1", "merged-fc2"],
+)
+@pytest.mark.parametrize("mode", ["flat", "row", "col"])
+@pytest.mark.parametrize("normalize_update", [False, True])
+def test_md_batched_weight_projection_matches_scalar(
+    shape, glu_split_dim, is_merged_expert, mode, normalize_update
+):
+    torch.manual_seed(123)
+    initial = torch.randn(shape, device="cuda")
+    gradient = torch.randn_like(initial)
+
+    def make_optimizer(disable_batch=False):
+        param = torch.nn.Parameter(initial.clone())
+        if glu_split_dim is not None:
+            param.glu_split_dim = glu_split_dim
+        if is_merged_expert:
+            param.merged_offload_expert = True
+        optimizer = MDDecoupling(
+            params=[param],
+            lr=0.01,
+            weight_decay=0.0,
+            hypersphere_mode=mode,
+            hypersphere_preserve_init=True,
+            use_orthogonal_updates=True,
+            momentum_beta=0.0,
+            use_nesterov=False,
+            scale_mode="none",
+            split_fc1=True,
+            normalize_update_to_weight_norm=normalize_update,
+            pg_collection=_NoProcessGroups(),
+            tp_mode="duplicated",
+        )
+        if disable_batch:
+            optimizer._direct_weight_batch = lambda *args: None
+        return param, optimizer
+
+    batched_param, batched_optimizer = make_optimizer()
+    scalar_param, scalar_optimizer = make_optimizer(disable_batch=True)
+    batched_param.grad = gradient.clone()
+    scalar_param.grad = gradient.clone()
+
+    batched_optimizer.step()
+    scalar_optimizer.step()
+
+    torch.testing.assert_close(batched_param, scalar_param, rtol=2e-5, atol=2e-5)
+
+
+@requires_cuda_and_emerging
 def test_md_update_weight_norm_supersedes_shape_up_scaling(monkeypatch):
     param = torch.nn.Parameter(torch.ones((3, 2), device="cuda"))
     optimizer = MDDecoupling(

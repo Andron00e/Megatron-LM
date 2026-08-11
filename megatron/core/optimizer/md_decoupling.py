@@ -694,6 +694,18 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         weight_blocks, weight_merge, partition_dim = self._logical_blocks(
             p, p, is_qkv, is_merged_offload_expert
         )
+        # weight_blocks and weight_batch are separate views of p, not copies of each other.
+        # The scalar adds below are therefore visible to the subsequent batched projection.
+        weight_batch = None
+        if will_normalize and partition_dim is None and not (
+            p.ndim == 2 and getattr(p, "expert_tp", False)
+        ):
+            weight_batch = self._direct_weight_batch(p, is_merged_offload_expert)
+            if weight_batch is not None and (
+                weight_batch.size(0) != len(weight_blocks) or len(weight_blocks) == 1
+            ):
+                weight_batch = None
+
         if len(update_blocks) == 1:
             weight_blocks[0].add_(update_blocks[0], alpha=-group["lr"])
         elif _FOREACH_ADD_ is not None:
@@ -720,6 +732,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 is_embedding,
                 is_router,
                 target_frobenius_norms=target_frobenius_norms,
+                batch=weight_batch,
             )
 
         # We return None merge for some like split glu_fc1 as they are only writable views and don't need to be merged back into the original tensor.
@@ -806,6 +819,17 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             )
         return local_shapes
 
+    def _direct_weight_batch(
+        self, p: torch.Tensor, is_merged_offload_expert: bool
+    ) -> Optional[torch.Tensor]:
+        """Return a no-copy batch view matching the ordering of the logical weight blocks."""
+        glu_split_dim = getattr(p, "glu_split_dim", None)
+        if glu_split_dim == 0 and p.ndim == 2:
+            return p.view(2, p.size(0) // 2, p.size(1))
+        if glu_split_dim == 1 and p.ndim == 3:
+            return p.view(p.size(0), 2, p.size(1) // 2, p.size(2)).flatten(0, 1)
+        return p if is_merged_offload_expert else None
+
     def _orthogonalize_param_blocks(
         self,
         p,
@@ -843,7 +867,6 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         ]
 
         return blocks, norm_partition_dim
-
 
     def _resolve_scale_mode(self, is_router: bool) -> str:
         """Muon scale-factor mode for this param. Routers use ``router_scale_mode`` (default
@@ -1167,6 +1190,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         is_router: bool,
         target_frobenius_norms,
         mode_override: Optional[str] = None,
+        batch: Optional[torch.Tensor] = None,
     ) -> None:
         """Normalize logical blocks onto explicit target Frobenius spheres."""
         mode = mode_override or self._resolve_mode(is_embedding, is_router)
@@ -1177,15 +1201,47 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 f"MuonMD has {len(blocks)} logical blocks but "
                 f"{len(target_frobenius_norms)} target norms"
             )
-        for block, target_frobenius_norm in zip(blocks, target_frobenius_norms):
-            self._normalize_single(
-                p,
-                block,
-                is_out_proj,
-                mode,
-                partition_dim,
-                target_frobenius_norm,
+        if batch is None:
+            for block, target_frobenius_norm in zip(blocks, target_frobenius_norms):
+                self._normalize_single(
+                    p, block, is_out_proj, mode, partition_dim, target_frobenius_norm
+                )
+        else:
+            self._normalize_batch(batch, is_out_proj, mode, target_frobenius_norms)
+
+    def _normalize_batch(
+        self,
+        batch: torch.Tensor,
+        is_out_proj: bool,
+        mode: str,
+        target_frobenius_norms,
+    ) -> None:
+        """Normalize an explicit batch of equal-shaped, non-TP logical blocks in place."""
+        if mode == "col":
+            dim = -2
+        elif mode == "row":
+            dim = -1
+        elif mode == "flat":
+            dim = (-2, -1)
+        elif mode == "embed":
+            dim = -2 if is_out_proj else -1
+        else:
+            raise ValueError(f"Unsupported hypersphere mode: {mode}")
+
+        norm = _local_squared_norm(batch, dim=dim, keepdim=True)
+        norm.sqrt_().clamp_min_(self.hypersphere_eps)
+        size_out, size_in = batch.shape[-2:]
+        slice_count = 1 if isinstance(dim, tuple) else (size_in if dim == -2 else size_out)
+        if isinstance(target_frobenius_norms[0], torch.Tensor):
+            radii = torch.stack(target_frobenius_norms).to(dtype=norm.dtype, device=norm.device)
+        else:
+            radii = torch.as_tensor(
+                target_frobenius_norms, dtype=norm.dtype, device=norm.device
             )
+        radii = radii.view(-1, 1, 1)
+
+        batch.mul_(radii / (math.sqrt(slice_count) * norm)) # x / ||x|| * target_radius
+
 
     def _normalize(self, p, x, is_qkv: bool = False, is_out_proj: bool = False,
                    is_embedding: bool = False, is_router: bool = False,
