@@ -62,13 +62,15 @@ def test_muon_tensor_selectors_skip_unrequested_stages_and_stats(monkeypatch):
     md_logging_module.set_muon_norm_logging(
         True,
         tensor_kinds=["updates"],
-        tensor_stats=["frobenius-norm"],
+        tensor_stats=["frobenius-norm", "row-col-rms-means"],
     )
     md_logging_module.capture_finalized_gradient_norms([model])
     md_logging_module.capture_muon_update_norms(param, torch.ones_like(param), 0.5)
 
     assert md_logging_module.collect_captured_muon_norms() == {
-        "muon-md/updates/attention-in/frobenius-norm": pytest.approx(1.0)
+        "muon-md/updates/attention-in/frobenius-norm": pytest.approx(1.0),
+        "muon-md/updates/attention-in/row-rms/mean": pytest.approx(0.5),
+        "muon-md/updates/attention-in/col-rms/mean": pytest.approx(0.5),
     }
 
 
@@ -102,6 +104,18 @@ def test_compiled_muon_tensor_selectors():
     }
 
 
+def test_muon_update_block_selector_skips_excluded_kind_before_iteration():
+    class ExcludedUpdates:
+        def __iter__(self):
+            raise AssertionError("Excluded tensor kind must not iterate update blocks")
+
+    md_logging_module.set_muon_norm_logging(True, tensor_kinds=["updates"])
+    md_logging_module.capture_muon_update_block_norms(
+        None, ExcludedUpdates(), 1.0, kind="orthogonal-updates"
+    )
+    md_logging_module.set_muon_norm_logging(False)
+
+
 def test_muon_update_sparsity_uses_configured_thresholds_after_lr_scaling():
     param = torch.nn.Parameter(torch.zeros(2, 2))
     param.md_gain_log_family = "attention-in"
@@ -126,7 +140,7 @@ def test_muon_update_norms_capture_logical_blocks_without_merging():
     md_logging_module.set_muon_norm_logging(True)
     md_logging_module.capture_muon_update_block_norms(
         param,
-        [torch.ones(2, 2), torch.full((2, 2), 3.0)],
+        [torch.ones(1, 2), torch.full((3, 2), 3.0)],
         1.0,
         kind="orthogonal-updates",
     )
@@ -139,9 +153,13 @@ def test_muon_update_norms_capture_logical_blocks_without_merging():
 
     raw_prefix = "muon-md/orthogonal-updates/attention-in"
     assert stats[f"{raw_prefix}/rms"] == pytest.approx(2.0)
-    assert stats[f"{raw_prefix}/frobenius-norm"] == pytest.approx(4.0)
+    assert stats[f"{raw_prefix}/frobenius-norm"] == pytest.approx(
+        (math.sqrt(2.0) + 3.0 * math.sqrt(6.0)) / 2.0
+    )
     assert stats[f"{raw_prefix}/row-rms/min"] == pytest.approx(1.0)
     assert stats[f"{raw_prefix}/row-rms/median"] == pytest.approx(2.0)
+    assert stats[f"{raw_prefix}/row-rms/mean"] == pytest.approx(2.0)
+    assert stats[f"{raw_prefix}/col-rms/mean"] == pytest.approx(2.0)
     final_prefix = "muon-md/updates/attention-in"
     assert stats[f"{final_prefix}/rms"] == pytest.approx(3.0)
     assert stats[f"{final_prefix}/frobenius-norm"] == pytest.approx(6.0)

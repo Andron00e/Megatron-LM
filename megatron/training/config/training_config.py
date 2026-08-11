@@ -244,11 +244,25 @@ class LoggerConfig:
     """Muon-MD tensor stages to log when log_muon_grad_norms is enabled."""
 
     muon_log_tensor_stats: list[
-        Literal["rms", "frobenius-norm", "rms-tails", "sparsity"]
+        Literal[
+            "rms",
+            "frobenius-norm",
+            "row-col-rms-means",
+            "row-col-rms-quantiles",
+            "sparsity",
+        ]
     ] = field(
-        default_factory=lambda: ["rms", "frobenius-norm", "rms-tails", "sparsity"]
+        default_factory=lambda: [
+            "rms",
+            "frobenius-norm",
+            "row-col-rms-means",
+            "row-col-rms-quantiles",
+            "sparsity",
+        ]
     )
-    """Statistics to compute for selected Muon-MD gradient and update stages."""
+    """Statistics to compute for selected Muon-MD gradient and update stages.
+    row-col-rms-means logs the means of per-row and per-column RMS values;
+    row-col-rms-quantiles logs their minimum, p10, and median."""
 
     muon_log_gain_stats: list[
         Literal[

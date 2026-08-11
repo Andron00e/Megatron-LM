@@ -74,12 +74,13 @@ _GAIN_FAMILIES = (
 # -----------------------------------------------------------------------------
 
 _TENSOR_KINDS = ("gradients", "orthogonal-updates", "updates")
-_TENSOR_STATS = ("rms", "frobenius-norm", "rms-tails", "sparsity")
+_TENSOR_STATS = ("rms", "frobenius-norm", "row-col-rms-means", "row-col-rms-quantiles", "sparsity")
 _CAPTURE_NORMS = False
 _CAPTURE_KINDS = _TENSOR_KINDS
 _CAPTURE_STATS = _TENSOR_STATS
 _CAPTURE_SPARSITY_THRESHOLDS = (1e-20, 1e-10, 1e-30)
 _PENDING_NORMS = {kind: [] for kind in _TENSOR_KINDS}
+_CAPTURE_CONSTANT_TENSORS = {}
 
 
 def _matrix_norm_stats_impl(
@@ -88,16 +89,17 @@ def _matrix_norm_stats_impl(
     sparsity_thresholds: torch.Tensor,
     log_rms: bool,
     log_frobenius: bool,
-    log_rms_tails: bool,
+    log_row_col_rms_means: bool,
+    log_row_col_rms_quantiles: bool,
     log_sparsity: bool,
 ) -> torch.Tensor:
-    """Compute selected matrix norms, RMS tails, and near-zero fractions."""
+    """Compute selected matrix norms, RMS distributions, and near-zero fractions."""
     rows, cols = tensor.shape[-2:]
     experts = tensor.numel() // (rows * cols)
     matrices = tensor.float().reshape(experts, rows, cols)
     zeros = matrices.new_zeros(1)
 
-    if log_rms or log_frobenius or log_rms_tails:
+    if log_rms or log_frobenius or log_row_col_rms_means or log_row_col_rms_quantiles:
         squares = matrices.square()
     rms = squares.mean().sqrt().mul(scale).reshape(1) if log_rms else zeros
     frobenius = (
@@ -105,15 +107,20 @@ def _matrix_norm_stats_impl(
         if log_frobenius
         else zeros
     )
-    if log_rms_tails:
+    if log_row_col_rms_means or log_row_col_rms_quantiles:
         row_rms = squares.mean(dim=2).sqrt().flatten()
         col_rms = squares.mean(dim=1).sqrt().flatten()
-        quantiles = row_rms.new_tensor([0.0, 0.1, 0.5])
-        row_tails = torch.quantile(row_rms, quantiles) * scale
-        col_tails = torch.quantile(col_rms, quantiles) * scale
+    if log_row_col_rms_means:
+        rms_means = torch.stack((row_rms.mean(), col_rms.mean())) * scale
     else:
-        row_tails = matrices.new_zeros(3)
-        col_tails = matrices.new_zeros(3)
+        rms_means = matrices.new_zeros(2)
+    if log_row_col_rms_quantiles:
+        quantiles = row_rms.new_tensor([0.0, 0.1, 0.5])
+        row_quantiles = torch.quantile(row_rms, quantiles) * scale
+        col_quantiles = torch.quantile(col_rms, quantiles) * scale
+    else:
+        row_quantiles = matrices.new_zeros(3)
+        col_quantiles = matrices.new_zeros(3)
     if log_sparsity:
         scaled_absolute = matrices.abs() * scale
         sparsity = (
@@ -121,7 +128,7 @@ def _matrix_norm_stats_impl(
         ).to(torch.float32).mean(dim=(0, 1, 2))
     else:
         sparsity = matrices.new_zeros(sparsity_thresholds.numel())
-    return torch.cat((rms, frobenius, row_tails, col_tails, sparsity))
+    return torch.cat((rms, frobenius, row_quantiles, col_quantiles, rms_means, sparsity))
 
 
 _compiled_matrix_norm_stats = torch.compile(_matrix_norm_stats_impl, dynamic=False)
@@ -129,19 +136,24 @@ _compiled_matrix_norm_stats = torch.compile(_matrix_norm_stats_impl, dynamic=Fal
 
 def _matrix_norm_stats(tensor: torch.Tensor, scale=1.0) -> torch.Tensor:
     stats = _compiled_matrix_norm_stats if tensor.is_cuda else _matrix_norm_stats_impl
-    scale_tensor = torch.as_tensor(abs(scale), dtype=torch.float32, device=tensor.device)
-    thresholds = torch.as_tensor(
-        _CAPTURE_SPARSITY_THRESHOLDS if "sparsity" in _CAPTURE_STATS else (),
-        dtype=torch.float32,
-        device=tensor.device,
-    )
+    threshold_values = _CAPTURE_SPARSITY_THRESHOLDS if "sparsity" in _CAPTURE_STATS else ()
+    constants_key = (tensor.device, abs(float(scale)), threshold_values)
+    constants = _CAPTURE_CONSTANT_TENSORS.get(constants_key)
+    if constants is None:
+        constants = (
+            torch.tensor(constants_key[1], dtype=torch.float32, device=tensor.device),
+            torch.tensor(threshold_values, dtype=torch.float32, device=tensor.device),
+        )
+        _CAPTURE_CONSTANT_TENSORS[constants_key] = constants
+    scale_tensor, thresholds = constants
     return stats(
         tensor,
         scale_tensor,
         thresholds,
         "rms" in _CAPTURE_STATS,
         "frobenius-norm" in _CAPTURE_STATS,
-        "rms-tails" in _CAPTURE_STATS,
+        "row-col-rms-means" in _CAPTURE_STATS,
+        "row-col-rms-quantiles" in _CAPTURE_STATS,
         "sparsity" in _CAPTURE_STATS,
     )
 
@@ -177,6 +189,7 @@ def set_muon_norm_logging(
         raise ValueError("Muon gradient/update sparsity thresholds must be finite positive values")
     for values in _PENDING_NORMS.values():
         values.clear()
+    _CAPTURE_CONSTANT_TENSORS.clear()
 
 
 def _capture_norms(kind: str, param: torch.Tensor, tensor: torch.Tensor, scale=1.0) -> None:
@@ -212,13 +225,12 @@ def capture_muon_update_norms(param: torch.Tensor, update: torch.Tensor, lr: flo
     _capture_norms("updates", param, update, lr)
 
 
-def capture_muon_update_block_norms(
-    param, updates, lr: float, kind: str = "updates"
-) -> None:
+def capture_muon_update_block_norms(param, updates, lr: float, kind: str = "updates") -> None:
     """Capture each logical update block without merging them."""
-    if _CAPTURE_NORMS:
-        for update in updates:
-            _capture_norms(kind, param, update, lr)
+    if not _CAPTURE_NORMS or kind not in _CAPTURE_KINDS:
+        return
+    for update in updates:
+        _capture_norms(kind, param, update, lr)
 
 
 def collect_captured_muon_norms() -> Dict[str, float]:
@@ -226,16 +238,18 @@ def collect_captured_muon_norms() -> Dict[str, float]:
     if not _CAPTURE_KINDS:
         set_muon_norm_logging(False)
         return {}
-    entries = [entry for kind in _CAPTURE_KINDS for entry in _PENDING_NORMS[kind]]
+    kinds = _CAPTURE_KINDS
+    entries = [
+        (kind_index, family, values)
+        for kind_index, kind in enumerate(kinds)
+        for family, values in _PENDING_NORMS[kind]
+    ]
     distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
     if not entries and not distributed:
         return {}
-    device = entries[0][1].device if entries else torch.device("cuda", torch.cuda.current_device())
-    kinds = _CAPTURE_KINDS
-    sparsity_count = (
-        len(_CAPTURE_SPARSITY_THRESHOLDS) if "sparsity" in _CAPTURE_STATS else 0
-    )
-    average_stat_count = 6 + sparsity_count
+    device = entries[0][2].device if entries else torch.device("cuda", torch.cuda.current_device())
+    sparsity_count = len(_CAPTURE_SPARSITY_THRESHOLDS) if "sparsity" in _CAPTURE_STATS else 0
+    average_stat_count = 8 + sparsity_count
     totals = torch.zeros(
         (len(kinds), len(_GAIN_FAMILIES), average_stat_count + 1),
         dtype=torch.float64,
@@ -247,53 +261,73 @@ def collect_captured_muon_norms() -> Dict[str, float]:
         dtype=torch.float64,
         device=device,
     )
-    average_indices = [0, 1, 3, 4, 6, 7, *range(8, 8 + sparsity_count)]
-    family_indices = {family: index for index, family in enumerate(_GAIN_FAMILIES)}
-    for kind_index, kind in enumerate(kinds):
-        for family, values in _PENDING_NORMS[kind]:
-            family_index = family_indices.get(family, family_indices["unclassified"])
-            totals[kind_index, family_index, :average_stat_count] += values[
-                average_indices
-            ]
-            totals[kind_index, family_index, average_stat_count] += 1
-            if "rms-tails" in _CAPTURE_STATS:
-                minima[kind_index, family_index] = torch.minimum(
-                    minima[kind_index, family_index], values[[2, 5]]
-                )
+    if entries:
+        average_indices = [0, 1, 3, 4, 6, 7, 8, 9, *range(10, 10 + sparsity_count)]
+        family_indices = {family: index for index, family in enumerate(_GAIN_FAMILIES)}
+        entry_indices = torch.tensor(
+            [
+                kind_index * len(_GAIN_FAMILIES)
+                + family_indices.get(family, family_indices["unclassified"])
+                for kind_index, family, _ in entries
+            ],
+            dtype=torch.long,
+            device=device,
+        )
+        entry_values = torch.stack([values for _, _, values in entries]).to(torch.float64)
+        average_values = torch.cat(
+            (
+                entry_values[:, average_indices],
+                torch.ones((len(entries), 1), dtype=torch.float64, device=device),
+            ),
+            dim=1,
+        )
+        totals.view(-1, average_stat_count + 1).index_add_(0, entry_indices, average_values)
+        if "row-col-rms-quantiles" in _CAPTURE_STATS:
+            minima.view(-1, 2).scatter_reduce_(
+                0,
+                entry_indices[:, None].expand(-1, 2),
+                entry_values[:, [2, 5]],
+                reduce="amin",
+            )
     if distributed:
         torch.distributed.all_reduce(totals)
-        if "rms-tails" in _CAPTURE_STATS:
+        if "row-col-rms-quantiles" in _CAPTURE_STATS:
             torch.distributed.all_reduce(minima, op=torch.distributed.ReduceOp.MIN)
+    totals_size = totals.numel()
+    cpu_values = torch.cat((totals.flatten(), minima.flatten())).cpu()
+    totals = (
+        cpu_values[:totals_size]
+        .view(len(kinds), len(_GAIN_FAMILIES), average_stat_count + 1)
+        .tolist()
+    )
+    minima = cpu_values[totals_size:].view(len(kinds), len(_GAIN_FAMILIES), 2).tolist()
     stats = {}
     for kind_index, name in enumerate(kinds):
         for family_index, family in enumerate(_GAIN_FAMILIES):
-            count = totals[kind_index, family_index, average_stat_count]
+            count = totals[kind_index][family_index][average_stat_count]
             if count:
-                values = totals[kind_index, family_index, :average_stat_count] / count
+                values = [
+                    value / count for value in totals[kind_index][family_index][:average_stat_count]
+                ]
                 prefix = f"muon-md/{name}/{family}"
                 if "rms" in _CAPTURE_STATS:
-                    stats[f"{prefix}/rms"] = values[0].item()
+                    stats[f"{prefix}/rms"] = values[0]
                 if "frobenius-norm" in _CAPTURE_STATS:
-                    stats[f"{prefix}/frobenius-norm"] = values[1].item()
-                if "rms-tails" in _CAPTURE_STATS:
-                    stats[f"{prefix}/row-rms/min"] = minima[
-                        kind_index, family_index, 0
-                    ].item()
-                    stats[f"{prefix}/row-rms/p10"] = values[2].item()
-                    stats[f"{prefix}/row-rms/median"] = values[3].item()
-                    stats[f"{prefix}/col-rms/min"] = minima[
-                        kind_index, family_index, 1
-                    ].item()
-                    stats[f"{prefix}/col-rms/p10"] = values[4].item()
-                    stats[f"{prefix}/col-rms/median"] = values[5].item()
+                    stats[f"{prefix}/frobenius-norm"] = values[1]
+                if "row-col-rms-means" in _CAPTURE_STATS:
+                    stats[f"{prefix}/row-rms/mean"] = values[6]
+                    stats[f"{prefix}/col-rms/mean"] = values[7]
+                if "row-col-rms-quantiles" in _CAPTURE_STATS:
+                    stats[f"{prefix}/row-rms/min"] = minima[kind_index][family_index][0]
+                    stats[f"{prefix}/row-rms/p10"] = values[2]
+                    stats[f"{prefix}/row-rms/median"] = values[3]
+                    stats[f"{prefix}/col-rms/min"] = minima[kind_index][family_index][1]
+                    stats[f"{prefix}/col-rms/p10"] = values[4]
+                    stats[f"{prefix}/col-rms/median"] = values[5]
                 if "sparsity" in _CAPTURE_STATS:
                     sparsity_prefix = f"muon-md/{name}/sparsity/{family}"
-                    for threshold, sparsity in zip(
-                        _CAPTURE_SPARSITY_THRESHOLDS, values[6:]
-                    ):
-                        stats[f"{sparsity_prefix}/fraction-below-{threshold}"] = (
-                            sparsity.item()
-                        )
+                    for threshold, sparsity in zip(_CAPTURE_SPARSITY_THRESHOLDS, values[8:]):
+                        stats[f"{sparsity_prefix}/fraction-below-{threshold}"] = sparsity
     set_muon_norm_logging(False)
     return stats
 
