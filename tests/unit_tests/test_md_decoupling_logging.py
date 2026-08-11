@@ -40,6 +40,32 @@ def test_muon_gradient_and_update_norms_are_grouped_by_family():
     assert stats["muon-md/updates/attention-in/rms"] == pytest.approx(6.0 / math.sqrt(6.0))
 
 
+def test_muon_update_norms_capture_logical_blocks_without_merging():
+    param = torch.nn.Parameter(torch.zeros(4, 2))
+    param.md_gain_log_family = "attention-in"
+
+    md_logging_module.set_muon_norm_logging(True)
+    md_logging_module.capture_muon_update_block_norms(
+        param,
+        [torch.ones(2, 2), torch.full((2, 2), 3.0)],
+        1.0,
+        kind="orthogonal-updates",
+    )
+    md_logging_module.capture_muon_update_block_norms(
+        param,
+        [torch.full((2, 2), 2.0), torch.full((2, 2), 4.0)],
+        1.0,
+    )
+    stats = md_logging_module.collect_captured_muon_norms()
+
+    raw_prefix = "muon-md/orthogonal-updates/attention-in"
+    assert stats[f"{raw_prefix}/rms"] == pytest.approx(2.0)
+    assert stats[f"{raw_prefix}/row-rms/min"] == pytest.approx(1.0)
+    assert stats[f"{raw_prefix}/row-rms/median"] == pytest.approx(2.0)
+    final_prefix = "muon-md/updates/attention-in"
+    assert stats[f"{final_prefix}/rms"] == pytest.approx(3.0)
+
+
 def test_md_gain_log_family_classifies_matrix_types():
     cases = [
         ("decoder.layers.0.mlp.router.weight", "is_router", "router"),

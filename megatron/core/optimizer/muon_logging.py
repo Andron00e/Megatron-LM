@@ -2,7 +2,11 @@
 
 """Distributed TensorBoard/W&B statistics for Muon and Muon-MD parameters.
 
-The computation has three stages:
+The module has two logging paths. The first captures finalized gradients, pre-correction
+orthogonal updates, and processed optimizer updates at logging steps. The second collects
+persistent gain, effective-weight sparsity, and parameter-RMS statistics from optimizer state.
+
+The persistent-state path has three stages:
 
 1. :func:`collect_md_gain_stats` accumulates element-level gain distributions and saturation.
 2. :func:`_accumulate_md_matrix_stats` reconstructs TP-sharded matrix gains, then
@@ -53,8 +57,12 @@ _GAIN_FAMILIES = (
     "unclassified",
 )
 
+# -----------------------------------------------------------------------------
+# Finalized-gradient, orthogonal-update, and processed-update norm logging
+# -----------------------------------------------------------------------------
+
 _CAPTURE_NORMS = False
-_PENDING_NORMS = {"gradients": [], "updates": []}
+_PENDING_NORMS = {"gradients": [], "orthogonal-updates": [], "updates": []}
 
 
 def _matrix_norm_stats_impl(tensor: torch.Tensor) -> torch.Tensor:
@@ -123,6 +131,15 @@ def capture_muon_update_norms(param: torch.Tensor, update: torch.Tensor, lr: flo
     _capture_norms("updates", param, update, lr)
 
 
+def capture_muon_update_block_norms(
+    param, updates, lr: float, kind: str = "updates"
+) -> None:
+    """Capture each logical update block without merging them."""
+    if _CAPTURE_NORMS:
+        for update in updates:
+            _capture_norms(kind, param, update, lr)
+
+
 def collect_captured_muon_norms() -> Dict[str, float]:
     """Aggregate captured RMS tail statistics by MuonMD parameter family."""
     entries = [entry for values in _PENDING_NORMS.values() for entry in values]
@@ -130,7 +147,11 @@ def collect_captured_muon_norms() -> Dict[str, float]:
     if not entries and not distributed:
         return {}
     device = entries[0][1].device if entries else torch.device("cuda", torch.cuda.current_device())
-    kinds = (("gradients", "gradients"), ("updates", "updates"))
+    kinds = (
+        ("gradients", "gradients"),
+        ("orthogonal-updates", "orthogonal-updates"),
+        ("updates", "updates"),
+    )
     totals = torch.zeros(
         (len(kinds), len(_GAIN_FAMILIES), 6), dtype=torch.float64, device=device
     )
@@ -170,6 +191,13 @@ def collect_captured_muon_norms() -> Dict[str, float]:
     return stats
 
 
+# -----------------------------------------------------------------------------
+# Persistent gain, effective-weight sparsity, and parameter-RMS logging
+# -----------------------------------------------------------------------------
+
+# Local tensor reductions
+
+
 def _matrix_weight_stats(
     matrix_weights: torch.Tensor, thresholds: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -200,6 +228,9 @@ def _softplus_matrix_gain_stats(raw_gains: torch.Tensor) -> torch.Tensor:
 @torch.compile(dynamic=True, fullgraph=True)
 def _compiled_softplus_matrix_gain_stats(raw_gains: torch.Tensor) -> torch.Tensor:
     return _softplus_matrix_gain_stats(raw_gains)
+
+
+# Parameter classification and distributed ownership
 
 
 def _gain_log_family(name: str, param: torch.Tensor) -> str:
@@ -280,6 +311,9 @@ def _include_param_in_matrix_stats(
         else getattr(md_optimizer.pg_collection, "dp_cp", None)
     )
     return dp_group is None or get_pg_rank(dp_group) == 0
+
+
+# Matrix-level sufficient-statistic collection
 
 
 def _accumulate_reduced_matrix_batch(
@@ -592,6 +626,9 @@ def _accumulate_md_matrix_stats(
         )
 
 
+# Metric formatting and public collectors
+
+
 def _append_md_gain_stats(
     stats: Dict[str, float],
     totals: List,
@@ -697,6 +734,9 @@ def collect_muon_stats(
         log_sparsity,
         log_param_rms,
     )
+
+
+# End-to-end distributed collection
 
 
 @torch.no_grad()
