@@ -787,6 +787,7 @@ def test_md_decoupling_recipe_defaults():
     config = OptimizerConfig()
 
     assert config.hypersphere_mode == "flat"
+    assert config.hypersphere_family_modes == ()
     assert config.hypersphere_embedding_mode == "row"
     assert config.hypersphere_router_mode == "row"
     assert config.hypersphere_radius_mode == "shape_native"
@@ -799,6 +800,41 @@ def test_md_decoupling_recipe_defaults():
     assert config.gain_parametrization == "softplus"
     assert config.muon_router_scale_mode == "none"
     assert config.muon_split_fc1 is True
+
+
+def test_md_decoupling_family_mode_overrides_and_output_channel_resolution():
+    param = torch.nn.Parameter(torch.ones(4, 4))
+    optimizer = MDDecoupling(
+        params=[param],
+        hypersphere_mode="output_channel",
+        hypersphere_family_modes={
+            "dense-mlp-in": "output_channel",
+            "dense-mlp-out": "output_channel",
+            "moe-latent-out": "output_channel",
+            "attention-in": "none",
+        },
+        hypersphere_embedding_mode="flat",
+        hypersphere_router_mode="row",
+    )
+
+    param.md_gain_log_family = "dense-mlp-in"
+    assert optimizer._resolve_mode(param, False, False) == "row"
+    param.md_gain_log_family = "dense-mlp-out"
+    assert optimizer._resolve_mode(param, True, False) == "col"
+    param.md_gain_log_family = "moe-latent-out"
+    assert optimizer._resolve_mode(param, False, False) == "col"
+    param.md_gain_log_family = "attention-in"
+    assert optimizer._resolve_mode(param, False, False) is None
+    param.md_gain_log_family = "expert-in"
+    assert optimizer._resolve_mode(param, False, False) == "row"
+    param.md_gain_log_family = "expert-out"
+    assert optimizer._resolve_mode(param, True, False) == "col"
+    param.md_gain_log_family = "attention-out"
+    assert optimizer._resolve_mode(param, True, False) == "flat"
+
+    # Dedicated embedding and router policies take precedence over ordinary family overrides.
+    assert optimizer._resolve_mode(param, False, True) == "flat"
+    assert optimizer._resolve_mode(param, False, False, True) == "row"
 
 
 def test_md_decoupling_router_scale_mode_resolution():
@@ -1686,19 +1722,20 @@ def _fan_in_optimizer(param, **kwargs):
 
 
 @pytest.mark.parametrize("shape", [(8, 4), (4, 8), (6, 6)])
-@pytest.mark.parametrize("mode", ["row", "flat"])
+@pytest.mark.parametrize("mode", ["row", "flat", "output_channel"])
 def test_md_decoupling_fan_in_radius_puts_weight_norm_at_sqrt_out(shape, mode):
-    """fan_in normalizes every row to unit L2, i.e. ||W||_F = sqrt(d_out) for any shape, in both
-    the row and flat sphere modes."""
+    """Every fan-in geometry places the weight at total radius sqrt(d_out)."""
     size_out, size_in = shape
     torch.manual_seed(0)
     param = torch.nn.Parameter(torch.randn(size_out, size_in))
+    if mode == "output_channel":
+        param.md_gain_log_family = "expert-out"
     optimizer = _fan_in_optimizer(
         param, hypersphere_mode=mode, hypersphere_preserve_init=True
     )
 
     with torch.no_grad():
-        optimizer._normalize(param, param)
+        optimizer._normalize(param, param, is_out_proj=mode == "output_channel")
 
     torch.testing.assert_close(
         torch.linalg.matrix_norm(param.detach()),
@@ -1707,11 +1744,14 @@ def test_md_decoupling_fan_in_radius_puts_weight_norm_at_sqrt_out(shape, mode):
         atol=1e-5,
     )
     if mode == "row":
+        expected = torch.ones(size_out)
         torch.testing.assert_close(
-            torch.linalg.vector_norm(param.detach(), dim=1),
-            torch.ones(size_out),
-            rtol=1e-5,
-            atol=1e-5,
+            torch.linalg.vector_norm(param.detach(), dim=1), expected, rtol=1e-5, atol=1e-5
+        )
+    elif mode == "output_channel":
+        expected = torch.full((size_in,), math.sqrt(size_out / size_in))
+        torch.testing.assert_close(
+            torch.linalg.vector_norm(param.detach(), dim=0), expected, rtol=1e-5, atol=1e-5
         )
 
 
@@ -1724,8 +1764,7 @@ def test_md_decoupling_fan_in_radius_and_update_scale_agree(shape):
         torch.nn.Parameter(torch.zeros(*shape)), hypersphere_mode="row"
     )
 
-    # Weight radii: flat -> sqrt(d_out), row -> 1, col -> sqrt(d_out/d_in) (col is rejected at
-    # construction, but the radius rule is the same sqrt(|slice| / d_in) for all three).
+    # Weight radii: flat -> sqrt(d_out), row -> 1, and col -> sqrt(d_out/d_in).
     assert optimizer._target_slice_radius(None, size_out, size_in) == pytest.approx(
         math.sqrt(size_out)
     )
@@ -1838,10 +1877,6 @@ def test_md_decoupling_fan_in_uses_global_sizes_under_tp(monkeypatch):
     [
         ({"tp_mode": "blockwise"}, "blockwise"),
         ({"scale_mode": "spectral"}, "shape_up"),
-        ({"hypersphere_mode": "col"}, "hypersphere_mode"),
-        ({"hypersphere_mode": "embed"}, "hypersphere_mode"),
-        ({"hypersphere_embedding_mode": "col"}, "hypersphere_embedding_mode"),
-        ({"hypersphere_router_mode": "embed"}, "hypersphere_router_mode"),
     ],
 )
 def test_md_decoupling_fan_in_rejects_inconsistent_settings(kwargs, match):

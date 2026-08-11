@@ -6,8 +6,8 @@
 Decouples a 2D weight into a *direction* (hypersphere-normalized weight) and a *magnitude*
 (learnable per-axis gains), with an optional Muon-style orthogonalized update on the direction:
 
-  - Direction: post-step L2-sphere projection of the weight (modes: row, col, flat, embed),
-    optionally per-class for embedding/output and router weights.
+  - Direction: post-step L2-sphere projection of the weight (row, flat, or output-channel),
+    optionally overridden by parameter family, embedding/output, or router policy.
   - Magnitude: optional learnable per-axis gains as a fused reparameterization
     (p = normalized_w * phi(gains)); ``gain_parametrization`` selects phi ∈ {direct, softplus}.
   - Update: AdamW by default, or Muon orthogonalized updates (``use_orthogonal_updates``).
@@ -67,6 +67,18 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 _FOREACH_ADD_ = getattr(torch, "_foreach_add_", None) # This are private APIs that can change in future versions of PyTorch.
+_HYPERSPHERE_FAMILIES = {
+    "attention-in",
+    "attention-out",
+    "dense-mlp-in",
+    "dense-mlp-out",
+    "expert-in",
+    "expert-out",
+    "moe-latent-in",
+    "moe-latent-out",
+    "unclassified",
+}
+_HYPERSPHERE_MODES = {"row", "flat", "output_channel", "none"}
 
 
 # NOTE: maybe for this make specialized norm functions (so row, column and global).
@@ -340,13 +352,12 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         # Hypersphere (L2, post-step weight projection only).
-        hypersphere_mode: Optional[Literal["row", "col", "flat", "embed"]] = None,
+        hypersphere_mode: Optional[Literal["row", "flat", "output_channel"]] = None,
         hypersphere_embedding_mode: Optional[
-            Literal["row", "col", "flat", "embed", "none", "external"]
+            Literal["row", "flat", "none", "external"]
         ] = None,
-        hypersphere_router_mode: Optional[
-            Literal["row", "col", "flat", "embed", "none"]
-        ] = None,
+        hypersphere_router_mode: Optional[Literal["row", "flat", "none"]] = None,
+        hypersphere_family_modes: Optional[Dict[str, str]] = None,
         hypersphere_eps: float = 1e-8,
         # Tangential-gradient / preserve-init options (off by default).
         hypersphere_tangential_grad: bool = False,
@@ -398,6 +409,14 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         self.hypersphere_mode = hypersphere_mode
         self.hypersphere_embedding_mode = _normalize_embedding_mode(hypersphere_embedding_mode)
         self.hypersphere_router_mode = hypersphere_router_mode
+        self.hypersphere_family_modes = dict(hypersphere_family_modes or {})
+        unknown_families = self.hypersphere_family_modes.keys() - _HYPERSPHERE_FAMILIES
+        unknown_modes = set(self.hypersphere_family_modes.values()) - _HYPERSPHERE_MODES
+        if unknown_families or unknown_modes:
+            raise ValueError(
+                "Invalid hypersphere family modes: "
+                f"unknown families={sorted(unknown_families)}, modes={sorted(unknown_modes)}"
+            )
         self.hypersphere_eps = hypersphere_eps
         self.hypersphere_tangential_grad = hypersphere_tangential_grad
         self.hypersphere_preserve_init = hypersphere_preserve_init
@@ -475,6 +494,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             self.hypersphere_mode is not None
             or self.hypersphere_embedding_mode is not None
             or self.hypersphere_router_mode is not None
+            or any(mode != "none" for mode in self.hypersphere_family_modes.values())
         ):
             with torch.no_grad():
                 for group in self.param_groups:
@@ -538,7 +558,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         is_embedding = getattr(p, "is_embedding_or_output_parameter", False)
         is_router = getattr(p, "is_router", False)
         is_merged_offload_expert = getattr(p, "merged_offload_expert", False)
-        mode = self._resolve_mode(is_embedding, is_router)
+        mode = self._resolve_mode(p, is_out_proj, is_embedding, is_router)
         will_normalize = (
             p.ndim == 2 or (p.ndim == 3 and is_merged_offload_expert)
         ) and mode is not None
@@ -886,13 +906,22 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             tp_mode=("duplicated" if self.tp_mode == "blockwise" else self.tp_mode),
         )
 
-    def _resolve_mode(self, is_embedding: bool, is_router: bool = False):
+    def _resolve_mode(
+        self, p: torch.Tensor, is_out_proj: bool, is_embedding: bool, is_router: bool = False
+    ):
+        family = getattr(p, "md_gain_log_family", "unclassified")
         if is_router and self.hypersphere_router_mode is not None:
             mode = self.hypersphere_router_mode
         elif is_embedding and self.hypersphere_embedding_mode is not None:
             mode = self.hypersphere_embedding_mode
+        elif family in self.hypersphere_family_modes:
+            mode = self.hypersphere_family_modes[family]
+        elif self.hypersphere_mode == "output_channel":
+            mode = "output_channel" if family in {"expert-in", "expert-out"} else "flat"
         else:
             mode = self.hypersphere_mode
+        if mode == "output_channel":
+            mode = "col" if is_out_proj or family.endswith("-out") else "row"
         return None if mode == "none" else mode
 
     def _resolve_radius_scale(self, is_out_proj: bool) -> float:
@@ -915,6 +944,15 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         if self.hypersphere_radius_mode == "init":
             assert self.hidden_size is not None and self.hidden_size > 0, (
                 "hypersphere_radius_mode='init' requires hidden_size"
+            )
+            unsupported = {
+                family: mode
+                for family, mode in self.hypersphere_family_modes.items()
+                if mode not in ("none", "flat")
+            }
+            assert not unsupported, (
+                "hypersphere_radius_mode='init' only supports flat family overrides; "
+                f"got {unsupported}."
             )
             return
         if self.hypersphere_radius_mode != "fan_in":
@@ -941,24 +979,8 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             "hypersphere_radius_mode='fan_in' targets ||update||_F = sqrt(d_out), which only "
             f"agrees with scale_mode='shape_up'; got '{self.scale_mode}'."
         )
-        # row gives unit rows and flat gives sqrt(d_out) outright, both landing ||W||_F on
-        # sqrt(d_out) = the update norm. col/embed normalize COLUMNS, which cannot reach
-        # sqrt(d_out) without a per-column radius of sqrt(d_out/d_in), so they would contradict
-        # the update scale (_target_slice_radius implements that radius, but the combination is
-        # rejected here rather than silently enabled).
-        unsupported = {
-            name: mode
-            for name, mode in (
-                ("hypersphere_mode", self.hypersphere_mode),
-                ("hypersphere_embedding_mode", self.hypersphere_embedding_mode),
-                ("hypersphere_router_mode", self.hypersphere_router_mode),
-            )
-            if mode not in (None, "none", "row", "flat")
-        }
-        assert not unsupported, (
-            "hypersphere_radius_mode='fan_in' only supports the 'row' and 'flat' sphere modes; "
-            f"got {unsupported}."
-        )
+        # Row, flat, and output-channel projections all land on ||W||_F = sqrt(d_out):
+        # rows use radius 1, while columns use radius sqrt(d_out / d_in).
 
 
     def _init_radius_scale(self, size_out: int, size_in: int) -> float:
@@ -1002,8 +1024,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         'shape_native'/'init' keep the historical radii: sqrt(max)*_init_radius_scale for flat,
         unit slices for row/col. Under 'fan_in' (init_std = 1/sqrt(d_in)) a slice of |S| entries
         has expected norm sqrt(|S|/d_in), giving flat -> sqrt(d_out), row -> 1 and
-        col -> sqrt(d_out/d_in); all three put ||W||_F at sqrt(d_out). Only the flat and row cases
-        are reachable today (_validate_radius_mode rejects col/embed under fan_in)."""
+        col -> sqrt(d_out/d_in); all three put ||W||_F at sqrt(d_out)."""
         if self.hypersphere_radius_mode == "fan_in":
             numel = size_out * size_in if dim is None else (size_out if dim == 0 else size_in)
             return (numel / size_in) ** 0.5
@@ -1098,7 +1119,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         is_router: bool,
     ) -> tuple:
         """Return the policy-selected Frobenius radius for each logical block."""
-        mode = self._resolve_mode(is_embedding, is_router)
+        mode = self._resolve_mode(p, is_out_proj, is_embedding, is_router)
         if mode is None:
             raise ValueError(
                 "--md-normalize-update-to-weight-norm requires an active hypersphere mode "
@@ -1113,10 +1134,10 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 size_out, size_in = self._global_sizes(
                     block, partition_dim, getattr(p, "expert_tp", False)
                 )
-                if mode == "col" or (mode == "embed" and is_out_proj):
+                if mode == "col":
                     dim = 0
                     slice_count = size_in
-                elif mode == "row" or (mode == "embed" and not is_out_proj):
+                elif mode == "row":
                     dim = 1
                     slice_count = size_out
                 else:
@@ -1146,7 +1167,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                                   is_merged_offload_expert: bool = False):
         """In-place: remove the radial component of `grad` w.r.t. the hypersphere mode at `p`.
         Mirrors _normalize's QKV-split layout so the constraint matches the post-step projection."""
-        mode = self._resolve_mode(is_embedding, is_router)
+        mode = self._resolve_mode(p, is_out_proj, is_embedding, is_router)
         if mode is None:
             return
         weight_blocks, _, _ = self._logical_blocks(
@@ -1166,8 +1187,6 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             dim = 0
         elif mode == "row":
             dim = 1
-        elif mode == "embed":
-            dim = 0 if is_out_proj else 1
         elif mode == "flat":
             dim = None
         else:
@@ -1193,7 +1212,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         batch: Optional[torch.Tensor] = None,
     ) -> None:
         """Normalize logical blocks onto explicit target Frobenius spheres."""
-        mode = mode_override or self._resolve_mode(is_embedding, is_router)
+        mode = mode_override or self._resolve_mode(p, is_out_proj, is_embedding, is_router)
         if mode is None:
             return
         if len(target_frobenius_norms) != len(blocks):
@@ -1223,8 +1242,6 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             dim = -1
         elif mode == "flat":
             dim = (-2, -1)
-        elif mode == "embed":
-            dim = -2 if is_out_proj else -1
         else:
             raise ValueError(f"Unsupported hypersphere mode: {mode}")
 
@@ -1249,14 +1266,14 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         """In-place L2-sphere projection of a 2D tensor `x` (sized like `p`).
 
         For QKV-merged weights, normalize each of Q/K/V separately. Modes:
-            row    → unit-norm each output row     (dim=1)
-            col    → unit-norm each input column   (dim=0)
-            flat   → unit Frobenius then scale by sqrt(max(d_out, d_in))
-            embed  → row for non-out_proj, col for out_proj
+            row            → unit-norm each output row     (dim=1)
+            flat           → unit Frobenius then scale by sqrt(max(d_out, d_in))
+            output_channel → row for input projections, column for output projections
+        ``col`` is the internal mode produced by output_channel for output projections.
         Each slice is then placed on its target radius (see _target_slice_radius), which is where
         --hypersphere-radius-mode moves the sphere.
         """
-        mode = self._resolve_mode(is_embedding, is_router)
+        mode = self._resolve_mode(p, is_out_proj, is_embedding, is_router)
         if mode is None:
             return
 
@@ -1300,8 +1317,6 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             dim = 1
         elif mode == "flat":
             dim = None
-        elif mode == "embed":
-            dim = 0 if is_out_proj else 1
         else:
             raise ValueError(f"Unsupported hypersphere mode: {mode}")
 
@@ -2094,6 +2109,7 @@ def get_megatron_mddecoupling_optimizer(
         betas=(config.adam_beta1, config.adam_beta2),
         eps=config.adam_eps,
         hypersphere_mode=config.hypersphere_mode,
+        hypersphere_family_modes=dict(config.hypersphere_family_modes),
         hypersphere_embedding_mode=hypersphere_embedding_mode,
         hypersphere_router_mode=config.hypersphere_router_mode,
         hypersphere_tangential_grad=config.hypersphere_tangential_grad,
