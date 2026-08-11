@@ -35,9 +35,8 @@ def test_muon_gradient_and_update_norms_are_grouped_by_family():
     prefix = "muon-md/gradients/attention-in"
     assert stats[f"{prefix}/rms"] == pytest.approx(math.sqrt(25.0 / 6.0))
     assert stats[f"{prefix}/frobenius-norm"] == pytest.approx(5.0)
-    assert stats[f"{prefix}/row-rms/min"] == 0.0
-    assert stats[f"{prefix}/row-rms/p10"] == pytest.approx(math.sqrt(25.0 / 3.0) * 0.1)
-    assert stats[f"{prefix}/row-rms/median"] == pytest.approx(math.sqrt(25.0 / 3.0) * 0.5)
+    assert stats[f"{prefix}/row-rms/mean"] == pytest.approx(math.sqrt(25.0 / 3.0) / 2.0)
+    assert stats[f"{prefix}/col-rms/mean"] == pytest.approx(7.0 / (3.0 * math.sqrt(2.0)))
     update_prefix = "muon-md/updates/attention-in"
     assert stats[f"{update_prefix}/rms"] == pytest.approx(6.0 / math.sqrt(6.0))
     assert stats[f"{update_prefix}/frobenius-norm"] == pytest.approx(6.0)
@@ -46,6 +45,33 @@ def test_muon_gradient_and_update_norms_are_grouped_by_family():
             assert stats[
                 f"muon-md/{kind}/sparsity/attention-in/fraction-below-{threshold}"
             ] == pytest.approx(expected_sparsity)
+
+
+def test_muon_tensor_norms_are_also_grouped_by_global_layer():
+    model = torch.nn.Module()
+    params = []
+    for layer, value in ((0, 1.0), (2, 3.0)):
+        param = torch.nn.Parameter(torch.zeros(2, 2))
+        param.md_gain_log_family = "attention-in"
+        param.md_gain_log_layer = layer
+        param.main_grad = torch.full_like(param, value)
+        model.register_parameter(f"weight_{layer}", param)
+        params.append((param, value))
+
+    md_logging_module.set_muon_norm_logging(True, tensor_stats=["rms"], layer_count=3)
+    md_logging_module.capture_finalized_gradient_norms([model])
+    for param, value in params:
+        update = torch.full_like(param, 2.0 * value)
+        md_logging_module.capture_muon_update_block_norms(
+            param, [update], 1.0, kind="orthogonal-updates"
+        )
+        md_logging_module.capture_muon_update_norms(param, update, 0.5)
+    stats = md_logging_module.collect_captured_muon_norms()
+
+    assert stats["muon-md/gradients/layer-0/attention-in/rms"] == pytest.approx(1.0)
+    assert stats["muon-md/gradients/layer-2/attention-in/rms"] == pytest.approx(3.0)
+    assert stats["muon-md/orthogonal-updates/layer-0/attention-in/rms"] == pytest.approx(2.0)
+    assert stats["muon-md/updates/layer-2/attention-in/rms"] == pytest.approx(3.0)
 
 
 def test_muon_tensor_selectors_skip_unrequested_stages_and_stats(monkeypatch):
@@ -156,8 +182,6 @@ def test_muon_update_norms_capture_logical_blocks_without_merging():
     assert stats[f"{raw_prefix}/frobenius-norm"] == pytest.approx(
         (math.sqrt(2.0) + 3.0 * math.sqrt(6.0)) / 2.0
     )
-    assert stats[f"{raw_prefix}/row-rms/min"] == pytest.approx(1.0)
-    assert stats[f"{raw_prefix}/row-rms/median"] == pytest.approx(2.0)
     assert stats[f"{raw_prefix}/row-rms/mean"] == pytest.approx(2.0)
     assert stats[f"{raw_prefix}/col-rms/mean"] == pytest.approx(2.0)
     final_prefix = "muon-md/updates/attention-in"

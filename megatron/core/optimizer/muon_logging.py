@@ -75,10 +75,12 @@ _GAIN_FAMILIES = (
 
 _TENSOR_KINDS = ("gradients", "orthogonal-updates", "updates")
 _TENSOR_STATS = ("rms", "frobenius-norm", "row-col-rms-means", "row-col-rms-quantiles", "sparsity")
+_DEFAULT_TENSOR_STATS = ("rms", "frobenius-norm", "row-col-rms-means", "sparsity")
 _CAPTURE_NORMS = False
 _CAPTURE_KINDS = _TENSOR_KINDS
-_CAPTURE_STATS = _TENSOR_STATS
+_CAPTURE_STATS = _DEFAULT_TENSOR_STATS
 _CAPTURE_SPARSITY_THRESHOLDS = (1e-20, 1e-10, 1e-30)
+_CAPTURE_LAYER_COUNT = 0
 _PENDING_NORMS = {kind: [] for kind in _TENSOR_KINDS}
 _CAPTURE_CONSTANT_TENSORS = {}
 
@@ -162,10 +164,12 @@ def set_muon_norm_logging(
     enabled: bool,
     sparsity_thresholds=(1e-20, 1e-10, 1e-30),
     tensor_kinds=_TENSOR_KINDS,
-    tensor_stats=_TENSOR_STATS,
+    tensor_stats=_DEFAULT_TENSOR_STATS,
+    layer_count: int = 0,
 ) -> None:
     """Configure capture for the current step and discard stale values."""
     global _CAPTURE_NORMS, _CAPTURE_KINDS, _CAPTURE_STATS, _CAPTURE_SPARSITY_THRESHOLDS
+    global _CAPTURE_LAYER_COUNT
     _CAPTURE_NORMS = enabled
     _CAPTURE_KINDS = tuple(dict.fromkeys(tensor_kinds))
     _CAPTURE_STATS = tuple(dict.fromkeys(tensor_stats))
@@ -176,6 +180,9 @@ def set_muon_norm_logging(
     if unknown_stats:
         raise ValueError(f"Unknown Muon tensor logging stats: {sorted(unknown_stats)}")
     _CAPTURE_NORMS = enabled and bool(_CAPTURE_KINDS) and bool(_CAPTURE_STATS)
+    if layer_count < 0:
+        raise ValueError("Muon gradient logging layer count must be non-negative")
+    _CAPTURE_LAYER_COUNT = layer_count
     _CAPTURE_SPARSITY_THRESHOLDS = tuple(
         dict.fromkeys(float(value) for value in sparsity_thresholds)
     )
@@ -195,9 +202,15 @@ def set_muon_norm_logging(
 def _capture_norms(kind: str, param: torch.Tensor, tensor: torch.Tensor, scale=1.0) -> None:
     if not _CAPTURE_NORMS or kind not in _CAPTURE_KINDS or tensor.ndim not in {2, 3}:
         return
+    layer = getattr(param, "md_gain_log_layer", None) if _CAPTURE_LAYER_COUNT else None
+    if layer is not None and not 0 <= layer < _CAPTURE_LAYER_COUNT:
+        raise ValueError(
+            f"Muon tensor layer {layer} is outside configured layer count {_CAPTURE_LAYER_COUNT}"
+        )
     _PENDING_NORMS[kind].append(
         (
             getattr(param, "md_gain_log_family", "unclassified"),
+            layer,
             _matrix_norm_stats(tensor.detach(), scale),
         )
     )
@@ -234,46 +247,46 @@ def capture_muon_update_block_norms(param, updates, lr: float, kind: str = "upda
 
 
 def collect_captured_muon_norms() -> Dict[str, float]:
-    """Aggregate selected captured statistics by MuonMD parameter family."""
+    """Aggregate captured statistics globally and by MuonMD parameter family and layer."""
     if not _CAPTURE_KINDS:
         set_muon_norm_logging(False)
         return {}
     kinds = _CAPTURE_KINDS
     entries = [
-        (kind_index, family, values)
+        (kind_index, family, layer, values)
         for kind_index, kind in enumerate(kinds)
-        for family, values in _PENDING_NORMS[kind]
+        for family, layer, values in _PENDING_NORMS[kind]
     ]
     distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
     if not entries and not distributed:
+        set_muon_norm_logging(False)
         return {}
-    device = entries[0][2].device if entries else torch.device("cuda", torch.cuda.current_device())
+    device = entries[0][3].device if entries else torch.device("cuda", torch.cuda.current_device())
     sparsity_count = len(_CAPTURE_SPARSITY_THRESHOLDS) if "sparsity" in _CAPTURE_STATS else 0
     average_stat_count = 8 + sparsity_count
+    family_count = len(_GAIN_FAMILIES)
+    global_bucket_count = len(kinds) * family_count
+    bucket_count = global_bucket_count + len(kinds) * _CAPTURE_LAYER_COUNT * family_count
     totals = torch.zeros(
-        (len(kinds), len(_GAIN_FAMILIES), average_stat_count + 1),
-        dtype=torch.float64,
-        device=device,
+        (bucket_count, average_stat_count + 1), dtype=torch.float64, device=device
     )
-    minima = torch.full(
-        (len(kinds), len(_GAIN_FAMILIES), 2),
-        float("inf"),
-        dtype=torch.float64,
-        device=device,
-    )
+    minima = torch.full((bucket_count, 2), float("inf"), dtype=torch.float64, device=device)
     if entries:
         average_indices = [0, 1, 3, 4, 6, 7, 8, 9, *range(10, 10 + sparsity_count)]
         family_indices = {family: index for index, family in enumerate(_GAIN_FAMILIES)}
+        entry_family_indices = [
+            family_indices.get(family, family_indices["unclassified"])
+            for _, family, _, _ in entries
+        ]
         entry_indices = torch.tensor(
             [
-                kind_index * len(_GAIN_FAMILIES)
-                + family_indices.get(family, family_indices["unclassified"])
-                for kind_index, family, _ in entries
+                kind_index * family_count + family_index
+                for (kind_index, _, _, _), family_index in zip(entries, entry_family_indices)
             ],
             dtype=torch.long,
             device=device,
         )
-        entry_values = torch.stack([values for _, _, values in entries]).to(torch.float64)
+        entry_values = torch.stack([values for _, _, _, values in entries]).to(torch.float64)
         average_values = torch.cat(
             (
                 entry_values[:, average_indices],
@@ -281,9 +294,26 @@ def collect_captured_muon_norms() -> Dict[str, float]:
             ),
             dim=1,
         )
-        totals.view(-1, average_stat_count + 1).index_add_(0, entry_indices, average_values)
+        layered_rows = [
+            row for row, (_, _, layer, _) in enumerate(entries) if layer is not None
+        ]
+        if layered_rows:
+            layer_indices = torch.tensor(
+                [
+                    global_bucket_count
+                    + (entries[row][0] * _CAPTURE_LAYER_COUNT + entries[row][2]) * family_count
+                    + entry_family_indices[row]
+                    for row in layered_rows
+                ],
+                dtype=torch.long,
+                device=device,
+            )
+            entry_indices = torch.cat((entry_indices, layer_indices))
+            entry_values = torch.cat((entry_values, entry_values[layered_rows]))
+            average_values = torch.cat((average_values, average_values[layered_rows]))
+        totals.index_add_(0, entry_indices, average_values)
         if "row-col-rms-quantiles" in _CAPTURE_STATS:
-            minima.view(-1, 2).scatter_reduce_(
+            minima.scatter_reduce_(
                 0,
                 entry_indices[:, None].expand(-1, 2),
                 entry_values[:, [2, 5]],
@@ -295,39 +325,50 @@ def collect_captured_muon_norms() -> Dict[str, float]:
             torch.distributed.all_reduce(minima, op=torch.distributed.ReduceOp.MIN)
     totals_size = totals.numel()
     cpu_values = torch.cat((totals.flatten(), minima.flatten())).cpu()
-    totals = (
-        cpu_values[:totals_size]
-        .view(len(kinds), len(_GAIN_FAMILIES), average_stat_count + 1)
-        .tolist()
-    )
-    minima = cpu_values[totals_size:].view(len(kinds), len(_GAIN_FAMILIES), 2).tolist()
+    totals = cpu_values[:totals_size].view(bucket_count, average_stat_count + 1).tolist()
+    minima = cpu_values[totals_size:].view(bucket_count, 2).tolist()
     stats = {}
+
+    def format_bucket(base: str, family: str, bucket: int) -> None:
+        count = totals[bucket][average_stat_count]
+        if not count:
+            return
+        values = [value / count for value in totals[bucket][:average_stat_count]]
+        prefix = f"{base}/{family}"
+        if "rms" in _CAPTURE_STATS:
+            stats[f"{prefix}/rms"] = values[0]
+        if "frobenius-norm" in _CAPTURE_STATS:
+            stats[f"{prefix}/frobenius-norm"] = values[1]
+        if "row-col-rms-means" in _CAPTURE_STATS:
+            stats[f"{prefix}/row-rms/mean"] = values[6]
+            stats[f"{prefix}/col-rms/mean"] = values[7]
+        if "row-col-rms-quantiles" in _CAPTURE_STATS:
+            stats[f"{prefix}/row-rms/min"] = minima[bucket][0]
+            stats[f"{prefix}/row-rms/p10"] = values[2]
+            stats[f"{prefix}/row-rms/median"] = values[3]
+            stats[f"{prefix}/col-rms/min"] = minima[bucket][1]
+            stats[f"{prefix}/col-rms/p10"] = values[4]
+            stats[f"{prefix}/col-rms/median"] = values[5]
+        if "sparsity" in _CAPTURE_STATS:
+            sparsity_prefix = f"{base}/sparsity/{family}"
+            for threshold, sparsity in zip(_CAPTURE_SPARSITY_THRESHOLDS, values[8:]):
+                stats[f"{sparsity_prefix}/fraction-below-{threshold}"] = sparsity
+
     for kind_index, name in enumerate(kinds):
         for family_index, family in enumerate(_GAIN_FAMILIES):
-            count = totals[kind_index][family_index][average_stat_count]
-            if count:
-                values = [
-                    value / count for value in totals[kind_index][family_index][:average_stat_count]
-                ]
-                prefix = f"muon-md/{name}/{family}"
-                if "rms" in _CAPTURE_STATS:
-                    stats[f"{prefix}/rms"] = values[0]
-                if "frobenius-norm" in _CAPTURE_STATS:
-                    stats[f"{prefix}/frobenius-norm"] = values[1]
-                if "row-col-rms-means" in _CAPTURE_STATS:
-                    stats[f"{prefix}/row-rms/mean"] = values[6]
-                    stats[f"{prefix}/col-rms/mean"] = values[7]
-                if "row-col-rms-quantiles" in _CAPTURE_STATS:
-                    stats[f"{prefix}/row-rms/min"] = minima[kind_index][family_index][0]
-                    stats[f"{prefix}/row-rms/p10"] = values[2]
-                    stats[f"{prefix}/row-rms/median"] = values[3]
-                    stats[f"{prefix}/col-rms/min"] = minima[kind_index][family_index][1]
-                    stats[f"{prefix}/col-rms/p10"] = values[4]
-                    stats[f"{prefix}/col-rms/median"] = values[5]
-                if "sparsity" in _CAPTURE_STATS:
-                    sparsity_prefix = f"muon-md/{name}/sparsity/{family}"
-                    for threshold, sparsity in zip(_CAPTURE_SPARSITY_THRESHOLDS, values[8:]):
-                        stats[f"{sparsity_prefix}/fraction-below-{threshold}"] = sparsity
+            format_bucket(
+                f"muon-md/{name}", family, kind_index * family_count + family_index
+            )
+    for kind_index, name in enumerate(kinds):
+        for layer in range(_CAPTURE_LAYER_COUNT):
+            for family_index, family in enumerate(_GAIN_FAMILIES):
+                format_bucket(
+                    f"muon-md/{name}/layer-{layer}",
+                    family,
+                    global_bucket_count
+                    + (kind_index * _CAPTURE_LAYER_COUNT + layer) * family_count
+                    + family_index,
+                )
     set_muon_norm_logging(False)
     return stats
 

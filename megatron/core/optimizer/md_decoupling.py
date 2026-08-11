@@ -611,7 +611,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                     is_merged_offload_expert=is_merged_offload_expert,
                 )
             capture_muon_update_block_norms(
-                p, update_blocks, group["lr"], kind="orthogonal-updates"
+                p, update_blocks, 1.0, kind="orthogonal-updates"
             )
             if self.normalize_update_to_weight_norm:
                 target_frobenius_norms = self._target_logical_frobenius_norms(

@@ -256,7 +256,6 @@ class LoggerConfig:
             "rms",
             "frobenius-norm",
             "row-col-rms-means",
-            "row-col-rms-quantiles",
             "sparsity",
         ]
     )

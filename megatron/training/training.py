@@ -2090,6 +2090,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         sparsity_thresholds=args.muon_sparsity_thresholds,
         tensor_kinds=args.muon_log_tensor_kinds,
         tensor_stats=args.muon_log_tensor_stats,
+        layer_count=args.num_layers,
     )
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
