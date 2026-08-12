@@ -1037,6 +1037,7 @@ def validate_args(args, defaults={}):
     args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
     args.mamba_inference_conv_states_dtype = map_dtype(args.mamba_inference_conv_states_dtype)
     args.mamba_inference_ssm_states_dtype = map_dtype(args.mamba_inference_ssm_states_dtype)
+    args.logit_dtype = map_dtype(getattr(args, 'logit_dtype', None))
 
     args.megatron_fsdp_main_params_dtype = map_dtype(args.megatron_fsdp_main_params_dtype)
     args.megatron_fsdp_main_grads_dtype = map_dtype(args.megatron_fsdp_main_grads_dtype)
@@ -3150,6 +3151,11 @@ def _add_mixed_precision_args(parser):
     group.add_argument('--fp16-lm-cross-entropy', action='store_true',
                        help='Move the cross entropy unreduced loss calculation'
                        'for lm head to fp16.')
+    group.add_argument('--output-logit-dtype', type=str, choices=['bf16', 'fp32'], default=None,
+                       dest='logit_dtype',
+                       help='Output dtype for the language-model output-layer GEMM. When the '
+                       'requested dtype differs from the input dtype, Transformer Engine '
+                       'general_gemm is used. By default, logits use the output-layer input dtype.')
     group.add_argument('--reuse-grad-buf-for-mxfp8-param-ag', action='store_true',
                        help='If True, reuse the grad buffer for MXFP8 parameter all-gather.')
 

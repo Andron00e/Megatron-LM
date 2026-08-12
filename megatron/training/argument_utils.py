@@ -527,6 +527,7 @@ def gpt_config_from_args(args: Namespace, config: TransformerConfig | None = Non
 
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
+    kwargs["logit_dtype"] = getattr(args, "logit_dtype", None)
     kwargs["position_embedding_type"] = args.position_embedding_type
     kwargs["rotary_percent"] = args.rotary_percent
     kwargs["rotary_base"] = args.rotary_base
@@ -570,6 +571,7 @@ def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None = 
 
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
+    kwargs["logit_dtype"] = getattr(args, "logit_dtype", None)
     kwargs["hybrid_layer_pattern"] = args.hybrid_layer_pattern
     kwargs["position_embedding_type"] = args.position_embedding_type
     kwargs["rotary_percent"] = args.rotary_percent
