@@ -800,6 +800,7 @@ def test_md_decoupling_recipe_defaults():
     assert config.gain_parametrization == "softplus"
     assert config.muon_router_scale_mode == "none"
     assert config.muon_split_fc1 is True
+    assert config.router_lr is None
 
 
 def test_md_decoupling_family_mode_overrides_and_output_channel_resolution():
@@ -835,6 +836,32 @@ def test_md_decoupling_family_mode_overrides_and_output_channel_resolution():
     # Dedicated embedding and router policies take precedence over ordinary family overrides.
     assert optimizer._resolve_mode(param, False, True) == "flat"
     assert optimizer._resolve_mode(param, False, False, True) == "row"
+
+
+def test_md_decoupling_router_lr_override():
+    router = torch.nn.Parameter(torch.ones(4, 8))
+    matrix = torch.nn.Parameter(torch.ones(8, 8))
+    router.is_router = True
+    config = OptimizerConfig(
+        optimizer="md_decoupling",
+        lr=1e-3,
+        min_lr=1e-5,
+        matrix_lr=1e-2,
+        router_lr=4e-3,
+    )
+
+    overrides = md_module._mddecoupling_config_overrides(config, {})
+    router_overrides = [
+        override for key, override in overrides.items() if key.matches(router, "router.weight")
+    ]
+    matrix_overrides = [
+        override for key, override in overrides.items() if key.matches(matrix, "linear.weight")
+    ]
+
+    assert router_overrides == [
+        {"use_orthogonal_updates": True, "max_lr": 4e-3, "min_lr": 4e-5}
+    ]
+    assert matrix_overrides == [{"max_lr": 1e-2, "min_lr": 1e-4}]
 
 
 def test_md_decoupling_router_scale_mode_resolution():
