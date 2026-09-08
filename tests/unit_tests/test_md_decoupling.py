@@ -46,23 +46,16 @@ requires_cuda_and_emerging = pytest.mark.skipif(
 def _orthogonalize_and_merge(optimizer, *args, **kwargs):
     use_radius_scale = kwargs.pop("use_radius_scale", False)
     is_router = kwargs.pop("is_router", False)
-    blocks, partition_dim = optimizer._orthogonalize_param_blocks(*args, **kwargs)
+    blocks, partition_dim, batch = optimizer._orthogonalize_param_blocks(*args, **kwargs)
     if optimizer.normalize_update_to_weight_norm:
         param = args[0]
         is_qkv = kwargs.get("is_qkv", False)
         is_merged_expert = kwargs.get("is_merged_offload_expert", False)
         is_out_proj = getattr(param, "is_out_proj", False)
         is_embedding = getattr(param, "is_embedding_or_output_parameter", False)
-        optimizer._cache_preserved_frobenius_norms(
-            param, is_qkv, is_merged_expert, True
-        )
+        optimizer._cache_preserved_frobenius_norms(param, is_qkv, is_merged_expert, True)
         targets = optimizer._target_logical_frobenius_norms(
-            param,
-            blocks,
-            partition_dim,
-            is_out_proj,
-            is_embedding,
-            is_router,
+            param, blocks, partition_dim, is_out_proj, is_embedding, is_router
         )
         optimizer._normalize_logical_blocks(
             param,
@@ -73,14 +66,13 @@ def _orthogonalize_and_merge(optimizer, *args, **kwargs):
             is_router,
             mode_override="flat",
             target_frobenius_norms=targets,
+            batch=batch,
         )
     else:
         scale_partition_dim = None if optimizer.tp_mode == "blockwise" else partition_dim
         is_expert_tp = getattr(args[0], "expert_tp", False)
         for index, block in enumerate(blocks):
-            size_out, size_in = optimizer._global_sizes(
-                block, scale_partition_dim, is_expert_tp
-            )
+            size_out, size_in = optimizer._global_sizes(block, scale_partition_dim, is_expert_tp)
             if use_radius_scale and optimizer.hypersphere_radius_mode == "fan_in":
                 scale = optimizer._fan_in_update_scale(size_out, size_in)
             else:
@@ -92,10 +84,7 @@ def _orthogonalize_and_merge(optimizer, *args, **kwargs):
             blocks[index] = block * scale * optimizer.extra_scale_factor
     result = torch.empty_like(args[1])
     result_blocks, merge, _ = optimizer._logical_blocks(
-        args[0],
-        result,
-        kwargs.get("is_qkv", False),
-        kwargs.get("is_merged_offload_expert", False),
+        args[0], result, kwargs.get("is_qkv", False), kwargs.get("is_merged_offload_expert", False)
     )
     if merge is not None:
         return merge(blocks)
@@ -441,6 +430,30 @@ def test_md_preserved_gain_consumes_init_norm_before_target_selection():
     torch.testing.assert_close(param, initial)
 
 
+@requires_cuda
+@torch.no_grad()
+def test_md_preserved_flat_gain_consumes_init_norm():
+    param = torch.nn.Parameter(torch.tensor([[3.0, 4.0], [0.0, 12.0]], device="cuda"))
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.0,
+        weight_decay=0.0,
+        hypersphere_mode="flat",
+        hypersphere_preserve_init=True,
+        hypersphere_gains_mode="flat",
+        gain_parametrization="direct",
+        pg_collection=_NoProcessGroups(),
+    )
+    initial = param.clone()
+    param.grad = torch.ones_like(param)
+
+    optimizer.step()
+
+    target = optimizer._fixed_weight_norms[param][0]
+    assert target.item() == pytest.approx(math.sqrt(2.0))
+    torch.testing.assert_close(param, initial)
+
+
 @requires_cuda_and_emerging
 def test_md_muon_keeps_glu_blocks_separate_through_weight_projection(monkeypatch):
     param = torch.nn.Parameter(torch.zeros((8, 4), device="cuda"))
@@ -486,31 +499,197 @@ def test_md_muon_keeps_glu_blocks_separate_through_weight_projection(monkeypatch
     torch.testing.assert_close(param[4:], torch.full_like(param[4:], -0.2))
 
 
+@pytest.mark.parametrize(
+    ("shape", "glu_split_dim", "expected_batch_shape"),
+    [((3, 4, 2), None, (3, 4, 2)), ((3, 8, 2), 1, (6, 4, 2))],
+    ids=["merged-fc2", "merged-fc1"],
+)
+def test_md_merged_expert_orthogonalization_uses_batched_api(
+    monkeypatch, shape, glu_split_dim, expected_batch_shape
+):
+    param = torch.nn.Parameter(torch.zeros(shape))
+    param.merged_offload_expert = True
+    if glu_split_dim is not None:
+        param.glu_split_dim = glu_split_dim
+    grad = torch.arange(math.prod(shape), dtype=torch.float32).view(shape)
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.1,
+        split_fc1=glu_split_dim is not None,
+        pg_collection=_NoProcessGroups(),
+    )
+    calls = []
+
+    def batched_newton_schulz(batch, **kwargs):
+        calls.append((batch.clone(), kwargs))
+        return batch + 1
+
+    monkeypatch.setattr(md_module, "_batched_newton_schulz", batched_newton_schulz)
+    optimizer._orthogonalize_tensor = lambda *args, **kwargs: pytest.fail(
+        "scalar orthogonalization must not run"
+    )
+
+    blocks, partition_dim, batch = optimizer._orthogonalize_param_blocks(
+        param, grad, is_merged_offload_expert=True
+    )
+
+    assert partition_dim is None
+    assert batch is not None
+    assert tuple(batch.shape) == expected_batch_shape
+    assert len(calls) == 1
+    assert calls[0][1] == {
+        "steps": optimizer.num_ns_steps,
+        "coefficient_type": optimizer.coefficient_type,
+    }
+    torch.testing.assert_close(torch.stack(blocks), batch)
+    torch.testing.assert_close(batch, calls[0][0] + 1)
+
+
+@pytest.mark.parametrize(
+    ("shape", "glu_split_dim", "expected_calls"),
+    [((3, 4, 2), None, 3), ((3, 8, 2), 1, 6)],
+    ids=["merged-fc2", "merged-fc1"],
+)
+def test_md_merged_expert_orthogonalization_falls_back_per_block(
+    monkeypatch, shape, glu_split_dim, expected_calls
+):
+    param = torch.nn.Parameter(torch.zeros(shape))
+    param.merged_offload_expert = True
+    if glu_split_dim is not None:
+        param.glu_split_dim = glu_split_dim
+    grad = torch.arange(math.prod(shape), dtype=torch.float32).view(shape)
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.1,
+        split_fc1=glu_split_dim is not None,
+        pg_collection=_NoProcessGroups(),
+    )
+    calls = []
+
+    def scalar_orthogonalize(block, *args, **kwargs):
+        calls.append(block.clone())
+        return block + 1
+
+    monkeypatch.setattr(md_module, "_batched_newton_schulz", None)
+    optimizer._orthogonalize_tensor = scalar_orthogonalize
+
+    blocks, partition_dim, batch = optimizer._orthogonalize_param_blocks(
+        param, grad, is_merged_offload_expert=True
+    )
+
+    assert partition_dim is None
+    assert len(calls) == expected_calls
+    assert batch is None
+    torch.testing.assert_close(torch.stack(blocks), torch.stack(calls) + 1)
+
+
+@pytest.mark.parametrize(
+    ("shape", "glu_split_dim", "expected_batch_shape"),
+    [((3, 4, 2), None, (3, 4, 2)), ((3, 8, 2), 1, (6, 4, 2))],
+    ids=["merged-fc2", "merged-fc1"],
+)
+@pytest.mark.parametrize("mode", ["flat", "row", "col"])
+def test_md_merged_expert_normalization_is_always_batched(
+    monkeypatch, shape, glu_split_dim, expected_batch_shape, mode
+):
+    param = torch.nn.Parameter(
+        torch.arange(1, math.prod(shape) + 1, dtype=torch.float32).view(shape)
+    )
+    param.merged_offload_expert = True
+    if glu_split_dim is not None:
+        param.glu_split_dim = glu_split_dim
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.1,
+        hypersphere_mode=mode,
+        hypersphere_preserve_init=True,
+        split_fc1=glu_split_dim is not None,
+        pg_collection=_NoProcessGroups(),
+    )
+    calls = []
+    original = optimizer._normalize_batch
+
+    def record_batch(batch, *args, **kwargs):
+        calls.append(tuple(batch.shape))
+        return original(batch, *args, **kwargs)
+
+    monkeypatch.setattr(optimizer, "_normalize_batch", record_batch)
+    with torch.no_grad():
+        optimizer._normalize(param, param, is_merged_offload_expert=True)
+
+    assert calls == [expected_batch_shape]
+
+
+@pytest.mark.parametrize("mode", ["flat", "row", "col"])
+def test_md_batched_normalization_matches_individual_blocks(mode):
+    param = torch.nn.Parameter(torch.ones((3, 4, 2)))
+    optimizer = MDDecoupling(
+        params=[param], lr=0.1, hypersphere_mode=mode, pg_collection=_NoProcessGroups()
+    )
+    torch.manual_seed(123)
+    batched = torch.randn_like(param)
+    individual = batched.clone()
+    targets = [torch.tensor(value) for value in (1.25, 2.5, 4.0)]
+
+    with torch.no_grad():
+        optimizer._normalize_batch(batched, mode, targets)
+        for block, target in zip(individual, targets):
+            optimizer._normalize_single(param, block, mode, None, target)
+
+    torch.testing.assert_close(batched, individual)
+
+
+def test_md_non_offloaded_glu_normalization_is_scalar(monkeypatch):
+    param = torch.nn.Parameter(torch.arange(1, 33, dtype=torch.float32).view(8, 4))
+    param.glu_split_dim = 0
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.01,
+        hypersphere_mode="flat",
+        hypersphere_preserve_init=True,
+        use_orthogonal_updates=False,
+        split_fc1=True,
+        pg_collection=_NoProcessGroups(),
+    )
+    monkeypatch.setattr(
+        optimizer,
+        "_normalize_batch",
+        lambda *args, **kwargs: pytest.fail("non-offloaded GLU normalization must stay scalar"),
+    )
+    normalized_shapes = []
+    normalize_single = optimizer._normalize_single
+
+    def record_normalize_single(p, block, *args, **kwargs):
+        normalized_shapes.append(tuple(block.shape))
+        return normalize_single(p, block, *args, **kwargs)
+
+    monkeypatch.setattr(optimizer, "_normalize_single", record_normalize_single)
+    param.grad = torch.ones_like(param)
+    optimizer.step()
+
+    assert normalized_shapes == [(4, 4), (4, 4)]
+
+
 @requires_cuda_and_emerging
 @pytest.mark.parametrize(
-    ("shape", "glu_split_dim", "is_merged_expert"),
-    [
-        ((8, 4), 0, False),
-        ((3, 8, 4), 1, True),
-        ((3, 4, 4), None, True),
-    ],
-    ids=["glu", "merged-fc1", "merged-fc2"],
+    ("shape", "glu_split_dim"),
+    [((3, 8, 4), 1), ((3, 4, 4), None)],
+    ids=["merged-fc1", "merged-fc2"],
 )
 @pytest.mark.parametrize("mode", ["flat", "row", "col"])
 @pytest.mark.parametrize("normalize_update", [False, True])
-def test_md_batched_weight_projection_matches_scalar(
-    shape, glu_split_dim, is_merged_expert, mode, normalize_update
+def test_md_merged_expert_batched_step_matches_scalar_orthogonalization(
+    monkeypatch, shape, glu_split_dim, mode, normalize_update
 ):
     torch.manual_seed(123)
     initial = torch.randn(shape, device="cuda")
     gradient = torch.randn_like(initial)
 
-    def make_optimizer(disable_batch=False):
+    def make_optimizer():
         param = torch.nn.Parameter(initial.clone())
         if glu_split_dim is not None:
             param.glu_split_dim = glu_split_dim
-        if is_merged_expert:
-            param.merged_offload_expert = True
+        param.merged_offload_expert = True
         optimizer = MDDecoupling(
             params=[param],
             lr=0.01,
@@ -526,16 +705,15 @@ def test_md_batched_weight_projection_matches_scalar(
             pg_collection=_NoProcessGroups(),
             tp_mode="duplicated",
         )
-        if disable_batch:
-            optimizer._direct_weight_batch = lambda *args: None
         return param, optimizer
 
     batched_param, batched_optimizer = make_optimizer()
-    scalar_param, scalar_optimizer = make_optimizer(disable_batch=True)
+    scalar_param, scalar_optimizer = make_optimizer()
     batched_param.grad = gradient.clone()
     scalar_param.grad = gradient.clone()
 
     batched_optimizer.step()
+    monkeypatch.setattr(md_module, "_batched_newton_schulz", None)
     scalar_optimizer.step()
 
     torch.testing.assert_close(batched_param, scalar_param, rtol=2e-5, atol=2e-5)
@@ -2198,14 +2376,13 @@ def test_md_decoupling_glu_fc1_flat_normalization_is_block_local(shape, split_di
 
 
 @pytest.mark.parametrize("mode", ["row", "flat"])
-@pytest.mark.parametrize(
-    "shape, split_dim", [((8, 2), 0), ((6, 12), 0), ((2, 8, 2), 1)]
-)
+@pytest.mark.parametrize("shape, split_dim", [((8, 2), 0), ((6, 12), 0), ((2, 8, 2), 1)])
 def test_md_decoupling_fan_in_radius_is_per_glu_fc1_block(shape, split_dim, mode, monkeypatch):
     """A fused GLU fc1 is two logical [ffn, hidden] matrices, so fan_in puts each half on its own
     sqrt(ffn) sphere (fused total sqrt(2*ffn) = sqrt(d_out), same as with split_fc1=False), and the
     update follows the same split so ||U|| = ||W|| holds per half."""
     monkeypatch.setattr(md_module, "newton_schulz_tp", lambda g, **kwargs: g, raising=False)
+    monkeypatch.setattr(md_module, "_batched_newton_schulz", lambda g, **kwargs: g)
     torch.manual_seed(0)
     param = torch.nn.Parameter(torch.randn(*shape))
     param.glu_split_dim = split_dim
@@ -2242,14 +2419,9 @@ def test_md_decoupling_fan_in_radius_is_per_glu_fc1_block(shape, split_dim, mode
     update = _orthogonalize_and_merge(
         optimizer, param, grad, use_radius_scale=True, is_merged_offload_expert=is_merged
     )
-    _assert_split_flat_norms(
-        optimizer, param, update, expected_norm=math.sqrt(block_out)
-    )
+    _assert_split_flat_norms(optimizer, param, update, expected_norm=math.sqrt(block_out))
     torch.testing.assert_close(
-        torch.linalg.vector_norm(update),
-        torch.tensor(math.sqrt(fused_out)),
-        rtol=1e-5,
-        atol=1e-5,
+        torch.linalg.vector_norm(update), torch.tensor(math.sqrt(fused_out)), rtol=1e-5, atol=1e-5
     )
 
 

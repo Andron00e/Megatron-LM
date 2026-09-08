@@ -20,12 +20,7 @@ from typing import Dict, List
 
 import torch
 
-from megatron.core.utils import (
-    get_pg_rank,
-    get_pg_size,
-    nvtx_range_pop,
-    nvtx_range_push,
-)
+from megatron.core.utils import get_pg_rank, get_pg_size, nvtx_range_pop, nvtx_range_push
 
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
 
@@ -105,9 +100,7 @@ def _matrix_norm_stats_impl(
         squares = matrices.square()
     rms = squares.mean().sqrt().mul(scale).reshape(1) if log_rms else zeros
     frobenius = (
-        squares.sum(dim=(1, 2)).sqrt().mean().mul(scale).reshape(1)
-        if log_frobenius
-        else zeros
+        squares.sum(dim=(1, 2)).sqrt().mean().mul(scale).reshape(1) if log_frobenius else zeros
     )
     if log_row_col_rms_means or log_row_col_rms_quantiles:
         row_rms = squares.mean(dim=2).sqrt().flatten()
@@ -126,8 +119,10 @@ def _matrix_norm_stats_impl(
     if log_sparsity:
         scaled_absolute = matrices.abs() * scale
         sparsity = (
-            scaled_absolute.unsqueeze(-1) < sparsity_thresholds
-        ).to(torch.float32).mean(dim=(0, 1, 2))
+            (scaled_absolute.unsqueeze(-1) < sparsity_thresholds)
+            .to(torch.float32)
+            .mean(dim=(0, 1, 2))
+        )
     else:
         sparsity = matrices.new_zeros(sparsity_thresholds.numel())
     return torch.cat((rms, frobenius, row_quantiles, col_quantiles, rms_means, sparsity))
@@ -186,11 +181,12 @@ def set_muon_norm_logging(
     _CAPTURE_SPARSITY_THRESHOLDS = tuple(
         dict.fromkeys(float(value) for value in sparsity_thresholds)
     )
-    if enabled and "sparsity" in _CAPTURE_STATS and (
-        not _CAPTURE_SPARSITY_THRESHOLDS
-        or any(
-            not math.isfinite(value) or value <= 0
-            for value in _CAPTURE_SPARSITY_THRESHOLDS
+    if (
+        enabled
+        and "sparsity" in _CAPTURE_STATS
+        and (
+            not _CAPTURE_SPARSITY_THRESHOLDS
+            or any(not math.isfinite(value) or value <= 0 for value in _CAPTURE_SPARSITY_THRESHOLDS)
         )
     ):
         raise ValueError("Muon gradient/update sparsity thresholds must be finite positive values")
@@ -267,9 +263,7 @@ def collect_captured_muon_norms() -> Dict[str, float]:
     family_count = len(_GAIN_FAMILIES)
     global_bucket_count = len(kinds) * family_count
     bucket_count = global_bucket_count + len(kinds) * _CAPTURE_LAYER_COUNT * family_count
-    totals = torch.zeros(
-        (bucket_count, average_stat_count + 1), dtype=torch.float64, device=device
-    )
+    totals = torch.zeros((bucket_count, average_stat_count + 1), dtype=torch.float64, device=device)
     minima = torch.full((bucket_count, 2), float("inf"), dtype=torch.float64, device=device)
     if entries:
         average_indices = [0, 1, 3, 4, 6, 7, 8, 9, *range(10, 10 + sparsity_count)]
@@ -294,9 +288,7 @@ def collect_captured_muon_norms() -> Dict[str, float]:
             ),
             dim=1,
         )
-        layered_rows = [
-            row for row, (_, _, layer, _) in enumerate(entries) if layer is not None
-        ]
+        layered_rows = [row for row, (_, _, layer, _) in enumerate(entries) if layer is not None]
         if layered_rows:
             layer_indices = torch.tensor(
                 [
@@ -314,10 +306,7 @@ def collect_captured_muon_norms() -> Dict[str, float]:
         totals.index_add_(0, entry_indices, average_values)
         if "row-col-rms-quantiles" in _CAPTURE_STATS:
             minima.scatter_reduce_(
-                0,
-                entry_indices[:, None].expand(-1, 2),
-                entry_values[:, [2, 5]],
-                reduce="amin",
+                0, entry_indices[:, None].expand(-1, 2), entry_values[:, [2, 5]], reduce="amin"
             )
     if distributed:
         torch.distributed.all_reduce(totals)
@@ -356,9 +345,7 @@ def collect_captured_muon_norms() -> Dict[str, float]:
 
     for kind_index, name in enumerate(kinds):
         for family_index, family in enumerate(_GAIN_FAMILIES):
-            format_bucket(
-                f"muon-md/{name}", family, kind_index * family_count + family_index
-            )
+            format_bucket(f"muon-md/{name}", family, kind_index * family_count + family_index)
     for kind_index, name in enumerate(kinds):
         for layer in range(_CAPTURE_LAYER_COUNT):
             for family_index, family in enumerate(_GAIN_FAMILIES):
@@ -444,10 +431,7 @@ def _gain_log_family(name: str, param: torch.Tensor) -> str:
 
 
 def _include_gain_in_global_stats(
-    md_optimizer: torch.optim.Optimizer,
-    param: torch.Tensor,
-    axis: str,
-    dp_state_is_sharded: bool,
+    md_optimizer: torch.optim.Optimizer, param: torch.Tensor, axis: str, dp_state_is_sharded: bool
 ) -> bool:
     """Return whether this rank owns a unique logical copy of a gain tensor."""
     pg_collection = md_optimizer.pg_collection
@@ -466,8 +450,7 @@ def _include_gain_in_global_stats(
 
     retained_dim = {"row": 0, "col": 1, "flat": None}[axis]
     gain_is_tp_sharded = (
-        retained_dim is not None
-        and getattr(param, "partition_dim", None) == retained_dim
+        retained_dim is not None and getattr(param, "partition_dim", None) == retained_dim
     )
     if not gain_is_tp_sharded:
         tp_group = (
@@ -521,9 +504,7 @@ def _accumulate_reduced_matrix_batch(
         device=reduced.device,
     )
     expanded_layers = [
-        (-1 if layer is None else layer)
-        for _, layer, count, _ in metadata
-        for _ in range(count)
+        (-1 if layer is None else layer) for _, layer, count, _ in metadata for _ in range(count)
     ]
     layers = torch.tensor(expanded_layers, dtype=torch.long, device=reduced.device)
     softplus = torch.tensor(
@@ -547,27 +528,20 @@ def _accumulate_reduced_matrix_batch(
     # element-weighted gain RMS computed later in ``collect_md_gain_stats``.
     gain_counts = reduced[:, :, _MATRIX_ELEMENT_COUNT]
     axis_valid = gain_counts > 0
-    matrix_rms = torch.sqrt(
-        reduced[:, :, _MATRIX_SQUARE_SUM] / gain_counts.clamp_min(1)
-    )
+    matrix_rms = torch.sqrt(reduced[:, :, _MATRIX_SQUARE_SUM] / gain_counts.clamp_min(1))
     if log_gains:
         buckets = family_indices[:, None] * len(_GAIN_AXES) + torch.arange(
             len(_GAIN_AXES), device=reduced.device
         )
         axis_indices = buckets.flatten()
-        axis_values = torch.stack(
-            (matrix_rms, axis_valid.to(matrix_rms.dtype)), dim=2
-        ).view(-1, 2)
+        axis_values = torch.stack((matrix_rms, axis_valid.to(matrix_rms.dtype)), dim=2).view(-1, 2)
         if layer_positions.numel():
             layer_buckets = buckets.index_select(0, layer_positions)
             layer_scopes = layers.index_select(0, layer_positions) + 1
             axis_indices = torch.cat(
                 (
                     axis_indices,
-                    (
-                        layer_scopes[:, None] * matrix_axis_totals.size(1)
-                        + layer_buckets
-                    ).flatten(),
+                    (layer_scopes[:, None] * matrix_axis_totals.size(1) + layer_buckets).flatten(),
                 )
             )
             layer_matrix_rms = matrix_rms.index_select(0, layer_positions)
@@ -614,9 +588,7 @@ def _accumulate_reduced_matrix_batch(
     if log_gains:
         row, col = reduced[:, :2].unbind(dim=1)
         row_rms, col_rms = matrix_rms[:, :2].unbind(dim=1)
-        row_col_valid = row[:, _MATRIX_ELEMENT_COUNT].gt(0) & col[
-            :, _MATRIX_ELEMENT_COUNT
-        ].gt(0)
+        row_col_valid = row[:, _MATRIX_ELEMENT_COUNT].gt(0) & col[:, _MATRIX_ELEMENT_COUNT].gt(0)
 
         # RMS of the complete outer-product gain field: RMS(r c^T) = RMS(r) * RMS(c).
         scale = row_rms * col_rms
@@ -626,12 +598,8 @@ def _accumulate_reduced_matrix_batch(
         # Gauge metrics use positive effective softplus gains. Their sum tracks the combined
         # multiplicative log scale; their difference exposes row/column rescaling redundancy.
         softplus_pair = row_col_valid & softplus
-        row_mean_log = row[:, _MATRIX_LOG_SUM] / row[
-            :, _MATRIX_ELEMENT_COUNT
-        ].clamp_min(1)
-        col_mean_log = col[:, _MATRIX_LOG_SUM] / col[
-            :, _MATRIX_ELEMENT_COUNT
-        ].clamp_min(1)
+        row_mean_log = row[:, _MATRIX_LOG_SUM] / row[:, _MATRIX_ELEMENT_COUNT].clamp_min(1)
+        col_mean_log = col[:, _MATRIX_LOG_SUM] / col[:, _MATRIX_ELEMENT_COUNT].clamp_min(1)
         matrix_values[:, _COMBINED_LOG_SCALE_SUM] = torch.where(
             softplus_pair, row_mean_log + col_mean_log, 0
         )
@@ -649,12 +617,8 @@ def _accumulate_reduced_matrix_batch(
                 + family_indices.index_select(0, layer_positions),
             )
         )
-        matrix_values = torch.cat(
-            (matrix_values, matrix_values.index_select(0, layer_positions))
-        )
-    matrix_totals.view(-1, matrix_totals.size(2)).index_add_(
-        0, matrix_indices, matrix_values
-    )
+        matrix_values = torch.cat((matrix_values, matrix_values.index_select(0, layer_positions)))
+    matrix_totals.view(-1, matrix_totals.size(2)).index_add_(0, matrix_indices, matrix_values)
 
 
 def _accumulate_md_matrix_stats(
@@ -676,9 +640,7 @@ def _accumulate_md_matrix_stats(
     batches = {}
     for md_optimizer in md_optimizers:
         for param, state in md_optimizer.state.items():
-            if not _include_param_in_matrix_stats(
-                md_optimizer, param, dp_state_is_sharded
-            ):
+            if not _include_param_in_matrix_stats(md_optimizer, param, dp_state_is_sharded):
                 continue
             present_axes = [axis for axis in _GAIN_AXES if f"{axis}_gain" in state]
             if not present_axes and not sparsity_thresholds and not log_param_rms:
@@ -701,9 +663,7 @@ def _accumulate_md_matrix_stats(
                 device=param.device,
             )
             partition_dim = getattr(param, "partition_dim", None)
-            if (sparsity_thresholds or log_param_rms) and (
-                partition_dim in {0, 1} or tp_rank == 0
-            ):
+            if (sparsity_thresholds or log_param_rms) and (partition_dim in {0, 1} or tp_rank == 0):
                 # MDDecoupling reapplies gains to the parameter at the end of every optimizer
                 # step, before logging runs. ``param`` is therefore already the effective weight.
                 matrix_weights = param.detach().reshape(matrix_count, -1)
@@ -717,10 +677,7 @@ def _accumulate_md_matrix_stats(
                     # The smallest representable positive threshold selects exact zeros without
                     # underflowing the comparison value in the weight dtype.
                     thresholds = matrix_weights.new_tensor(
-                        [
-                            max(threshold, smallest_positive)
-                            for threshold in sparsity_thresholds
-                        ]
+                        [max(threshold, smallest_positive) for threshold in sparsity_thresholds]
                     )
                     # NOTE: For now MuonMD always have the master FP32 parametes, so we will always have them in GPU
                     matrix_stats = (
@@ -728,9 +685,7 @@ def _accumulate_md_matrix_stats(
                         if matrix_weights.is_cuda
                         else _matrix_weight_stats
                     )
-                    near_zero_counts, weight_square_sum = matrix_stats(
-                        matrix_weights, thresholds
-                    )
+                    near_zero_counts, weight_square_sum = matrix_stats(matrix_weights, thresholds)
                     record[:, 0, _MATRIX_NEAR_ZERO_START:] = near_zero_counts
                 if log_param_rms and weight_square_sum is None:
                     # Parameter RMS needs the same sum(W_effective^2) as the sparsity kernel. If
@@ -846,13 +801,11 @@ def _append_md_gain_stats(
             if "max" in gain_stats:
                 stats[f"{gain_prefix}/max"] = maxima[bucket]
             if "saturated-fraction" in gain_stats and softplus_count:
-                stats[f"{gain_prefix}/saturated-fraction"] = (
-                    saturated_count / softplus_count
-                )
+                stats[f"{gain_prefix}/saturated-fraction"] = saturated_count / softplus_count
 
-        scale_sum, pair_count, combined_sum, imbalance_sum, softplus_pair_count = (
-            matrix_totals[family_index][:_SPARSITY_MATRIX_COUNT]
-        )
+        scale_sum, pair_count, combined_sum, imbalance_sum, softplus_pair_count = matrix_totals[
+            family_index
+        ][:_SPARSITY_MATRIX_COUNT]
         if "gain-field-rms" in gain_stats and pair_count:
             stats[f"{prefix}/gain-field/{family}/rms"] = scale_sum / pair_count
         if softplus_pair_count:
@@ -867,9 +820,7 @@ def _append_md_gain_stats(
         sparsity_matrix_count = matrix_totals[family_index][_SPARSITY_MATRIX_COUNT]
         if sparsity_matrix_count:
             for threshold_index, threshold in enumerate(sparsity_thresholds):
-                sparsity_sum = matrix_totals[family_index][
-                    _SPARSITY_SUM_START + threshold_index
-                ]
+                sparsity_sum = matrix_totals[family_index][_SPARSITY_SUM_START + threshold_index]
                 stats[f"{prefix}/sparsity/{family}/fraction-below-{threshold}"] = (
                     sparsity_sum / sparsity_matrix_count
                 )
@@ -974,9 +925,7 @@ def _collect_muon_stats(
     if not log_gains and not log_sparsity and not log_param_rms:
         return {}
     sparsity_thresholds = (
-        tuple(dict.fromkeys(float(value) for value in sparsity_thresholds))
-        if log_sparsity
-        else ()
+        tuple(dict.fromkeys(float(value) for value in sparsity_thresholds)) if log_sparsity else ()
     )
     if log_sparsity and (
         not sparsity_thresholds
@@ -985,9 +934,7 @@ def _collect_muon_stats(
         raise ValueError(f"{namespace} sparsity thresholds must be finite positive values")
 
     wrapped_optimizers = getattr(optimizer, "chained_optimizers", (optimizer,))
-    inner_optimizers = [
-        getattr(wrapped, "optimizer", wrapped) for wrapped in wrapped_optimizers
-    ]
+    inner_optimizers = [getattr(wrapped, "optimizer", wrapped) for wrapped in wrapped_optimizers]
     md_optimizers = [
         wrapped for wrapped in inner_optimizers if isinstance(wrapped, optimizer_class)
     ]
@@ -1004,9 +951,7 @@ def _collect_muon_stats(
     ] + layernorm_params
 
     dp_state_is_sharded = isinstance(optimizer, LayerWiseDistributedOptimizer)
-    distributed = (
-        torch.distributed.is_available() and torch.distributed.is_initialized()
-    )
+    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
     if not md_optimizers and not distributed:
         return {}
 
@@ -1025,41 +970,25 @@ def _collect_muon_stats(
     layer_count = 0
     if per_layer:
         layer_count = max(
-            (
-                getattr(param, "md_gain_log_layer", -1) + 1
-                for param in logged_params
-            ),
-            default=0,
+            (getattr(param, "md_gain_log_layer", -1) + 1 for param in logged_params), default=0
         )
         if distributed:
-            layer_count_tensor = torch.tensor(
-                layer_count, dtype=torch.int64, device=device
-            )
-            torch.distributed.all_reduce(
-                layer_count_tensor, op=torch.distributed.ReduceOp.MAX
-            )
+            layer_count_tensor = torch.tensor(layer_count, dtype=torch.int64, device=device)
+            torch.distributed.all_reduce(layer_count_tensor, op=torch.distributed.ReduceOp.MAX)
             layer_count = int(layer_count_tensor.item())
     scope_count = layer_count + 1
     totals = torch.zeros(
-        (scope_count, bucket_count, _GAIN_STAT_COUNT),
-        dtype=torch.float64,
-        device=device,
+        (scope_count, bucket_count, _GAIN_STAT_COUNT), dtype=torch.float64, device=device
     )
     minima = torch.full(
         (scope_count, bucket_count), float("inf"), dtype=torch.float64, device=device
     )
     maxima = torch.full_like(minima, float("-inf"))
     matrix_axis_totals = torch.zeros(
-        (scope_count, bucket_count, _MATRIX_AXIS_STAT_COUNT),
-        dtype=torch.float64,
-        device=device,
+        (scope_count, bucket_count, _MATRIX_AXIS_STAT_COUNT), dtype=torch.float64, device=device
     )
     matrix_totals = torch.zeros(
-        (
-            scope_count,
-            len(_GAIN_FAMILIES),
-            _SPARSITY_SUM_START + len(sparsity_thresholds),
-        ),
+        (scope_count, len(_GAIN_FAMILIES), _SPARSITY_SUM_START + len(sparsity_thresholds)),
         dtype=torch.float64,
         device=device,
     )
@@ -1095,19 +1024,12 @@ def _collect_muon_stats(
                 layer = getattr(param, "md_gain_log_layer", None)
                 layer_scope = layer + 1 if per_layer and layer is not None else None
                 gain_entries.append(
-                    (
-                        raw_gain,
-                        bucket,
-                        layer_scope,
-                        md_optimizer.gain_parametrization == "softplus",
-                    )
+                    (raw_gain, bucket, layer_scope, md_optimizer.gain_parametrization == "softplus")
                 )
     # LayerNorm scales are direct 1D gains owned by the chained Adam optimizer. Add one for
     # zero-centered gamma before element statistics, and average each norm vector's RMS equally.
     if log_gains and md_optimizers:
-        layernorm_bucket = (
-            family_indices["layernorm"] * len(_GAIN_AXES) + _GAIN_AXES.index("flat")
-        )
+        layernorm_bucket = family_indices["layernorm"] * len(_GAIN_AXES) + _GAIN_AXES.index("flat")
         for param in layernorm_params:
             if not _include_gain_in_global_stats(
                 md_optimizers[0], param, "flat", dp_state_is_sharded
@@ -1128,13 +1050,11 @@ def _collect_muon_stats(
         # saturation. Unlike ``effective-rms`` above, every gain element has equal weight here;
         # differently sized matrices therefore contribute different numbers of observations.
         entry_counts = torch.tensor(
-            [entry[0].numel() for entry in gain_entries],
-            dtype=torch.long,
-            device=device,
+            [entry[0].numel() for entry in gain_entries], dtype=torch.long, device=device
         )
-        raw_values = torch.cat(
-            [entry[0].detach().flatten() for entry in gain_entries]
-        ).to(torch.float64)
+        raw_values = torch.cat([entry[0].detach().flatten() for entry in gain_entries]).to(
+            torch.float64
+        )
         entry_ids = torch.repeat_interleave(
             torch.arange(len(gain_entries), device=device), entry_counts
         )
@@ -1152,16 +1072,12 @@ def _collect_muon_stats(
         gain_values = torch.stack(
             (
                 torch.segment_reduce(effective_gain, "sum", lengths=entry_counts),
-                torch.segment_reduce(
-                    effective_gain.square(), "sum", lengths=entry_counts
-                ),
+                torch.segment_reduce(effective_gain.square(), "sum", lengths=entry_counts),
                 entry_counts.to(torch.float64),
                 torch.segment_reduce(
                     softplus_values.to(torch.float64), "sum", lengths=entry_counts
                 ),
-                torch.segment_reduce(
-                    saturated.to(torch.float64), "sum", lengths=entry_counts
-                ),
+                torch.segment_reduce(saturated.to(torch.float64), "sum", lengths=entry_counts),
             ),
             dim=1,
         )
@@ -1177,9 +1093,7 @@ def _collect_muon_stats(
         flat_minima.scatter_reduce_(0, entry_buckets, gain_minima, reduce="amin")
         flat_maxima.scatter_reduce_(0, entry_buckets, gain_maxima, reduce="amax")
 
-        layer_entries = [
-            index for index, entry in enumerate(gain_entries) if entry[2] is not None
-        ]
+        layer_entries = [index for index, entry in enumerate(gain_entries) if entry[2] is not None]
         if layer_entries:
             layer_indices = [
                 gain_entries[index][2] * bucket_count + gain_entries[index][1]
@@ -1188,12 +1102,8 @@ def _collect_muon_stats(
             layer_entries = torch.tensor(layer_entries, dtype=torch.long, device=device)
             layer_indices = torch.tensor(layer_indices, dtype=torch.long, device=device)
             flat_totals.index_add_(0, layer_indices, gain_values[layer_entries])
-            flat_minima.scatter_reduce_(
-                0, layer_indices, gain_minima[layer_entries], reduce="amin"
-            )
-            flat_maxima.scatter_reduce_(
-                0, layer_indices, gain_maxima[layer_entries], reduce="amax"
-            )
+            flat_minima.scatter_reduce_(0, layer_indices, gain_minima[layer_entries], reduce="amin")
+            flat_maxima.scatter_reduce_(0, layer_indices, gain_maxima[layer_entries], reduce="amax")
     nvtx_range_pop(f"{namespace}/logging/gain-statistics")
 
     nvtx_range_push(f"{namespace}/logging/global-reductions")
