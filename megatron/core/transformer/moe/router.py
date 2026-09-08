@@ -6,6 +6,7 @@ from typing import Optional, Union
 import torch
 
 from megatron.core.jit import jit_fuser
+from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
@@ -183,10 +184,18 @@ class TopKRouter(Router):
             ),
             persistent=False,
         )
-        # Retain local counts until finalization so TP/CP communication is batched.
-        self.mbs_expert_load_samples = []
-        self.seq_expert_load_samples = []
-        # Inference samples have an independent consume/reset lifecycle.
+        # Retain local counts until finalization so TP/CP communication is batched. Fixed-size
+        # registered buffers are required here: Python list appends run during CUDA graph capture,
+        # but not during replay.
+        self.register_buffer('mbs_expert_load_samples', None, persistent=False)
+        self.register_buffer('seq_expert_load_samples', None, persistent=False)
+        self.register_buffer(
+            'expert_load_sample_count',
+            torch.zeros((), dtype=torch.long, device=torch.cuda.current_device()),
+            persistent=False,
+        )
+        # Inference samples have an independent consume/reset lifecycle. Inference CUDA graphs use
+        # InferenceTopKRouter and do not currently collect these eager-only metrics.
         self.inference_mbs_expert_load_samples = []
         self.inference_seq_expert_load_samples = []
 
@@ -791,6 +800,52 @@ class TopKRouter(Router):
                     routing_map = routing_map & (~padding_mask)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
+    def _record_expert_load_samples(
+        self, mbs_sample: torch.Tensor, seq_sample: Optional[torch.Tensor]
+    ) -> None:
+        """Store one microbatch of expert counts in CUDA-graph-stable buffers."""
+        capacity = get_num_microbatches()
+        if (
+            self.is_mtp_layer
+            and self.config.mtp_use_repeated_layer
+            and self.config.mtp_num_layers is not None
+        ):
+            capacity *= self.config.mtp_num_layers
+        num_experts_with_token_count = self.config.num_moe_experts + 1
+
+        graph_enabled = self.config.enable_cuda_graph or self.config.cuda_graph_impl != "none"
+
+        def allocate_buffer(name: str, shape: tuple[int, ...]) -> None:
+            buffer = getattr(self, name)
+            if buffer is not None and buffer.shape == shape:
+                return
+            if buffer is not None and (
+                graph_enabled or self.expert_load_sample_count.item() != 0
+            ):
+                raise RuntimeError(
+                    f"Cannot resize router metric buffer {name} from {tuple(buffer.shape)} to "
+                    f"{shape} while CUDA graphs are enabled or samples are pending."
+                )
+            # Eager batch-size ramp-up can change the capacity between collection windows.
+            setattr(
+                self,
+                name,
+                torch.empty(shape, dtype=mbs_sample.dtype, device=mbs_sample.device),
+            )
+
+        allocate_buffer("mbs_expert_load_samples", (capacity, num_experts_with_token_count))
+        if seq_sample is not None:
+            allocate_buffer(
+                "seq_expert_load_samples",
+                (capacity, seq_sample.shape[0], num_experts_with_token_count),
+            )
+
+        sample_index = torch.remainder(self.expert_load_sample_count, capacity).reshape(1)
+        self.mbs_expert_load_samples.index_copy_(0, sample_index, mbs_sample.unsqueeze(0))
+        if seq_sample is not None:
+            self.seq_expert_load_samples.index_copy_(0, sample_index, seq_sample.unsqueeze(0))
+        self.expert_load_sample_count.add_(1)
+
     def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Top-k routing function
 
@@ -805,7 +860,10 @@ class TopKRouter(Router):
             routing_map (torch.Tensor): The mapping of token to experts assignment,
                 with shape [num_tokens, num_experts].
         """
-        seq_length, bsz = logits.shape[:2]
+        if logits.ndim == 2:
+            seq_length, bsz = logits.shape[0], 1
+        else:
+            seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
 
         # Flatten padding_mask to [num_tokens] if provided
@@ -879,26 +937,23 @@ class TopKRouter(Router):
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
 
-        if (
+        collect_training_metrics = (
             self.training
             and torch.is_grad_enabled()
             and self.config.moe_router_violation_metrics
-        ):
-            violation_metrics = self.config.moe_router_violation_metrics
-            mbs_samples = self.mbs_expert_load_samples
-            seq_samples = self.seq_expert_load_samples
-        elif (
+        )
+        collect_inference_metrics = (
             not self.training
             and not torch.is_grad_enabled()
             and self.config.moe_router_inference_violation_metrics
-        ):
-            violation_metrics = self.config.moe_router_inference_violation_metrics
-            mbs_samples = self.inference_mbs_expert_load_samples
-            seq_samples = self.inference_seq_expert_load_samples
-        else:
-            violation_metrics = None
+        )
 
-        if violation_metrics is not None:
+        if collect_training_metrics or collect_inference_metrics:
+            violation_metrics = (
+                self.config.moe_router_violation_metrics
+                if collect_training_metrics
+                else self.config.moe_router_inference_violation_metrics
+            )
             with torch.no_grad():
                 expert_load_routing_map = routing_map.reshape(seq_length, bsz, -1)
                 if padding_mask is not None:
@@ -914,15 +969,27 @@ class TopKRouter(Router):
                     )
 
                 seq_tokens_per_expert = expert_load_routing_map.sum(dim=0, dtype=torch.float32)
+                seq_sample = None
                 if "seq" in violation_metrics:
-                    seq_samples.append(
-                        torch.cat((seq_tokens_per_expert, seq_num_tokens), dim=-1)
-                    )
+                    seq_sample = torch.cat((seq_tokens_per_expert, seq_num_tokens), dim=-1)
 
+                mbs_sample = None
                 if "mbs" in violation_metrics or "ep" in violation_metrics:
                     mbs_tokens_per_expert = seq_tokens_per_expert.sum(dim=0)
                     mbs_num_tokens = seq_num_tokens.sum(dim=0)
-                    mbs_samples.append(torch.cat((mbs_tokens_per_expert, mbs_num_tokens)))
+                    mbs_sample = torch.cat((mbs_tokens_per_expert, mbs_num_tokens))
+
+                if collect_training_metrics:
+                    if mbs_sample is None:
+                        mbs_sample = torch.cat(
+                            (seq_tokens_per_expert.sum(dim=0), seq_num_tokens.sum(dim=0))
+                        )
+                    self._record_expert_load_samples(mbs_sample, seq_sample)
+                else:
+                    if seq_sample is not None:
+                        self.inference_seq_expert_load_samples.append(seq_sample)
+                    if mbs_sample is not None:
+                        self.inference_mbs_expert_load_samples.append(mbs_sample)
 
         return probs, routing_map
 

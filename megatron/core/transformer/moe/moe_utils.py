@@ -1087,6 +1087,26 @@ def apply_router_token_dropping(
     return final_probs, final_map
 
 
+def expert_load_entropy(tokens_per_expert: torch.Tensor) -> torch.Tensor:
+    """Compute normalized entropy of an expert-load distribution."""
+    loads = tokens_per_expert.float()
+    num_experts = loads.shape[-1]
+    if num_experts == 1:
+        return torch.ones(loads.shape[:-1], dtype=loads.dtype, device=loads.device)
+
+    total_load = loads.sum(dim=-1, keepdim=True)
+    probabilities = loads / total_load.clamp_min(1)
+    entropy = -(
+        probabilities * probabilities.clamp_min(torch.finfo(loads.dtype).tiny).log()
+    ).sum(dim=-1)
+    normalized_entropy = entropy / math.log(num_experts)
+    return torch.where(
+        total_load.squeeze(-1) > 0,
+        normalized_entropy,
+        torch.ones_like(normalized_entropy),
+    )
+
+
 def expert_load_violation_batchwise(
     tokens_per_expert: torch.Tensor,
     num_experts: int,
