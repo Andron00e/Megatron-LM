@@ -1,12 +1,17 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.num_microbatches_calculator import (
+    init_num_microbatches_calculator,
+    unset_num_microbatches_calculator,
+)
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import (
     consume_inference_router_violation_metrics,
@@ -15,7 +20,7 @@ from megatron.core.transformer.moe.moe_utils import (
     router_gating_linear,
     topk_routing_with_score_function,
 )
-from megatron.core.transformer.moe.router import Router
+from megatron.core.transformer.moe.router import Router, TopKRouter
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
@@ -84,9 +89,101 @@ def test_topk_routing_uses_precomputed_indices_for_probs():
     assert torch.equal(routing_map, expected_routing_map)
 
 
+def _metric_buffer_router(device):
+    router = torch.nn.Module()
+    router.config = SimpleNamespace(
+        num_moe_experts=4,
+        mtp_num_layers=None,
+        mtp_use_repeated_layer=False,
+        enable_cuda_graph=False,
+        cuda_graph_impl="none",
+    )
+    router.is_mtp_layer = False
+    router.register_buffer("mbs_expert_load_samples", None, persistent=False)
+    router.register_buffer("seq_expert_load_samples", None, persistent=False)
+    router.register_buffer(
+        "expert_load_sample_count", torch.zeros((), dtype=torch.long, device=device), persistent=False
+    )
+    return router
+
+
+def test_expert_load_samples_use_stable_registered_buffers(monkeypatch):
+    monkeypatch.setattr("megatron.core.transformer.moe.router.get_num_microbatches", lambda: 2)
+    router = _metric_buffer_router("cpu")
+    first_mbs = torch.tensor([4.0, 2.0, 1.0, 1.0, 4.0])
+    first_seq = torch.stack((first_mbs, first_mbs))
+
+    TopKRouter._record_expert_load_samples(router, first_mbs, first_seq)
+    mbs_data_ptr = router.mbs_expert_load_samples.data_ptr()
+    seq_data_ptr = router.seq_expert_load_samples.data_ptr()
+    second_mbs = first_mbs + 1
+    second_seq = first_seq + 1
+    TopKRouter._record_expert_load_samples(router, second_mbs, second_seq)
+
+    assert router.mbs_expert_load_samples.data_ptr() == mbs_data_ptr
+    assert router.seq_expert_load_samples.data_ptr() == seq_data_ptr
+    assert router.expert_load_sample_count.item() == 2
+    torch.testing.assert_close(router.mbs_expert_load_samples, torch.stack((first_mbs, second_mbs)))
+    torch.testing.assert_close(router.seq_expert_load_samples, torch.stack((first_seq, second_seq)))
+    assert "mbs_expert_load_samples" in router._buffers
+    assert "seq_expert_load_samples" in router._buffers
+
+
+def test_cuda_graph_metric_buffers_cannot_be_resized(monkeypatch):
+    router = _metric_buffer_router("cpu")
+    router.config.enable_cuda_graph = True
+    sample = torch.zeros(5)
+    monkeypatch.setattr("megatron.core.transformer.moe.router.get_num_microbatches", lambda: 2)
+    TopKRouter._record_expert_load_samples(router, sample, None)
+    monkeypatch.setattr("megatron.core.transformer.moe.router.get_num_microbatches", lambda: 3)
+
+    with pytest.raises(RuntimeError, match="Cannot resize router metric buffer"):
+        TopKRouter._record_expert_load_samples(router, sample, None)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_expert_load_sample_buffer_updates_during_cuda_graph_replay(monkeypatch):
+    monkeypatch.setattr("megatron.core.transformer.moe.router.get_num_microbatches", lambda: 2)
+    router = _metric_buffer_router("cuda")
+    static_mbs = torch.zeros(5, device="cuda")
+    static_seq = torch.zeros((2, 5), device="cuda")
+
+    # Allocate the registered buffers before capture, as the normal graph warmup does.
+    TopKRouter._record_expert_load_samples(router, static_mbs, static_seq)
+    router.expert_load_sample_count.zero_()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        TopKRouter._record_expert_load_samples(router, static_mbs, static_seq)
+    router.expert_load_sample_count.zero_()
+
+    first_mbs = torch.arange(5, dtype=torch.float32, device="cuda")
+    first_seq = torch.stack((first_mbs, first_mbs + 1))
+    static_mbs.copy_(first_mbs)
+    static_seq.copy_(first_seq)
+    graph.replay()
+    second_mbs = first_mbs + 10
+    second_seq = first_seq + 10
+    static_mbs.copy_(second_mbs)
+    static_seq.copy_(second_seq)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert router.expert_load_sample_count.item() == 2
+    torch.testing.assert_close(router.mbs_expert_load_samples, torch.stack((first_mbs, second_mbs)))
+    torch.testing.assert_close(router.seq_expert_load_samples, torch.stack((first_seq, second_seq)))
+
+
 class TestTop2Router:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
+        init_num_microbatches_calculator(
+            rank=0,
+            rampup_batch_size=None,
+            global_batch_size=1,
+            micro_batch_size=1,
+            data_parallel_size=1,
+        )
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         print("done intializing")
         num_moe_experts = 4
@@ -110,6 +207,7 @@ class TestTop2Router:
         self.router = cast(Router, self.sequential_mlp.router)
 
     def teardown_method(self, method):
+        unset_num_microbatches_calculator()
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
