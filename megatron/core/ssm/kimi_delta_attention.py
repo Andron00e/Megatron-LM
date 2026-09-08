@@ -423,9 +423,13 @@ class KimiDeltaAttention(GatedDeltaNet):
         setattr(self.dt_bias, "tensor_model_parallel", True)
         setattr(self.dt_bias, "partition_dim", 0)
         self.dt_bias.is_kda_decay_parameter = True
+        self._alog_per_channel = _env_flag("KDA_ALOG_PER_CHANNEL", False)
+        self._alog_view = (1, 1, -1, self.key_head_dim if self._alog_per_channel else 1)
         self.A_log = nn.Parameter(
             torch.empty(
-                self.num_v_heads_local_tp,
+                self.num_v_heads_local_tp * self.key_head_dim
+                if self._alog_per_channel
+                else self.num_v_heads_local_tp,
                 dtype=torch.float32,
                 device=torch.cuda.current_device(),
             )
@@ -438,8 +442,10 @@ class KimiDeltaAttention(GatedDeltaNet):
         self.gated_delta_rule = chunk_kda
         # Let chunk_kda derive the decay from raw alpha/A_log/dt_bias, so the
         # fp32 [b, s, h, d_k] decay is never materialized.
-        self._use_fused_decay_gate = _KDA_SUPPORTS_FUSED_DECAY_GATE and _env_flag(
-            "KDA_USE_GATE_IN_KERNEL", True
+        self._use_fused_decay_gate = (
+            _KDA_SUPPORTS_FUSED_DECAY_GATE
+            and _env_flag("KDA_USE_GATE_IN_KERNEL", True)
+            and not self._alog_per_channel
         )
         # Kimi-K3 safe decay gate g = g_min * sigmoid(exp(A_log) * (z + dt_bias)).
         # FLA computes this natively (chunk_kda safe_gate/lower_bound; fused_kda_gate
@@ -457,7 +463,7 @@ class KimiDeltaAttention(GatedDeltaNet):
         # Without the in-kernel gate, prefer FLA's fused_kda_gate over torch.
         self._kda_gate_style = (
             None
-            if self._use_fused_decay_gate
+            if self._use_fused_decay_gate or self._alog_per_channel
             else (_KDA_GATE_STYLE if _env_flag("KDA_FUSED_GATE", True) else None)
         )
         # fused_kda_gate can only do the safe decay in the 0.5 style with a
@@ -626,7 +632,9 @@ class KimiDeltaAttention(GatedDeltaNet):
                 self.A_log.data.zero_()
             else:
                 A = torch.empty(
-                    self.num_v_heads_local_tp,
+                    self.num_v_heads_local_tp * self.key_head_dim
+                    if self._alog_per_channel
+                    else self.num_v_heads_local_tp,
                     dtype=torch.float32,
                     device=torch.cuda.current_device(),
                 ).uniform_(*A_init_range)
@@ -677,7 +685,7 @@ class KimiDeltaAttention(GatedDeltaNet):
     @jit_fuser
     def _activate_decay_torch(self, alpha, A_log_local_cp, dt_bias_local_cp):
         """Torch fallback for `_activate_decay`; `alpha` already [b, s, h, d_k]."""
-        decay_scale = A_log_local_cp.exp().view(1, 1, -1, 1)
+        decay_scale = A_log_local_cp.exp().view(self._alog_view)
         bias = dt_bias_local_cp.view(1, 1, -1, self.key_head_dim)
         if self._safe_gate:
             # Kimi-K3 safe decay: g = g_min * sigmoid(exp(A_log) * (alpha + dt_bias)).
