@@ -15,6 +15,7 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import (
     consume_inference_router_violation_metrics,
+    expert_load_entropy,
     get_updated_expert_bias,
     qb_dual_update,
     router_gating_linear,
@@ -61,6 +62,15 @@ def test_qb_dual_update_uses_column_quantile():
 
     torch.testing.assert_close(indices, expected_indices)
     torch.testing.assert_close(beta_local, expected_beta)
+
+
+def test_expert_load_entropy_is_normalized():
+    loads = torch.tensor(
+        [[1.0, 1.0, 1.0, 1.0], [4.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]]
+    )
+
+    torch.testing.assert_close(expert_load_entropy(loads), torch.tensor([1.0, 0.0, 1.0]))
+    torch.testing.assert_close(expert_load_entropy(torch.tensor([[3.0]])), torch.ones(1))
 
 
 def test_topk_routing_uses_precomputed_indices_for_probs():

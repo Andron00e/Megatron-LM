@@ -23,6 +23,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from .. import parallel_state
 from ..num_microbatches_calculator import get_num_microbatches
 from ..transformer.moe.moe_utils import (
+    expert_load_entropy,
     expert_load_violation_batchwise,
     get_updated_expert_bias,
     recover_qb_beta_from_histogram,
@@ -399,6 +400,8 @@ def _log_microbatch_router_metrics(
             (f"{prefix}_max_violation", violation.max(dim=-1).values),
             (f"{prefix}_min_violation", violation.min(dim=-1).values),
             (f"{prefix}_median_violation", violation.median(dim=-1).values),
+            (f"{prefix}_std_violation", violation.std(dim=-1, correction=0)),
+            (f"{prefix}_entropy", expert_load_entropy(tokens_per_expert)),
         ):
             save_to_aux_losses_tracker(
                 name,
@@ -478,10 +481,18 @@ def _log_global_router_metrics(model: List[torch.nn.Module], config: Transformer
                 total_num_tokens=total_num_tokens,
                 topk=module.topk,
             )
+            ideal_tokens_per_expert = (
+                total_num_tokens * module.topk / global_tokens_per_expert.shape[0]
+            )
+            violation_std = (
+                (global_tokens_per_expert - ideal_tokens_per_expert) / ideal_tokens_per_expert
+            ).std(correction=0)
             for name, value in (
                 ("global_expert_max_violation", max_violation),
                 ("global_expert_min_violation", min_violation),
                 ("global_expert_median_violation", median_violation),
+                ("global_expert_std_violation", violation_std),
+                ("global_expert_entropy", expert_load_entropy(global_tokens_per_expert)),
             ):
                 save_to_aux_losses_tracker(
                     name,

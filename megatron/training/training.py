@@ -2330,17 +2330,25 @@ def training_log(
             track_names.append("expert_max_violation")
             track_names.append("expert_min_violation")
             track_names.append("expert_median_violation")
+            track_names.append("expert_std_violation")
+            track_names.append("expert_entropy")
         if "seq" in args.moe_router_violation_metrics:
             track_names.append("seq_expert_max_violation")
             track_names.append("seq_expert_min_violation")
             track_names.append("seq_expert_median_violation")
+            track_names.append("seq_expert_std_violation")
+            track_names.append("seq_expert_entropy")
         track_names.append("global_expert_max_violation")
         track_names.append("global_expert_min_violation")
         track_names.append("global_expert_median_violation")
+        track_names.append("global_expert_std_violation")
+        track_names.append("global_expert_entropy")
         if "ep" in args.moe_router_violation_metrics:
             track_names.append("ep_expert_max_violation")
             track_names.append("ep_expert_min_violation")
             track_names.append("ep_expert_median_violation")
+            track_names.append("ep_expert_std_violation")
+            track_names.append("ep_expert_entropy")
         if args.moe_router_bias_metrics:
             uses_quantile_balancing = "quantile_balancing" in args.moe_router_load_balancing_type
             if args.moe_router_enable_expert_bias and not uses_quantile_balancing:

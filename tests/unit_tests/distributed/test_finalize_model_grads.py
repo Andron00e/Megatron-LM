@@ -12,6 +12,7 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import (
     _allreduce_non_tensor_model_parallel_grads,
     _allreduce_word_embedding_grads,
+    _log_global_router_metrics,
     _log_microbatch_router_metrics,
     _update_router_qb_beta,
     reset_model_temporary_tensors,
@@ -95,9 +96,15 @@ def test_tensor_router_metric_samples_are_logged_and_reset(monkeypatch):
     _log_microbatch_router_metrics([model], config, dp_group=object())
 
     assert set(saved_metrics) == {
-        f"{scope}_{stat}_violation"
+        f"{scope}_{metric}"
         for scope in ("expert", "seq_expert")
-        for stat in ("max", "min", "median")
+        for metric in (
+            "max_violation",
+            "min_violation",
+            "median_violation",
+            "std_violation",
+            "entropy",
+        )
     }
     buffer_data_ptrs = (
         model.router.mbs_expert_load_samples.data_ptr(),
@@ -118,6 +125,39 @@ def test_tensor_router_metric_sample_overflow_is_reported():
 
     with pytest.raises(RuntimeError, match="exceeded the configured number of microbatches"):
         _log_microbatch_router_metrics([model], config, dp_group=object())
+
+
+def test_global_router_metrics_include_std_and_entropy(monkeypatch):
+    model, config = _router_metric_model()
+    model.router.topk = 1
+    model.router.register_buffer("local_tokens_per_expert", torch.tensor([4.0, 0.0, 0.0, 0.0]))
+    saved_metrics = {}
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        parallel_state, "get_tensor_and_data_parallel_group", lambda **kwargs: object()
+    )
+    monkeypatch.setitem(_log_global_router_metrics.__globals__, "get_num_microbatches", lambda: 1)
+
+    def save_metric(name, value, *args, **kwargs):
+        saved_metrics[name] = value.clone()
+
+    monkeypatch.setitem(
+        _log_global_router_metrics.__globals__, "save_to_aux_losses_tracker", save_metric
+    )
+
+    _log_global_router_metrics([model], config)
+
+    assert set(saved_metrics) == {
+        "global_expert_max_violation",
+        "global_expert_min_violation",
+        "global_expert_median_violation",
+        "global_expert_std_violation",
+        "global_expert_entropy",
+    }
+    torch.testing.assert_close(
+        saved_metrics["global_expert_std_violation"], torch.sqrt(torch.tensor(3.0))
+    )
+    torch.testing.assert_close(saved_metrics["global_expert_entropy"], torch.tensor(0.0))
 
 
 class TestUpdateRouterQBBeta:
