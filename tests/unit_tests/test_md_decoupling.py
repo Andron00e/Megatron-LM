@@ -981,15 +981,15 @@ def test_md_decoupling_recipe_defaults():
     assert config.router_lr is None
 
 
-def test_md_decoupling_family_mode_overrides_and_output_channel_resolution():
+def test_md_decoupling_family_mode_overrides_and_embed_resolution():
     param = torch.nn.Parameter(torch.ones(4, 4))
     optimizer = MDDecoupling(
         params=[param],
-        hypersphere_mode="output_channel",
+        hypersphere_mode="embed",
         hypersphere_family_modes={
-            "dense-mlp-in": "output_channel",
-            "dense-mlp-out": "output_channel",
-            "moe-latent-out": "output_channel",
+            "dense-mlp-in": "row",
+            "dense-mlp-out": "col",
+            "moe-latent-out": "col",
             "attention-in": "none",
         },
         hypersphere_embedding_mode="flat",
@@ -1008,8 +1008,6 @@ def test_md_decoupling_family_mode_overrides_and_output_channel_resolution():
     assert optimizer._resolve_mode(param, False, False) == "row"
     param.md_gain_log_family = "expert-out"
     assert optimizer._resolve_mode(param, True, False) == "col"
-    param.md_gain_log_family = "attention-out"
-    assert optimizer._resolve_mode(param, True, False) == "flat"
 
     # Dedicated embedding and router policies take precedence over ordinary family overrides.
     assert optimizer._resolve_mode(param, False, True) == "flat"
@@ -1927,20 +1925,16 @@ def _fan_in_optimizer(param, **kwargs):
 
 
 @pytest.mark.parametrize("shape", [(8, 4), (4, 8), (6, 6)])
-@pytest.mark.parametrize("mode", ["row", "flat", "output_channel"])
+@pytest.mark.parametrize("mode", ["row", "col", "flat"])
 def test_md_decoupling_fan_in_radius_puts_weight_norm_at_sqrt_out(shape, mode):
     """Every fan-in geometry places the weight at total radius sqrt(d_out)."""
     size_out, size_in = shape
     torch.manual_seed(0)
     param = torch.nn.Parameter(torch.randn(size_out, size_in))
-    if mode == "output_channel":
-        param.md_gain_log_family = "expert-out"
-    optimizer = _fan_in_optimizer(
-        param, hypersphere_mode=mode, hypersphere_preserve_init=True
-    )
+    optimizer = _fan_in_optimizer(param, hypersphere_mode=mode, hypersphere_preserve_init=True)
 
     with torch.no_grad():
-        optimizer._normalize(param, param, is_out_proj=mode == "output_channel")
+        optimizer._normalize(param, param)
 
     torch.testing.assert_close(
         torch.linalg.matrix_norm(param.detach()),
@@ -1953,7 +1947,7 @@ def test_md_decoupling_fan_in_radius_puts_weight_norm_at_sqrt_out(shape, mode):
         torch.testing.assert_close(
             torch.linalg.vector_norm(param.detach(), dim=1), expected, rtol=1e-5, atol=1e-5
         )
-    elif mode == "output_channel":
+    elif mode == "col":
         expected = torch.full((size_in,), math.sqrt(size_out / size_in))
         torch.testing.assert_close(
             torch.linalg.vector_norm(param.detach(), dim=0), expected, rtol=1e-5, atol=1e-5

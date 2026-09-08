@@ -353,21 +353,21 @@ class OptimizerConfig:
 
     hypersphere_mode: Optional[str] = 'flat'
     """Hypersphere normalization mode for ordinary matrices. One of
-    'row'/'flat'/'output_channel'/'none'. The output_channel preset uses rows for expert inputs,
-    columns for expert outputs, and flat geometry for other families. None = off."""
+    'row'/'col'/'flat'/'embed'/'none'. ``embed`` selects row normalization for input projections
+    and column normalization for output projections. None = off."""
 
     hypersphere_family_modes: Tuple[Tuple[str, str], ...] = ()
-    """Per-family hypersphere mode overrides as (family, mode) pairs. Unlisted families follow
-    hypersphere_mode; its output_channel preset targets expert input/output families only."""
+    """Per-family hypersphere mode overrides as (family, mode) pairs. Modes are
+    'row'/'col'/'flat'/'none'; unlisted families follow hypersphere_mode."""
 
     hypersphere_embedding_mode: Optional[str] = 'row'
     """Hypersphere mode override for embedding + LM head. One of
-    'row'/'flat'/'none'/'external'. 'external' routes those params to the chained optimizer;
-    'none' keeps them in MDDecoupling without post-step normalization."""
+    'row'/'col'/'flat'/'embed'/'none'/'external'. 'external' routes those params to the chained
+    optimizer; 'none' keeps them in MDDecoupling without post-step normalization."""
 
     hypersphere_router_mode: Optional[str] = 'row'
-    """Hypersphere mode override for MoE router weights. One of 'row'/'flat'/'none'. None
-    disables router-specific normalization."""
+    """Hypersphere mode override for MoE router weights. One of 'row'/'col'/'flat'/'embed'/'none'.
+    None disables router-specific normalization."""
 
     hypersphere_tangential_grad: bool = False
     """Project p.grad onto the hypersphere tangent space before the update."""

@@ -88,7 +88,7 @@ _HYPERSPHERE_FAMILIES = {
     "moe-latent-out",
     "unclassified",
 }
-_HYPERSPHERE_MODES = {"row", "flat", "output_channel", "none"}
+_HYPERSPHERE_MODES = {"row", "col", "flat", "none"}
 
 
 @torch._dynamo.config.patch(recompile_limit=16)
@@ -353,9 +353,11 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         # Hypersphere (L2, post-step weight projection only).
-        hypersphere_mode: Optional[Literal["row", "flat", "output_channel"]] = None,
-        hypersphere_embedding_mode: Optional[Literal["row", "flat", "none", "external"]] = None,
-        hypersphere_router_mode: Optional[Literal["row", "flat", "none"]] = None,
+        hypersphere_mode: Optional[Literal["row", "col", "flat", "embed"]] = None,
+        hypersphere_embedding_mode: Optional[
+            Literal["row", "col", "flat", "embed", "none", "external"]
+        ] = None,
+        hypersphere_router_mode: Optional[Literal["row", "col", "flat", "embed", "none"]] = None,
         hypersphere_family_modes: Optional[Dict[str, str]] = None,
         hypersphere_eps: float = 1e-8,
         # Tangential-gradient / preserve-init options (off by default).
@@ -909,12 +911,10 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             mode = self.hypersphere_embedding_mode
         elif family in self.hypersphere_family_modes:
             mode = self.hypersphere_family_modes[family]
-        elif self.hypersphere_mode == "output_channel":
-            mode = "output_channel" if family in {"expert-in", "expert-out"} else "flat"
         else:
             mode = self.hypersphere_mode
-        if mode == "output_channel":
-            mode = "col" if is_out_proj or family.endswith("-out") else "row"
+        if mode == "embed":
+            mode = "col" if is_out_proj else "row"
         return None if mode == "none" else mode
 
     def _resolve_radius_scale(self, is_out_proj: bool) -> float:
@@ -1238,10 +1238,10 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         """In-place L2-sphere projection of a 2D tensor `x` (sized like `p`).
 
         For QKV-merged weights, normalize each of Q/K/V separately. Modes:
-            row            → unit-norm each output row     (dim=1)
-            flat           → unit Frobenius then scale by sqrt(max(d_out, d_in))
-            output_channel → row for input projections, column for output projections
-        ``col`` is the internal mode produced by output_channel for output projections.
+            row   → normalize each output row
+            col   → normalize each input column
+            flat  → normalize the full matrix Frobenius norm
+            embed → row for embeddings and input projections, col for output projections
         Each slice is then placed on its target radius (see _target_slice_radius), which is where
         --hypersphere-radius-mode moves the sphere.
         """
