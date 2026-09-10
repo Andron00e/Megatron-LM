@@ -621,6 +621,8 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
     args = get_args()
     has_cu_seqlens = args.sft or getattr(args, 'dataloader_inter_document_masking', False)
+    has_bfd_padding = getattr(args, 'pretraining_packing_strategy', None) == 'bfd'
+    broadcast_bfd_padding = has_bfd_padding and mpu.get_tensor_model_parallel_world_size() > 1
 
     def _broadcast(item):
         if item is not None:
@@ -634,6 +636,9 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
         assert data_iterator is not None
         data = next(data_iterator)
+        num_valid_tokens = (
+            data["num_valid_tokens"].cuda(non_blocking=True) if has_bfd_padding else None
+        )
         batch = {
             'tokens': data["tokens"].cuda(non_blocking=True),
             'labels': data["labels"].cuda(non_blocking=True),
@@ -727,6 +732,18 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast_cu_seqlens(batch['cu_seqlens'])
             _broadcast_max_seqlen(batch['max_seqlen'])
 
+        elif has_bfd_padding:
+            # A genuine middle PP stage needs only the compact BFD metadata.
+            batch['tokens'] = None
+            batch['labels'] = None
+            batch['loss_mask'] = None
+            batch['attention_mask'] = None
+            batch['position_ids'] = None
+
+        if broadcast_bfd_padding:
+            # One int32 per sample replaces a sequence-length boolean mask.
+            _broadcast(num_valid_tokens)
+
     else:
         if args.hybrid_context_parallel:
             seq_len = torch.tensor(0, dtype=torch.int32, device=torch.cuda.current_device())
@@ -749,6 +766,13 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             shape,
             dtype=torch.float32,
             device=torch.cuda.current_device(),
+        )
+        num_valid_tokens = (
+            torch.empty(
+                args.micro_batch_size, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            if has_bfd_padding
+            else None
         )
         if args.create_attention_mask_in_dataloader:
             shape_attention_mask = (args.micro_batch_size, 1, args.seq_length, args.seq_length) if not args.hybrid_context_parallel else (1, 1, shape[0], shape[0])
@@ -851,6 +875,16 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             cu_seqlens = _broadcast_cu_seqlens()
             max_seqlen = _broadcast_max_seqlen()
 
+        elif has_bfd_padding:
+            tokens = None
+            labels = None
+            loss_mask = None
+            attention_mask = None
+            position_ids = None
+
+        if broadcast_bfd_padding:
+            _broadcast(num_valid_tokens)
+
         batch = {
             'tokens': tokens,
             'labels': labels,
@@ -861,6 +895,10 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             'max_seqlen': max_seqlen,
             'local_cp_size': local_cp_size,
         }
+
+    if has_bfd_padding:
+        positions = torch.arange(args.seq_length, device=num_valid_tokens.device).unsqueeze(0)
+        batch['padding_mask'] = positions >= num_valid_tokens.unsqueeze(1)
 
     return batch
 

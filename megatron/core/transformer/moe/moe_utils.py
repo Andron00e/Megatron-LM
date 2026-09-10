@@ -131,13 +131,21 @@ def switch_load_balancing_loss_func(
         mask_expanded = padding_mask.unsqueeze(-1)
         probs = probs * mask_expanded
 
+    # A data-parallel padding sample can contain no valid tokens. Its masked
+    # probabilities and counts are both zero, so the correct loss is zero,
+    # not a division-by-zero NaN.
+    if isinstance(total_num_tokens, torch.Tensor):
+        safe_total_num_tokens = torch.clamp(total_num_tokens, min=1)
+    else:
+        safe_total_num_tokens = max(total_num_tokens, 1)
+
     if fused:
         if not HAVE_TE or fused_moe_aux_loss is None:
             raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.7.0.")
         return fused_moe_aux_loss(
             probs=probs,
             tokens_per_expert=tokens_per_expert,
-            total_num_tokens=total_num_tokens,
+            total_num_tokens=safe_total_num_tokens,
             topk=topk,
             num_experts=num_experts,
             coeff=moe_aux_loss_coeff,
@@ -145,7 +153,9 @@ def switch_load_balancing_loss_func(
 
     aggregated_probs_per_expert = probs.sum(dim=0)
     aux_loss = torch.sum(aggregated_probs_per_expert * tokens_per_expert) * (
-        num_experts * moe_aux_loss_coeff / (topk * total_num_tokens * total_num_tokens)
+        num_experts
+        * moe_aux_loss_coeff
+        / (topk * safe_total_num_tokens * safe_total_num_tokens)
     )
     return aux_loss
 

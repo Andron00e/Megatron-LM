@@ -797,7 +797,7 @@ class TopKRouter(Router):
         if torch.is_grad_enabled():
             with torch.no_grad():
                 if padding_mask is not None:
-                    routing_map = routing_map & (~padding_mask)
+                    routing_map = routing_map & (~padding_mask.unsqueeze(-1))
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
     def _record_expert_load_samples(
