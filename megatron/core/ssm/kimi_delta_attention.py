@@ -161,6 +161,19 @@ def _fused_kda_gate_style() -> Optional[str]:
 
 _KDA_GATE_STYLE = _fused_kda_gate_style()
 
+# Whether the installed fused_kda_gate indexes A_log per channel (PER_CHANNEL).
+def _fused_kda_gate_supports_per_channel() -> bool:
+    try:
+        import inspect as _inspect
+        from fla.ops.kda import gate as _gate_mod
+        return "PER_CHANNEL" in _inspect.getsource(_gate_mod)
+    except Exception:
+        return False
+
+
+_KDA_GATE_SUPPORTS_PER_CHANNEL = _fused_kda_gate_supports_per_channel()
+
+
 _KDA_SUPPORTS_QK_L2NORM_IN_KERNEL = _chunk_kda_supports("use_qk_l2norm_in_kernel")
 _KDA_SUPPORTS_FUSED_BETA_SIGMOID = _chunk_kda_supports(
     "use_beta_sigmoid_in_kernel"
@@ -445,7 +458,7 @@ class KimiDeltaAttention(GatedDeltaNet):
         self._use_fused_decay_gate = (
             _KDA_SUPPORTS_FUSED_DECAY_GATE
             and _env_flag("KDA_USE_GATE_IN_KERNEL", True)
-            and not self._alog_per_channel
+            and (not self._alog_per_channel or _KDA_GATE_SUPPORTS_PER_CHANNEL)
         )
         # Kimi-K3 safe decay gate g = g_min * sigmoid(exp(A_log) * (z + dt_bias)).
         # FLA computes this natively (chunk_kda safe_gate/lower_bound; fused_kda_gate
@@ -463,9 +476,15 @@ class KimiDeltaAttention(GatedDeltaNet):
         # Without the in-kernel gate, prefer FLA's fused_kda_gate over torch.
         self._kda_gate_style = (
             None
-            if self._use_fused_decay_gate or self._alog_per_channel
+            if self._use_fused_decay_gate
             else (_KDA_GATE_STYLE if _env_flag("KDA_FUSED_GATE", True) else None)
         )
+        # Per-channel A_log needs a fused gate that indexes A_log per channel;
+        # only the 0.5 style can, so fall back to torch otherwise.
+        if self._alog_per_channel and not (
+            self._kda_gate_style == "0.5" and _KDA_GATE_SUPPORTS_PER_CHANNEL
+        ):
+            self._kda_gate_style = None
         # fused_kda_gate can only do the safe decay in the 0.5 style with a
         # lower_bound arg; otherwise fall through to the torch reparameterization.
         if (
