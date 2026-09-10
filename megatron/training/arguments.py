@@ -1135,6 +1135,20 @@ def validate_args(args, defaults={}):
             'parallelism yet.'
         )
 
+    # TE's `auto` backend picks cuDNN fused attention for THD batches, which is much slower than
+    # flash on the segment shapes BFD packing produces (whole documents). Only `auto` is overridden.
+    if args.attention_backend == AttnBackend.auto and (
+        args.sft or getattr(args, 'dataloader_inter_document_masking', False)
+    ):
+        args.attention_backend = AttnBackend.flash
+        if args.rank == 0:
+            print(
+                '> packed-sequence attention: selecting the flash attention backend '
+                '(cuDNN fused attention is much slower on THD-format batches). '
+                'Pass --attention-backend to override.',
+                flush=True,
+            )
+
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
         args.encoder_seq_length = args.seq_length
