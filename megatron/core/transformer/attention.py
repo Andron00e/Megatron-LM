@@ -834,16 +834,18 @@ class Attention(MegatronModule, ABC):
             "sm_margin": 0,
         }
 
-        # Parse the expect argument names from the function signature
-        if inspect.isfunction(_flash_attn_forward):
-            sig = inspect.signature(_flash_attn_forward)
-        else:
-            assert isinstance(_flash_attn_forward, torch._library.custom_ops.CustomOpDef)
-            sig = inspect.signature(_flash_attn_forward._init_fn)
+        # FA3's inference wrapper is vulnerable to dispatcher schema lifetime
+        # failures. Use the registered implementation directly for this
+        # inference-only path, while preserving the module-global op. The
+        # private `_init_fn` API is intentionally scoped to this wrapper.
+        fa3_forward = _flash_attn_forward
+        if isinstance(fa3_forward, torch._library.custom_ops.CustomOpDef):
+            fa3_forward = fa3_forward._init_fn
+        sig = inspect.signature(fa3_forward)
         valid_kwargs = set(sig.parameters.keys())
         final_kwargs = {k: candidate_kwargs[k] for k in valid_kwargs if k in candidate_kwargs}
 
-        output_total, *unused = _flash_attn_forward(**final_kwargs)
+        output_total, *unused = fa3_forward(**final_kwargs)
 
         return output_total
 
