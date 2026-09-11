@@ -43,6 +43,10 @@ from megatron.training.utils import get_batch_on_this_cp_rank, unwrap_model
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
+# TODO: Fix the intermittent four-rank full-file failure during repeated process-group setup.
+# Gloo can fail with "connectFullMesh failed" or "Connection closed by peer" between tests.
+# Gloo cannot be disabled for the whole file because optimizer tests require its DP groups.
+
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
 else:
