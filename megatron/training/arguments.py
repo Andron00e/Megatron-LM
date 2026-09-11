@@ -3486,6 +3486,8 @@ def _add_data_args(parser):
                        'Relevant with CP.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--mask-loss-token-ids', type=int, nargs='+', default=None,
+                       help='Token IDs whose next-token losses are masked during pretraining.')
     group.add_argument('--dataloader-inter-document-masking', action='store_true',
                        help='Return cu_seqlens marking document boundaries '
                        'within each sample so that attention is restricted '
