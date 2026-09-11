@@ -1837,6 +1837,18 @@ def setup_model_and_optimizer(
                 'load_checkpoint_time': timers('load-checkpoint').active_time(),
             }
         )
+
+        # Release the checkpoint LOAD strategy retained in checkpointing_context.
+        # With --ckpt-fully-parallel-load it is a FullyParallelLoadStrategyWrapper that
+        # holds the broadcast-exchange state; left in place it stays resident into the
+        # first SAVE (checkpointing.py reuses checkpointing_context['load_strategy']) and
+        # the save OOMs on top of it. gc.collect() returns that memory to the caching
+        # allocator WITHOUT unmapping, so it is reused safely under expandable_segments --
+        # unlike torch.cuda.empty_cache(), which unmaps segments NCCL has registered for
+        # pipeline-parallel P2P and triggers illegal memory accesses.
+        if checkpointing_context is not None:
+            checkpointing_context.pop("load_strategy", None)
+        gc.collect()
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
