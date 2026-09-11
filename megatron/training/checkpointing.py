@@ -400,8 +400,12 @@ def get_rng_state(ckpt_format: str, tp_group: torch.distributed.ProcessGroup, pp
         pp_size = get_pg_size(pp_group)
         tp_rank = get_pg_rank(tp_group)
         tp_size = get_pg_size(tp_group)
-        rng_state_list = ShardedObject('rng_state', rng_state_list, (pp_size, tp_size), (pp_rank, tp_rank),
-                                       replica_id=mpu.get_data_parallel_rank(with_context_parallel=True))
+        dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        dp_cp_rank = get_pg_rank(dp_cp_group)
+        dp_cp_size = get_pg_size(dp_cp_group)
+        rng_state_list = ShardedObject(
+            'rng_state', rng_state_list, (pp_size, tp_size, dp_cp_size),
+            (pp_rank, tp_rank, dp_cp_rank))
     elif ckpt_format == "fsdp_dtensor":
         pp_rank = mpu.get_pipeline_model_parallel_rank()
         tp_rank = mpu.get_tensor_model_parallel_rank()
@@ -1748,7 +1752,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         )
 
         # Determine if RNG state will be loaded
-        if (ckpt_tp_pp == run_tp_pp and not release and not args.finetune and not args.no_load_rng
+        if (ckpt_tp_pp == run_tp_pp and ckpt_world_size == run_world_size and not release and not args.finetune and not args.no_load_rng
                 and not getattr(ckpt_args, 'no_save_rng', False)):
             if tp_group is None and pp_group is None:
                 tp_group = mpu.get_tensor_model_parallel_group()
@@ -1759,6 +1763,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             gen_sd_rng_state = None
             if ckpt_tp_pp != run_tp_pp:
                 print_rank_0("{}: RNG state will be ignored".format(mismatch_msg))
+            elif ckpt_world_size != run_world_size:
+                print_rank_0("Job sharding has changed: RNG state will be ignored")
 
         if ckpt_type == CheckpointType.LOCAL:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(args)

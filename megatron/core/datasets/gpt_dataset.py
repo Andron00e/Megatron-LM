@@ -257,6 +257,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     eod_mask_loss: Optional[bool] = None
     """Option to enable the EOD mask loss"""
 
+    loss_mask_token_ids: Optional[Tuple[int, ...]] = None
+    """Token IDs whose next-token losses are masked."""
+
     create_attention_mask: bool = True
     """Option to enable the attention masks generation. Can be disabled if attention kernel
        generates masks by itself.
@@ -589,6 +592,12 @@ class GPTDataset(MegatronDataset):
 
         # For padded sequences, mask the loss
         loss_mask[labels == self._pad_token_id] = 0.0
+
+        # Mask only the specified next-token targets. This stays in the CPU data
+        # worker, so it adds neither GPU work nor distributed communication.
+        if self.config.loss_mask_token_ids:
+            for token_id in self.config.loss_mask_token_ids:
+                loss_mask[labels == token_id] = 0.0
 
         # For padded sequences, ensure the embedding layer can map the token ID
         tokens[tokens == self._pad_token_id] = 0

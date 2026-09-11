@@ -400,6 +400,60 @@ def test_mock_gpt_dataset_goldfish():
     assert "outside the tokenizer vocab" in str(excinfo.value.__cause__)
 
 
+def test_mask_loss_token_ids_masks_targets_only(monkeypatch):
+    import pretrain_gpt
+
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
+    base = dict(
+        random_seed=1234,
+        sequence_length=1024,
+        split="990,9,1",
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        tokenizer=tokenizer,
+        mid_level_dataset_surplus=0.005,
+    )
+    masked_dataset = BlendedMegatronDatasetBuilder(
+        MockGPTDataset,
+        [100, 0, 0],
+        lambda: True,
+        GPTDatasetConfig(**base, loss_mask_token_ids=(10, 11)),
+    ).build()[0]
+    baseline_dataset = BlendedMegatronDatasetBuilder(
+        MockGPTDataset, [100, 0, 0], lambda: True, GPTDatasetConfig(**base)
+    ).build()[0]
+
+    args = type(
+        "Args",
+        (),
+        {"modelopt_enabled": False, "check_for_nan_in_loss_and_grad": False,
+         "check_for_spiky_loss": False},
+    )()
+    monkeypatch.setattr(pretrain_gpt, "get_args", lambda: args)
+    monkeypatch.setattr(pretrain_gpt, "has_nvidia_modelopt", False)
+
+    masked_target_count = 0
+    for index in range(100):
+        sample, baseline = masked_dataset[index], baseline_dataset[index]
+        assert torch.equal(sample["labels"], baseline["labels"])
+        masked_targets = (sample["labels"] == 10) | (sample["labels"] == 11)
+        expected_loss_mask = baseline["loss_mask"].clone()
+        expected_loss_mask[masked_targets] = 0.0
+        assert torch.equal(sample["loss_mask"], expected_loss_mask)
+
+        masked_target_count += int(masked_targets.sum())
+    assert masked_target_count > 0
+
+    # Verify the exact pretraining loss function excludes these targets.
+    losses = torch.arange(sample["loss_mask"].numel(), dtype=torch.float)
+    loss, num_tokens, _ = pretrain_gpt.loss_func(sample["loss_mask"], losses)
+    assert loss == torch.sum(losses * expected_loss_mask)
+    assert num_tokens == expected_loss_mask.sum()
+
+
 def test_goldfish_config_validation():
     tokenizer = MegatronTokenizer.from_pretrained(
         metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
