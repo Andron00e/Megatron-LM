@@ -404,19 +404,19 @@ class TopKRouter(Router):
 
             if should_update_beta:
                 if use_histogram:
-                    valid_scores = scores
-                    valid_alpha = topk_result.values[:, -1]
-                    if padding_mask is not None:
-                        valid_scores = valid_scores[~padding_mask]
-                        valid_alpha = valid_alpha[~padding_mask]
-                    if valid_scores.numel() > 0:
-                        histogram = compute_qb_histogram(
-                            valid_scores,
-                            valid_alpha,
+                    # Hand the mask down instead of compacting the rows here:
+                    # scores[~padding_mask] lowers to nonzero(), which synchronizes the
+                    # device and makes the shape data-dependent, so the router can no
+                    # longer be CUDA-graph captured. Counts are identical.
+                    self.qb_histogram.add_(
+                        compute_qb_histogram(
+                            scores,
+                            topk_result.values[:, -1],
                             self.qb_beta,
                             self.config.moe_router_quantile_balancing_num_bins,
+                            padding_mask=padding_mask,
                         )
-                        self.qb_histogram.add_(histogram)
+                    )
                 else:
                     beta_scores = qb_scores
                     beta_padding_mask = padding_mask
