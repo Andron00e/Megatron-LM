@@ -1061,6 +1061,9 @@ class Attention(MegatronModule, ABC):
         )
         if no_rope:
             rotary_pos_emb = None
+            rotary_pos_cos = None
+            rotary_pos_sin = None
+            rotary_pos_cos_sin = None
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
