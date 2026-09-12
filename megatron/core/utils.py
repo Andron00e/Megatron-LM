@@ -2042,7 +2042,9 @@ def flatten_batch_for_packed_sequences(batch: Dict[str, Any]) -> Dict[str, Any]:
         return batch
 
     seq_length = None
-    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+    # padding_mask is included because on a genuine middle PP stage every other entry
+    # is None, and the cu_seqlens fallback below costs a device sync per microbatch.
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask'):
         if batch.get(key) is not None:
             seq_length = batch[key].shape[1]
             break
