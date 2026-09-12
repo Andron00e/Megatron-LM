@@ -2033,7 +2033,7 @@ def dummy_train_step(data_iterator):
             batch = get_batch_on_this_cp_rank(batch)
 
 
-def _pipeline_shape_args(args):
+def _pipeline_shape_args(args, micro_batch_size=None):
     """
     Return the (seq_length, micro_batch_size) used to size pipeline P2P buffers.
 
@@ -2042,13 +2042,15 @@ def _pipeline_shape_args(args):
     `(mbs * seq, 1)` rather than `(seq, mbs)`. Report the collapsed shape
     so the pipeline send/recv buffers match the actual tensor layout.
     """
+    if micro_batch_size is None:
+        micro_batch_size = args.micro_batch_size
     is_packed = (
         getattr(args, 'dataloader_inter_document_masking', False)
         or getattr(args, 'sft', False)
     )
-    if is_packed and args.micro_batch_size > 1:
-        return args.seq_length * args.micro_batch_size, 1
-    return args.seq_length, args.micro_batch_size
+    if is_packed and micro_batch_size > 1:
+        return args.seq_length * micro_batch_size, 1
+    return args.seq_length, micro_batch_size
 
 
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
@@ -3724,7 +3726,8 @@ def evaluate(
 
     timers('evaluate', log_level=0).start(barrier=True)
 
-    pp_seq_length, pp_micro_batch_size = _pipeline_shape_args(args)
+    eval_micro_batch_size = args.eval_micro_batch_size
+    pp_seq_length, pp_micro_batch_size = _pipeline_shape_args(args, eval_micro_batch_size)
 
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         from megatron.legacy.model.vision.knn_monitor import compute_feature_bank
@@ -3742,9 +3745,11 @@ def evaluate(
 
     total_loss_dict = {}
 
-    # make validation batch size independent from training batch size
-    eval_batch_size = args.global_batch_size
-    eval_num_microbatches = eval_batch_size // (args.micro_batch_size * args.data_parallel_size)
+    # Make validation batch size independent from training batch size.
+    eval_batch_size = args.eval_global_batch_size
+    eval_num_microbatches = eval_batch_size // (
+        eval_micro_batch_size * args.data_parallel_size
+    )
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
@@ -3754,7 +3759,7 @@ def evaluate(
         adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
             model,
             seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
+            micro_batch_size=eval_micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
         )
     else:
@@ -3851,7 +3856,7 @@ def evaluate(
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
                 model=model,
-                num_microbatches=get_num_microbatches(),
+                num_microbatches=eval_num_microbatches,
                 seq_length=pp_seq_length,
                 micro_batch_size=pp_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
@@ -3991,8 +3996,12 @@ def get_train_valid_test_num_samples():
         else:
             assert args.train_iters is not None
             eval_iters = (args.train_iters // args.eval_interval + 1) * args.eval_iters
-        eval_samples = eval_iters * args.global_batch_size
-    test_samples = args.eval_iters * args.global_batch_size
+        eval_samples = eval_iters * getattr(
+            args, 'eval_global_batch_size', args.global_batch_size
+        )
+    test_samples = args.eval_iters * getattr(
+        args, 'eval_global_batch_size', args.global_batch_size
+    )
 
     # Get train_samples in current phase.
     if args.phase_transition_iterations:
@@ -4037,7 +4046,9 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     if args.iteration > 0 and args.consumed_valid_samples == 0:
         if args.train_samples is None:
             args.consumed_valid_samples = (
-                (args.iteration // args.eval_interval) * args.eval_iters * args.global_batch_size
+                (args.iteration // args.eval_interval)
+                * args.eval_iters
+                * getattr(args, 'eval_global_batch_size', args.global_batch_size)
             )
 
     # Get consumed train samples in this phase.
