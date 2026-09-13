@@ -131,13 +131,21 @@ def switch_load_balancing_loss_func(
         mask_expanded = padding_mask.unsqueeze(-1)
         probs = probs * mask_expanded
 
+    # A data-parallel padding sample can contain no valid tokens. Its masked
+    # probabilities and counts are both zero, so the correct loss is zero,
+    # not a division-by-zero NaN.
+    if isinstance(total_num_tokens, torch.Tensor):
+        safe_total_num_tokens = torch.clamp(total_num_tokens, min=1)
+    else:
+        safe_total_num_tokens = max(total_num_tokens, 1)
+
     if fused:
         if not HAVE_TE or fused_moe_aux_loss is None:
             raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.7.0.")
         return fused_moe_aux_loss(
             probs=probs,
             tokens_per_expert=tokens_per_expert,
-            total_num_tokens=total_num_tokens,
+            total_num_tokens=safe_total_num_tokens,
             topk=topk,
             num_experts=num_experts,
             coeff=moe_aux_loss_coeff,
@@ -145,7 +153,9 @@ def switch_load_balancing_loss_func(
 
     aggregated_probs_per_expert = probs.sum(dim=0)
     aux_loss = torch.sum(aggregated_probs_per_expert * tokens_per_expert) * (
-        num_experts * moe_aux_loss_coeff / (topk * total_num_tokens * total_num_tokens)
+        num_experts
+        * moe_aux_loss_coeff
+        / (topk * safe_total_num_tokens * safe_total_num_tokens)
     )
     return aux_loss
 
@@ -230,6 +240,7 @@ def compute_qb_histogram(
     alpha: torch.Tensor,
     beta: torch.Tensor,
     num_bins: int,
+    padding_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Histogram the per-token QB bias required by every expert.
 
@@ -246,6 +257,11 @@ def compute_qb_histogram(
         alpha: Biased Top-(k+1) cutoff for each token, shaped ``[num_tokens]``.
         beta: Current per-expert subtractive QB threshold, shaped ``[num_experts]``.
         num_bins: Number of uniform histogram bins.
+        padding_mask: Optional ``[num_tokens]`` bool mask, True for padding rows to
+            exclude. Excluded here rather than by compacting ``scores`` at the call site,
+            where a boolean-mask gather would lower to ``nonzero`` and synchronize the
+            device; padded rows are binned into a scratch block that is sliced off, for
+            identical counts with no sync (the same reason bincount became scatter_add_).
 
     Returns:
         Per-expert integer counts shaped ``[num_experts, num_bins]``.
@@ -254,6 +270,9 @@ def compute_qb_histogram(
     assert alpha.dim() == 1 and alpha.shape[0] == scores.shape[0]
     assert beta.dim() == 1 and beta.shape[0] == scores.shape[1]
     assert num_bins > 0
+    assert padding_mask is None or (
+        padding_mask.dim() == 1 and padding_mask.shape[0] == scores.shape[0]
+    )
 
     num_experts = scores.shape[1]
     # We have a guarantee that r_{i, j} = alpha_i - scores_{i, j} is in [-beta.max() - 1, -beta.min() + 1], where beta.max and beta.min are the past values of beta.
@@ -272,17 +291,24 @@ def compute_qb_histogram(
 
     expert_offsets = torch.arange(num_experts, device=scores.device) * num_bins
     bin_indices.add_(expert_offsets)
+    num_blocks = num_experts
+    if padding_mask is not None:
+        # Shift padded rows into a scratch block past the last expert, sliced off below.
+        # A whole block rather than one slot: they keep their per-expert spread, so the
+        # scatter_add_ atomics stay as contended as they were (one slot measured 673us
+        # against 244us for the old compacting path; a whole block measures 190us).
+        bin_indices.add_(padding_mask.unsqueeze(1) * (num_experts * num_bins))
+        num_blocks = 2 * num_experts
     # torch.bincount does not support CUDA-graph capturable because it
     # internally has d2h sync.
     # revert to scatter_add_. A fixed-size buffer has a static output shape, and a
     # stride-0 expanded ones source avoids the bin_indices-sized values tensor.
     flat_indices = bin_indices.reshape(-1)
     ones = torch.ones(1, dtype=flat_indices.dtype, device=flat_indices.device)
-    return (
-        torch.zeros(num_experts * num_bins, dtype=torch.long, device=flat_indices.device)
-        .scatter_add_(0, flat_indices, ones.expand_as(flat_indices))
-        .reshape(num_experts, num_bins)
-    )
+    histogram = torch.zeros(
+        num_blocks * num_bins, dtype=torch.long, device=flat_indices.device
+    ).scatter_add_(0, flat_indices, ones.expand_as(flat_indices))
+    return histogram[: num_experts * num_bins].reshape(num_experts, num_bins)
 
 
 def recover_qb_beta_from_histogram(

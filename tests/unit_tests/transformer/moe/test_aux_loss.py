@@ -15,6 +15,7 @@ from megatron.core.transformer.moe.moe_utils import (
     clear_aux_losses_tracker,
     get_default_pg_collection,
     get_moe_layer_wise_logging_tracker,
+    switch_load_balancing_loss_func,
 )
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -37,6 +38,18 @@ try:
     )
 except Exception:  # pragma: no cover - defensive
     HAVE_ROUTER_FUSION = False
+
+
+def test_switch_loss_with_all_padding_is_zero():
+    all_padding_loss = switch_load_balancing_loss_func(
+        probs=torch.zeros((4, 2)),
+        tokens_per_expert=torch.zeros(2),
+        total_num_tokens=0,
+        topk=1,
+        num_experts=2,
+        moe_aux_loss_coeff=1.0,
+    )
+    torch.testing.assert_close(all_padding_loss, torch.tensor(0.0))
 
 
 class AuxlossTestContainer(MoEModelTestContainer):
