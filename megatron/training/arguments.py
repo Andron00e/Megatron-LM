@@ -1757,6 +1757,17 @@ def validate_args(args, defaults={}):
                 "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
                 "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
             )
+            if getattr(args, 'pretraining_packing_strategy', None) == 'bfd':
+                # Capture takes a routing padding_mask only for MoE layers that have already
+                # routed with one, which needs at least one real forward before the graphs
+                # are recorded. With no warmup step the graphs are captured unmasked and TE
+                # silently ignores the mask passed at replay, so fail here instead.
+                assert args.cuda_graph_warmup_steps > 0, (
+                    "--cuda-graph-warmup-steps must be > 0 with --pretraining-packing-strategy "
+                    "bfd and --cuda-graph-impl transformer_engine: with 0 the CUDA graphs are "
+                    "captured before any forward and the MoE routing padding mask is silently "
+                    "dropped from every replay."
+                )
     if args.cuda_graph_scope == "full" or (
         isinstance(args.cuda_graph_scope, list) and "full" in args.cuda_graph_scope
     ):
