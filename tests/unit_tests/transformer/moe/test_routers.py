@@ -664,24 +664,6 @@ class TestAuxLossFreeTop2Router:
         # Print some debug info
         print("Updated bias after first forward pass:", updated_bias)
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_expert_bias_ignores_padding_tokens(self):
-        """Expert-bias counts exclude padded rows for any token/expert dimensions."""
-        self.router = self.router.cuda()
-        routing_map = torch.zeros((5, 8), dtype=torch.bool, device="cuda")
-        routing_map[0, [0, 1]] = True
-        routing_map[1, [2, 3]] = True
-        routing_map[2, [0, 4]] = True
-        routing_map[3, [5, 6]] = True
-        routing_map[4, [1, 7]] = True
-        padding_mask = torch.tensor([False, True, False, True, False], device="cuda")
-
-        self.router.local_tokens_per_expert.zero_()
-        self.router._apply_expert_bias(routing_map, padding_mask)
-
-        expected = torch.tensor([2, 2, 0, 0, 1, 0, 0, 1], device="cuda")
-        torch.testing.assert_close(self.router.local_tokens_per_expert, expected)
-
     @pytest.mark.internal
     @pytest.mark.skipif(
         not torch.cuda.is_available() or not HAVE_ROUTER_FUSION,
@@ -1107,3 +1089,106 @@ class TestPaddingMaskBufferAliasing:
             return hidden_states.grad.clone()
 
         torch.testing.assert_close(grad_of(False), grad_of(True), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_capture_static_inputs_take_a_padding_mask_shaped_like_hidden_states():
+    """TE captures from get_layer_static_inputs, not from the live forward's kwargs.
+
+    So the placeholder must be there exactly when the layer routes with a mask, and it
+    must follow the sharded shape of hidden_states, since TE copies the live mask into it
+    on every replay and a shape mismatch there would be a hard error at the first replay.
+    """
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+    from megatron.core.transformer.enums import CudaGraphScope
+    from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    Utils.initialize_model_parallel(1, 1)
+    init_num_microbatches_calculator(
+        rank=0, rampup_batch_size=None, global_batch_size=2, micro_batch_size=2,
+        data_parallel_size=1,
+    )
+    _set_random_seed(seed_=123, data_parallel_random_init=False)
+    try:
+        num_experts, seq_len, mbs, hidden = 4, 8, 2, 8
+        config = TransformerConfig(
+            num_layers=1, hidden_size=hidden, num_attention_heads=4,
+            num_moe_experts=num_experts, use_cpu_initialization=True,
+            moe_router_load_balancing_type="none", moe_router_score_function="sigmoid",
+            moe_router_topk=1, add_bias_linear=False,
+        )
+        spec = get_gpt_layer_local_spec(num_experts=num_experts, moe_grouped_gemm=False)
+        layer = TransformerLayer(config, spec.submodules).cuda()
+        assert layer.is_moe_layer
+        # The production scope: attention stays eager, capture takes hidden_states (+ mask).
+        layer.config.cuda_graph_scope = [CudaGraphScope.moe_router, CudaGraphScope.moe_preprocess]
+
+        assert "padding_mask" not in layer.get_layer_static_inputs(seq_len, mbs)
+
+        layer.mlp.route(
+            torch.randn(seq_len, mbs, hidden, device="cuda"),
+            torch.zeros(mbs, seq_len, dtype=torch.bool, device="cuda"),
+        )
+        static = layer.get_layer_static_inputs(seq_len, mbs)
+        assert static["padding_mask"].dtype == torch.bool
+        assert static["padding_mask"].shape == (mbs, seq_len)
+        assert static["padding_mask"].shape == tuple(reversed(static["hidden_states"].shape[:2]))
+
+        # Under sequence parallelism hidden_states arrive sequence-sharded and so does the
+        # live mask (GPTModel._preprocess scatters it), so the placeholder must shrink too.
+        layer.config.sequence_parallel = True
+        layer.config.tensor_model_parallel_size = 2
+        static = layer.get_layer_static_inputs(seq_len, mbs)
+        assert static["padding_mask"].shape == (mbs, seq_len // 2)
+        assert static["padding_mask"].shape == tuple(reversed(static["hidden_states"].shape[:2]))
+    finally:
+        unset_num_microbatches_calculator()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_expert_bias_ignores_padding_tokens():
+    """Expert-bias counts exclude padded rows for any token/expert dimensions.
+
+    Single rank on purpose: TestAuxLossFreeTop2Router's fixture asks for 8 expert-parallel
+    ranks, so a test placed there errors at setup in a one-GPU session and never runs.
+    """
+    Utils.initialize_model_parallel(1, 1)
+    init_num_microbatches_calculator(
+        rank=0, rampup_batch_size=None, global_batch_size=2, micro_batch_size=2,
+        data_parallel_size=1,
+    )
+    _set_random_seed(seed_=123, data_parallel_random_init=False)
+    try:
+        num_moe_experts = 8
+        config = TransformerConfig(
+            num_layers=2, hidden_size=12, num_attention_heads=4,
+            num_moe_experts=num_moe_experts, use_cpu_initialization=True,
+            moe_router_load_balancing_type="none", moe_router_score_function="sigmoid",
+            moe_router_enable_expert_bias=True, moe_router_bias_update_rate=0.1,
+            moe_router_topk=2, add_bias_linear=False,
+        )
+        submodules = get_gpt_layer_local_submodules(
+            num_experts=num_moe_experts, moe_grouped_gemm=False
+        )
+        router = cast(Router, MoELayer(config, submodules.mlp.submodules).router).cuda()
+        assert router.local_tokens_per_expert is not None
+
+        routing_map = torch.zeros((5, 8), dtype=torch.bool, device="cuda")
+        routing_map[0, [0, 1]] = True
+        routing_map[1, [2, 3]] = True
+        routing_map[2, [0, 4]] = True
+        routing_map[3, [5, 6]] = True
+        routing_map[4, [1, 7]] = True
+        padding_mask = torch.tensor([False, True, False, True, False], device="cuda")
+
+        router.local_tokens_per_expert.zero_()
+        router._apply_expert_bias(routing_map, padding_mask)
+
+        expected = torch.tensor(
+            [2, 2, 0, 0, 1, 0, 0, 1], device="cuda", dtype=router.local_tokens_per_expert.dtype
+        )
+        torch.testing.assert_close(router.local_tokens_per_expert, expected)
+    finally:
+        unset_num_microbatches_calculator()
+        Utils.destroy_model_parallel()
