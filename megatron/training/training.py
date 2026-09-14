@@ -2668,11 +2668,18 @@ def save_checkpoint_and_time(
     one_logger_utils.track_e2e_metrics()
     # Free overlap param-gather buffers and release cached GPU memory so
     # that the async checkpoint worker process has enough GPU headroom for
-    # D2H tensor transfers.
-    for model_chunk in model:
-        if hasattr(model_chunk, 'free_overlap_buffers'):
-            model_chunk.free_overlap_buffers()
-    torch.cuda.empty_cache()
+    # D2H tensor transfers. GUARDED on async_save: torch.cuda.empty_cache()
+    # unmaps CUDA segments NCCL has registered for pipeline-parallel P2P
+    # (fragile under expandable_segments), so with PP>1 the next P2P after the
+    # save touches an unmapped address -> CUDA illegal memory access (the run
+    # dies right after checkpointing; a fresh resume re-registers and continues).
+    # It only buys headroom for the async-save worker PROCESS, so for synchronous
+    # saves it is pure downside -- skip the whole block.
+    if args.async_save:
+        for model_chunk in model:
+            if hasattr(model_chunk, 'free_overlap_buffers'):
+                model_chunk.free_overlap_buffers()
+        torch.cuda.empty_cache()
 
     global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
     should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
