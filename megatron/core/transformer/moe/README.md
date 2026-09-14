@@ -307,6 +307,10 @@ histograms before the bias is decoded, mean-centered, and applied to the next ba
 `average` method remains available for comparison, but averaging independently computed quantiles
 generally differs from the true pooled quantile. This implementation follows the
 [Kimi K3 Technical Report](https://github.com/MoonshotAI/Kimi-K3/blob/main/k3_tech_report.pdf).
+Set `--moe-router-quantile-balancing-freeze` when fine-tuning to keep a checkpoint's `qb_beta`
+fixed while continuing to use it for routing. Frozen QB skips both statistics collection and the
+global-batch update collectives. Setting the load-balancing type to `none` is not equivalent: it
+removes `qb_beta` from the routing decision.
 
 Global-batch expert-load violation is always logged. Optional scopes selected with
 `--moe-router-violation-metrics` retain local expert counts and batch their communication at the
@@ -549,6 +553,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-router-group-topk | Selected groups in group-limited routing | None |
 | --moe-router-enable-expert-bias | Dynamic per-expert bias | False |
 | --moe-router-bias-update-rate | Bias update rate | 1e-3 |
+| --moe-router-quantile-balancing-freeze | Preserve the loaded QB bias without collecting or applying updates | False |
 | --moe-router-quantile-balancing-method | QB estimator: average, legacy_average (raw-logit compatibility), or histogram | histogram |
 | --moe-router-quantile-balancing-num-bins | Per-expert histogram bins for histogram QB | 1000 |
 | --moe-router-bias-metrics | Log router bias mean, standard deviation, minimum, and maximum | False |

@@ -188,9 +188,7 @@ class TopKRouter(Router):
         self.register_buffer(
             'local_tokens_per_expert',
             torch.zeros(
-                self.config.num_moe_experts,
-                dtype=torch.float32,
-                device=torch.cuda.current_device(),
+                self.config.num_moe_experts, dtype=torch.float32, device=torch.cuda.current_device()
             ),
             persistent=False,
         )
@@ -362,9 +360,7 @@ class TopKRouter(Router):
         scores = logits * map
         return scores, map
 
-    def quantile_balancing(
-        self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
-    ):
+    def quantile_balancing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Apply average or histogram quantile-balancing routing.
 
         The average methods gather TP/CP values and accumulate one quantile per
@@ -386,7 +382,11 @@ class TopKRouter(Router):
         gather_group = self.tp_cp_group
         gather_size = gather_group.size() if gather_group is not None else 1
 
-        should_update_beta = self.training and torch.is_grad_enabled()
+        should_update_beta = (
+            self.training
+            and torch.is_grad_enabled()
+            and not self.config.moe_router_quantile_balancing_freeze
+        )
 
         with torch.no_grad():
             logits_fp32 = logits.detach().to(dtype=torch.float32)
@@ -405,9 +405,7 @@ class TopKRouter(Router):
                 else scores
             )
             biased_scores = qb_scores - self.qb_beta
-            use_histogram = (
-                self.config.moe_router_quantile_balancing_method == 'histogram'
-            )
+            use_histogram = self.config.moe_router_quantile_balancing_method == 'histogram'
             if should_update_beta and use_histogram:
                 topk_result = biased_scores.topk(self.topk + 1, dim=1)
                 indices = topk_result.indices[:, : self.topk]
@@ -900,11 +898,7 @@ class TopKRouter(Router):
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
 
-        if (
-            self.training
-            and torch.is_grad_enabled()
-            and self.config.moe_router_violation_metrics
-        ):
+        if self.training and torch.is_grad_enabled() and self.config.moe_router_violation_metrics:
             violation_metrics = self.config.moe_router_violation_metrics
             mbs_samples = self.mbs_expert_load_samples
             seq_samples = self.seq_expert_load_samples
@@ -928,17 +922,12 @@ class TopKRouter(Router):
                     seq_num_tokens = valid_tokens.sum(dim=0, dtype=torch.float32).unsqueeze(-1)
                 else:
                     seq_num_tokens = torch.full(
-                        (bsz, 1),
-                        seq_length,
-                        dtype=torch.float32,
-                        device=routing_map.device,
+                        (bsz, 1), seq_length, dtype=torch.float32, device=routing_map.device
                     )
 
                 seq_tokens_per_expert = expert_load_routing_map.sum(dim=0, dtype=torch.float32)
                 if "seq" in violation_metrics:
-                    seq_samples.append(
-                        torch.cat((seq_tokens_per_expert, seq_num_tokens), dim=-1)
-                    )
+                    seq_samples.append(torch.cat((seq_tokens_per_expert, seq_num_tokens), dim=-1))
 
                 if "mbs" in violation_metrics or "ep" in violation_metrics:
                     mbs_tokens_per_expert = seq_tokens_per_expert.sum(dim=0)
