@@ -66,7 +66,7 @@ def initialize_megatron(
     # on initialize_megatron() to parse arguments.
     try:
         args = get_args()
-    except RuntimeError:
+    except AssertionError:
         if parsed_args is None:
             args = parse_args(extra_args_provider, ignore_unknown_args)
         else:
