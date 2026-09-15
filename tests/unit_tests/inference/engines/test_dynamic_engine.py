@@ -3971,6 +3971,84 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
+    def test_multitoken_stop_word_trims_accumulated_logprobs(self):
+        """A stop word spanning decode steps trims all per-token outputs."""
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=10,
+            num_speculative_tokens=0,
+            materialize_only_last_token_logits=False,
+            model_provider="gpt",
+        )
+        env = self._build_test_env(test_config)
+
+        unwrapped_model = env.engine.controller.inference_wrapped_model.model
+
+        def mock_deterministic_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            batch, sequence = tokens.shape
+            logits = torch.zeros(
+                batch,
+                sequence,
+                test_config.vocab_size,
+                device=tokens.device,
+                dtype=torch.bfloat16,
+            )
+            next_tokens = (tokens + 1).clamp(max=test_config.vocab_size - 1)
+            logits.scatter_(2, next_tokens.unsqueeze(-1), 100.0)
+            return logits
+
+        unwrapped_model.forward = mock_deterministic_forward
+        env.engine.add_request(
+            request_id=0,
+            prompt=torch.tensor([1, 2, 3, 4], device="cuda"),
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=10,
+                termination_id=99,
+                detokenize_stop_sequence=False,
+                return_log_probs=True,
+                top_n_logprobs=2,
+                top_k=1,
+            ),
+        )
+        env.engine.get_request(0).stop_word_ids = [[8, 9]]
+        env.engine.add_request(
+            request_id=1,
+            prompt=torch.tensor([1, 2, 3, 4], device="cuda"),
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=10,
+                termination_id=6,
+                return_log_probs=True,
+                top_n_logprobs=2,
+                top_k=1,
+            ),
+        )
+
+        finished_records = []
+        while env.engine.has_unfinished_requests():
+            result = env.engine.step_modern()
+            finished_records.extend(result["finished_request_records"])
+
+        requests = {record[0].request_id: record.merge() for record in finished_records}
+        stop_request = requests[0]
+        assert stop_request.generated_tokens == [5, 6, 7]
+        assert len(stop_request.generated_log_probs) == len(stop_request.generated_tokens)
+        assert len(stop_request.generated_top_n_logprobs) == len(
+            stop_request.generated_tokens
+        )
+
+        eos_request = requests[1]
+        assert eos_request.generated_tokens == [5, 6]
+        assert len(eos_request.generated_log_probs) == len(eos_request.generated_tokens)
+        assert len(eos_request.generated_top_n_logprobs) == len(eos_request.generated_tokens)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
     def test_speculative_decoding_logprobs_with_stop_word_trim(self):
         """Test that log probs are correctly trimmed when a stop word lands
         in the middle of a speculative batch.

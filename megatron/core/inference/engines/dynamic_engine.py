@@ -1316,6 +1316,22 @@ class DynamicInferenceEngine(AbstractEngine):
             # generation length or at a stop word inside a speculative batch.
             num_output_trim = num_length_trim + num_stop_word_trim
             if num_output_trim > 0:
+                # A multi-token stop word can span decode steps. In that case,
+                # some corresponding log probabilities have already been
+                # accumulated on the request and must be removed there too.
+                if request_log_probs is not None:
+                    accumulated_trim = max(0, num_stop_word_trim - len(request_log_probs))
+                    if accumulated_trim > 0 and request.generated_log_probs:
+                        request.generated_log_probs = request.generated_log_probs[
+                            :-accumulated_trim
+                        ]
+                if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                    current_top_n = top_n_logprobs[req_idx]
+                    accumulated_trim = max(0, num_stop_word_trim - len(current_top_n))
+                    if accumulated_trim > 0 and request.generated_top_n_logprobs:
+                        request.generated_top_n_logprobs = request.generated_top_n_logprobs[
+                            :-accumulated_trim
+                        ]
                 if request_log_probs is not None:
                     request_log_probs = request_log_probs[:-num_output_trim]
                 if top_n_logprobs is not None and req_idx in top_n_logprobs:
