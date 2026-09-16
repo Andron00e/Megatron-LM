@@ -1544,6 +1544,12 @@ def validate_args(args, defaults={}):
             f"optimizer {args.optimizer!r} would ignore it."
         )
 
+    if args.neutrino_k_long is not None:
+        assert args.neutrino_sketch_side == 'long', (
+            "--neutrino-k-long only applies to the matrices --neutrino-sketch-side long "
+            f"transposes; got --neutrino-sketch-side {args.neutrino_sketch_side!r}."
+        )
+
     # Muon optimizer check
     if 'muon' in args.optimizer:
 
@@ -2985,6 +2991,16 @@ def _add_training_args(parser):
     group.add_argument('--neutrino-no-error-feedback', action='store_true',
                        help='Disable error feedback (drop the off-subspace residual instead '
                        'of folding it back into the next step).')
+    group.add_argument('--neutrino-sketch-side', type=str, default='short',
+                       choices=['short', 'long'],
+                       help="'short' (default) sketches the input side: Y = G V with V N x k, "
+                       'wire tensor M x k. \'long\' transposes any matrix with M > N before '
+                       'sketching, so the sketched dimension is always max(M, N) and every '
+                       'wire tensor is min(M, N) x k (fc1 ships 2.5x fewer bytes at 350m).')
+    group.add_argument('--neutrino-k-long', type=int, default=None,
+                       help='Rank used instead of --neutrino-k on exactly the matrices that '
+                       '--neutrino-sketch-side long transposes (equal-bytes ablation: '
+                       "k' = k * max(M, N) / min(M, N)). Requires --neutrino-sketch-side long.")
     group.add_argument('--neutrino-metrics-interval', type=int, default=50,
                        help='Log Neutrino diagnostic metrics every N steps (0 disables).')
     group.add_argument('--neutrino-dp-projection', action='store_true',

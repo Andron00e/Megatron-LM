@@ -380,6 +380,9 @@ class Neutrino(Optimizer):
         # --- effective-k policy (ablation knob) ---
         k_mode: str = "fixed",  # "fixed" -> use k; "ratio" -> round(k_ratio * min(M,N))
         k_ratio: float = 0.25,  # used when k_mode == "ratio"
+        # --- which side the sketch compresses ---
+        sketch_side: str = "short",  # short (default, = current behavior) | long
+        k_long: Optional[int] = None,  # k for the long-side (transposed) path only
         # --- error feedback ---
         error_feedback: bool = True,  # fold the off-subspace residual back in next step
         # --- metrics gating ---
@@ -411,6 +414,15 @@ class Neutrino(Optimizer):
         self.pg_collection = pg_collection
         self.tp_mode = tp_mode
         self.orth_mode = orth_mode
+        # Y = G V sketches the input side (N -> k), so the wire tensor is M x k and a tall
+        # matrix (fc1: M = 2.5 N) ships 2.5x the bytes of its transpose at the same k.
+        # 'long' transposes such matrices before sketching so the sketched dimension is
+        # always max(M, N) and every wire tensor is min(M, N) x k; k_long, if set, is the
+        # rank used on exactly those transposed matrices (the equal-bytes ablation).
+        assert sketch_side in ("short", "long"), sketch_side
+        assert k_long is None or sketch_side == "long", "k_long needs sketch_side='long'"
+        self.sketch_side = sketch_side
+        self.k_long = k_long
         self.error_feedback = error_feedback
         self.metrics_interval = metrics_interval
         self.dp_projection = dp_projection
@@ -479,6 +491,15 @@ class Neutrino(Optimizer):
             k = group['k']
         # keep at least 1, never exceed the smaller dimension.
         return max(1, min(k, min_dim))
+
+    def _sketch_transposed(self, M_global: int, N_global: int) -> bool:
+        """True when this matrix is sketched as its transpose (see ``sketch_side``)."""
+        return self.sketch_side == "long" and M_global > N_global
+
+    def _k_for_side(self, k_eff: int, transposed: bool, M_global: int, N_global: int) -> int:
+        if transposed and self.k_long is not None:
+            return max(1, min(self.k_long, min(M_global, N_global)))
+        return k_eff
 
     # ------------------------------------------------------------------
     # basis generation
@@ -958,7 +979,13 @@ class Neutrino(Optimizer):
             elif partition_dim == 1:
                 N_global = N * tp_size
 
-        k_eff = self._effective_k(M_global, N_global, group, items=items)
+        transposed = self._sketch_transposed(M_global, N_global)
+        k_eff = self._k_for_side(
+            self._effective_k(M_global, N_global, group, items=items), transposed, M_global, N_global
+        )
+        # Scale modes describe the update of the M x N parameter (spectral is asymmetric in
+        # out/in), so they always see the parameter's own global shape, never the sketched one.
+        scale_out, scale_in = M_global, N_global
 
         expert = bool(_expert_tp)
 
@@ -978,6 +1005,13 @@ class Neutrino(Optimizer):
 
         # --- stack adjusted gradients: [P, M, N] ---
         g_adj = torch.stack([self._g_adj(p, grad, group) for p, grad in items], dim=0)
+
+        # --- long-side sketch: work on G^T, so from here M, N, partition_dim and the
+        # TP path are those of the transposed matrix; update/YV are transposed back below.
+        if transposed:
+            g_adj = g_adj.transpose(-2, -1)
+            M, N, M_global, N_global = N, M, N_global, M_global
+            partition_dim = None if partition_dim is None else 1 - partition_dim
 
         # --- basis [P, N, k_eff], shared across DP, tp_rank folded in for col-shard ---
         bucket_id = self.state[p0]['param_id']
@@ -1025,6 +1059,8 @@ class Neutrino(Optimizer):
 
         update = torch.bmm(U, V.transpose(-2, -1))  # [P, M, N]
         YV = torch.bmm(Y_for_resid, V.transpose(-2, -1))  # [P, M, N]
+        if transposed:
+            g_adj, update, YV = (t.transpose(-2, -1) for t in (g_adj, update, YV))
 
         if self.log_subspace_drift and subspace_values is not None:
             self._track_subspace_drift(items, U, k_eff, M_global, subspace_values)
@@ -1035,7 +1071,7 @@ class Neutrino(Optimizer):
             else None
         )
         scale = get_muon_scale_factor(
-            M_global, N_global, mode=scale_mode, k_eff=k_eff, r_eff=r_eff
+            scale_out, scale_in, mode=scale_mode, k_eff=k_eff, r_eff=r_eff
         )
 
         # --- apply update + write error feedback, per param ---
@@ -1083,7 +1119,12 @@ class Neutrino(Optimizer):
             elif partition_dim == 1:
                 N_global = N * tp_size
 
-        k_eff = self._effective_k(M_global, N_global, group, items=[(p, grad)])
+        transposed = self._sketch_transposed(M_global, N_global)
+        k_eff = self._k_for_side(
+            self._effective_k(M_global, N_global, group, items=[(p, grad)]),
+            transposed, M_global, N_global,
+        )
+        scale_out, scale_in = M_global, N_global
 
         expert = bool(getattr(p, 'expert_tp', False))
 
@@ -1098,6 +1139,10 @@ class Neutrino(Optimizer):
             return
 
         g_adj = self._g_adj(p, grad, group)  # [E, M, N]
+        if transposed:
+            g_adj = g_adj.transpose(-2, -1)
+            M, N, M_global, N_global = N, M, N_global, M_global
+            partition_dim = None if partition_dim is None else 1 - partition_dim
 
         # shared basis across experts of identical shape: a single [N, k] matrix
         # broadcast over the E batch dim via matmul (no stride-0 bmm).
@@ -1140,6 +1185,8 @@ class Neutrino(Optimizer):
 
         update = torch.matmul(U, Vt)  # [E, M, N]
         YV = torch.matmul(Y_for_resid, Vt)  # [E, M, N]
+        if transposed:
+            g_adj, update, YV = (t.transpose(-2, -1) for t in (g_adj, update, YV))
 
         if self.log_subspace_drift and subspace_values is not None:
             # E-batched analog of _track_subspace_drift: one param p, but U stacks E
@@ -1163,7 +1210,7 @@ class Neutrino(Optimizer):
             else None
         )
         scale = get_muon_scale_factor(
-            M_global, N_global, mode=scale_mode, k_eff=k_eff, r_eff=r_eff
+            scale_out, scale_in, mode=scale_mode, k_eff=k_eff, r_eff=r_eff
         )
         p.data.add_(update.to(p.dtype), alpha=-lr * scale)
         self._ef_writeback(p, g_adj, YV)
@@ -1363,6 +1410,8 @@ def get_megatron_neutrino_optimizer(
         orth_mode=config.neutrino_orth_mode,
         k_mode=config.neutrino_k_mode,
         k_ratio=config.neutrino_k_ratio,
+        sketch_side=config.neutrino_sketch_side,
+        k_long=config.neutrino_k_long,
         error_feedback=not config.neutrino_no_error_feedback,
         metrics_interval=config.neutrino_metrics_interval,
         dp_projection=config.neutrino_dp_projection,

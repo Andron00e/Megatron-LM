@@ -344,6 +344,15 @@ class OptimizerConfig:
     neutrino_no_momentum: bool = False
     """Skip allocating the momentum buffer (memory saving; use raw gradients instead)."""
 
+    neutrino_sketch_side: str = 'short'
+    """'short' (default) sketches the input side, Y = G V with V N x k, so the wire tensor
+    is M x k. 'long' transposes any matrix with M > N before sketching so the sketched
+    dimension is always max(M, N) and the wire tensor is min(M, N) x k."""
+
+    neutrino_k_long: Optional[int] = None
+    """Rank used instead of neutrino_k on exactly the matrices the 'long' path transposes
+    (the equal-bytes ablation, k' = k * max(M, N) / min(M, N)). Requires 'long'."""
+
     neutrino_no_error_feedback: bool = False
     """Disable error feedback (drop the off-subspace residual instead of folding it back into
     the next step). Empirically beneficial at low compression ratios in our own sweeps —
