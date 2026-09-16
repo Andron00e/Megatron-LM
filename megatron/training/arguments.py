@@ -2694,7 +2694,9 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-use-nesterov', action='store_true',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
-                       choices=['spectral', 'unit_rms_norm', 'shape_scaling', 'shape_up', 'none'],
+                       choices=['spectral', 'unit_rms_norm', 'shape_scaling', 'shape_up', 'none',
+                                'rank_correct', 'shape_up_rank', 'rank_correct_calibrated',
+                                'rank_correct_saturating'],
                        help='Scale mode for Muon optimizer. With MuP, set '
                        '--muon-scale-mode unit_rms_norm to use unit_rms_norm scaling, '
                        'or set --muon-scale-mode spectral to keep spectral scaling.')
@@ -2949,8 +2951,109 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'md_decoupling'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'md_decoupling',
+                                'neutrino', 'dion', 'neutrinomd'],
                        help='Optimizer function')
+    # ---- Neutrino optimizer (--optimizer neutrino) ----
+    # Communication-efficient Muon: projects the momentum matrix onto a thin k-dim random
+    # basis before any communication happens (see megatron/core/optimizer/neutrino.py).
+    # Reuses --matrix-lr / --muon-momentum / --muon-use-nesterov / --muon-scale-mode /
+    # --min-lr-mode / --muon-lr-factor from the Muon/MDDecoupling flags above.
+    group.add_argument('--neutrino-k', type=int, default=512,
+                       help='Random basis rank k (--neutrino-k-mode fixed). Falls back to '
+                       'full-rank Newton-Schulz (== Muon) whenever k >= min(M, N).')
+    group.add_argument('--neutrino-k-mode', type=str, default='fixed',
+                       choices=['fixed', 'ratio'],
+                       help="'fixed' uses --neutrino-k directly; 'ratio' sets "
+                       'k = round(neutrino_k_ratio * min(M, N)) per parameter shape.')
+    group.add_argument('--neutrino-k-ratio', type=float, default=0.25,
+                       help='Effective-rank ratio used when --neutrino-k-mode ratio.')
+    group.add_argument('--neutrino-basis-init', type=str, default='gaussian',
+                       choices=['gaussian', 'rademacher', 'uniform', 'orthonormal'],
+                       help='Random basis distribution for Neutrino.')
+    group.add_argument('--neutrino-orth-mode', type=str, default='cholesky_qr',
+                       choices=['cholesky_qr', 'polar'],
+                       help="How to orthonormalize the thin projection Y. 'cholesky_qr' "
+                       '(default) takes the QR factor Q of Y, which spans the right column '
+                       "space but achieves alignment tr(R) instead of the optimum ||R||_*. "
+                       "'polar' appends the exact k*k polar correction, polar(Y) = Q polar(R), "
+                       'which is the only factor that solves the subspace-restricted spectral '
+                       'LMO. Measured tr(R)/||R||_* on real 350m momentum: median 0.814 at '
+                       'k=256, 0.741 at k=512.')
+    group.add_argument('--neutrino-no-momentum', action='store_true',
+                       help='Skip allocating the Neutrino momentum buffer.')
+    group.add_argument('--neutrino-no-error-feedback', action='store_true',
+                       help='Disable error feedback (drop the off-subspace residual instead '
+                       'of folding it back into the next step).')
+    group.add_argument('--neutrino-metrics-interval', type=int, default=50,
+                       help='Log Neutrino diagnostic metrics every N steps (0 disables).')
+    group.add_argument('--neutrino-dp-projection', action='store_true',
+                       help='Replace the dense data-parallel gradient all-reduce with an '
+                       'all-reduce of the thin projected Y (the actual communication-saving '
+                       'path). Requires the replicated (non-layer-wise, non-distributed) DP '
+                       'path and --clip-grad 0.0.')
+    group.add_argument('--neutrino-dp-wire-bf16', action='store_true',
+                       help='Send the thin Y in bf16 instead of fp32 during the DP exchange. Halves realized DP traffic; the fp32 is needed for Cholesky-QR conditioning, not for transport, and the dense gradient it replaces is itself bf16.')
+    group.add_argument('--neutrino-log-subspace-drift', action='store_true',
+                       help='Diagnostic only (no effect on the update): log step-to-step '
+                       'subspace overlap of the realized thin projection U against the '
+                       'analytically-expected chance-level overlap for random subspaces.')
+    group.add_argument('--neutrino-subspace-drift-interval', type=int, default=50,
+                       help='Host-sync cadence in steps for --neutrino-log-subspace-drift '
+                       '(the overlap is computed every step regardless; this only batches '
+                       'the wandb flush).')
+    # ---- Neutrino algorithmic variants (see _research/variants/neutrino_variants.py) ----
+    group.add_argument('--neutrino-variant', type=str, default='base',
+                       choices=['base', 'srht', 'ef21', 'kschedule', 'perlayerk', 'powersgd',
+                                'signmuon', 'dion2', 'cycle', 'quant'],
+                       help="Select a Neutrino subclass from _research/variants/. 'base' "
+                       '(default) is the unmodified optimizer above.')
+    group.add_argument('--neutrino-k-schedule-start-k', type=int, default=None,
+                       help='neutrino-variant=kschedule only: k at step 0.')
+    group.add_argument('--neutrino-k-schedule-end-k', type=int, default=None,
+                       help='neutrino-variant=kschedule only: k once the ramp finishes.')
+    group.add_argument('--neutrino-k-schedule-total-steps', type=int, default=None,
+                       help='neutrino-variant=kschedule only: steps over which k ramps.')
+    group.add_argument('--neutrino-k-schedule-style', type=str, default=None,
+                       choices=['linear', 'cosine'],
+                       help='neutrino-variant=kschedule only: ramp shape.')
+    group.add_argument('--neutrino-layer-k-overrides', type=str, default=None,
+                       help="neutrino-variant=perlayerk only: e.g. 'attention=512,mlp=128'.")
+    group.add_argument('--neutrino-scale-mode', type=str, default=None,
+                       choices=['spectral', 'unit_rms_norm', 'shape_scaling', 'shape_up', 'none',
+                                'rank_correct', 'shape_up_rank', 'rank_correct_calibrated',
+                                'rank_correct_saturating', 'mirror'],
+                       help='Scale mode for Neutrino\'s OWN compressed-branch reconstruction '
+                       '(currently used by NeutrinoMD). Deliberately separate from '
+                       '--muon-scale-mode: that flag drives a DIFFERENT scale-factor function '
+                       '(MuonMD\'s/Muon\'s full-rank Newton-Schulz branch) with no '
+                       'rank-correction term, so reusing it for the compressed branch silently '
+                       'under-scales the update by ~sqrt(min(M,N)/k) -- e.g. 2x at this '
+                       "project's k/min_dim=0.25 convention. Default None lets the consumer "
+                       "pick its own appropriate default (NeutrinoMD defaults to "
+                       "'rank_correct_calibrated') rather than silently borrowing "
+                       '--muon-scale-mode\'s value.')
+    # ---- NeutrinoMD optimizer (--optimizer neutrinomd) ----
+    # First-pass hybrid: MDDecoupling (MuonMD, arXiv:2606.25971) with Neutrino's
+    # random-projection + Cholesky-QR + error-feedback substituted for Newton-Schulz in
+    # the direction/orthogonalization branch (see _research/variants/neutrinomd.py).
+    # Reuses all --hypersphere-*/--gain-*/--muon-momentum/--matrix-lr flags from the
+    # MDDecoupling section below, AND the --neutrino-k/-k-mode/-k-ratio/-no-error-feedback
+    # and --muon-scale-mode flags above -- there is no separate --neutrinomd-* flag
+    # namespace; only --optimizer neutrinomd itself picks this class over MDDecoupling.
+    # ---- Dion optimizer (--optimizer dion) ----
+    # Warm-started, power-iterated low-rank orthonormalized update (arXiv:2504.05295). Reuses
+    # --matrix-lr / --muon-lr-factor / --min-lr-mode from the Muon/MDDecoupling flags above.
+    group.add_argument('--dion-mu', type=float, default=0.95,
+                       help='Error-feedback retention factor for Dion: the momentum buffer is '
+                       'reduced by (1 - dion_mu) times the reconstructed low-rank part each step.')
+    group.add_argument('--dion-rank', type=int, default=256,
+                       help='Dion low-rank basis dimension (clamped to min(M, N) per shape).')
+    group.add_argument('--dion-eps', type=float, default=1e-8,
+                       help='Numerical epsilon for Dion basis column-normalization.')
+    group.add_argument('--dion-dp-projection', action='store_true',
+                       help='Reserved for symmetry with --neutrino-dp-projection; not yet '
+                       'wired to a DDP-level skip hook, so this flag is currently a no-op.')
     # ---- MDDecoupling optimizer (--optimizer md_decoupling) ----
     # Magnitude-direction decoupling: hypersphere normalization (direction) + learnable per-axis
     # gains (magnitude) + optional Muon orthogonalized updates. Reuses --adam-beta1/--adam-beta2/

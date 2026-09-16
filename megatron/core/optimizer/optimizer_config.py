@@ -310,6 +310,148 @@ class OptimizerConfig:
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
     One of 'adam' or 'lion'. Defaults to 'adam'."""
 
+    ###################################################################################
+    # Neutrino (communication-efficient Muon): projects the momentum matrix onto a thin
+    # k-dimensional random basis regenerated locally from a shared seed before any
+    # communication happens, exchanges only the thin projection, and preserves the
+    # unprojected residual as error feedback. Reuses matrix_lr / muon_momentum /
+    # muon_use_nesterov / muon_scale_mode / min_lr_mode from the Muon/MDDecoupling fields
+    # above; see megatron/core/optimizer/neutrino.py for the full algorithm.
+    ###################################################################################
+    neutrino_k: int = 512
+    """Random basis rank k (used when neutrino_k_mode == 'fixed'). Falls back to full-rank
+    Newton-Schulz (bit-identical to Muon) whenever k >= min(M, N) for a given matrix."""
+
+    neutrino_k_mode: str = 'fixed'
+    """'fixed' uses neutrino_k directly; 'ratio' sets k = round(neutrino_k_ratio * min(M, N))
+    per parameter shape."""
+
+    neutrino_k_ratio: float = 0.25
+    """Effective-rank ratio used when neutrino_k_mode == 'ratio'."""
+
+    neutrino_basis_init: str = 'gaussian'
+    """Random basis distribution: 'gaussian' (default), 'rademacher', 'uniform', or
+    'orthonormal' (Haar-random via QR)."""
+
+    neutrino_orth_mode: str = 'cholesky_qr'
+    """Orthonormalization of the thin projection Y. 'cholesky_qr' (default) is the
+    historical path: U = Y L^-T, the QR factor, whose update alignment is tr(R) with
+    R = L^T. 'polar' right-multiplies by the exact k*k polar factor of R so the update
+    attains ||R||_*, the true subspace-restricted spectral LMO value. The gap is
+    (tr(R)/||R||_*)^2 in guaranteed per-step decrease and is scale-invariant, so no
+    learning rate or scale mode can absorb it."""
+
+    neutrino_no_momentum: bool = False
+    """Skip allocating the momentum buffer (memory saving; use raw gradients instead)."""
+
+    neutrino_no_error_feedback: bool = False
+    """Disable error feedback (drop the off-subspace residual instead of folding it back into
+    the next step). Empirically beneficial at low compression ratios in our own sweeps —
+    do not assume the intuitive crossover point without re-testing."""
+
+    neutrino_scale_mode: Optional[str] = None
+    """Muon scale_mode string for Neutrino's OWN compressed-branch reconstruction
+    (currently consumed by NeutrinoMD; distinct from --muon-scale-mode, which
+    drives MuonMD's/Muon's full-rank Newton-Schulz branch). None lets the
+    consumer pick its own Neutrino-appropriate default (NeutrinoMD defaults to
+    'rank_correct_calibrated') rather than silently inheriting whatever
+    muon_scale_mode happens to be tuned to for a DIFFERENT scale-factor
+    function with no rank-correction term -- conflating the two caused a
+    silent ~2x under-scaling of NeutrinoMD's compressed branch in the first
+    real-sweep pass (see variant-ablation-report.md §6)."""
+
+    neutrino_metrics_interval: int = 50
+    """Log diagnostic metrics (error/update/orthogonality ratios, comm-savings) every N steps.
+    0 disables. Diagnostics are accumulated on-device with a single host sync at log time."""
+
+    neutrino_dp_projection: bool = False
+
+    neutrino_dp_wire_bf16: bool = False
+    """Send the thin Y in bf16 rather than fp32. Y is built in fp32 because Cholesky-QR
+    on the k x k Gram is ill-conditioned in bf16, but that constrains the FACTORIZATION,
+    not the transport. The dense gradient this exchange replaces is bf16 in Megatron's
+    grad buffer, so fp32-on-the-wire moves twice the bytes of the thing it stands in for.
+    Halves realized DP traffic; default False preserves prior behaviour."""
+    """Replace Megatron's dense data-parallel gradient all-reduce with an all-reduce of the
+    thin projected Y for Neutrino-managed params — this is the actual communication-saving
+    path (without it, DDP still all-reduces the dense gradient regardless of k). Requires the
+    replicated (non-layer-wise) all-reduce DP path: do NOT combine with
+    --use-layer-wise-distributed-optimizer, and pass --clip-grad 0.0."""
+
+    neutrino_log_subspace_drift: bool = False
+    """Diagnostic only, no effect on the update: log the subspace overlap between this step's
+    and the previous step's orthonormalized U (the realized thin projection) for every
+    low-rank-compressed bucket, alongside the analytically-expected overlap for two
+    independent random k-dim subspaces of R^M (k_eff / M). Tests whether Neutrino's realized
+    subspace drifts slower than chance despite the basis V being freshly random every step —
+    the premise a PowerSGD-style warm-started basis would need to hold before it's worth the
+    added communication (see researchtools/scratchpad/neutrino-scratch/
+    brainstorm-neutrino-improvements.md, section 4)."""
+
+    neutrino_subspace_drift_interval: int = 50
+    """Host-sync cadence (in steps) for --neutrino-log-subspace-drift. The overlap itself is
+    computed every step (cheap: one extra batched matmul+trace on already-computed U, no new
+    device syncs); this only controls how often the buffered per-step values are flushed to
+    wandb in a single sync, mirroring neutrino_metrics_interval's gating rationale."""
+
+    ###################################################################################
+    # Neutrino algorithmic variants (see _research/variants/neutrino_variants.py and
+    # researchtools/scratchpad/neutrino-scratch/brainstorm-neutrino-improvements.md §2 /
+    # powersgd-muon-hybrid-design.md). 'base' (default) is the unmodified Neutrino class
+    # above; any other value selects a Neutrino subclass from _research/variants/'s
+    # VARIANT_REGISTRY, resolved lazily so this file has no load-time dependency on
+    # _research/ being on PYTHONPATH (falls back to 'base' with a warning if not found).
+    ###################################################################################
+    neutrino_variant: str = 'base'
+    """'base' | 'srht' | 'ef21' | 'kschedule' | 'perlayerk' | 'powersgd'. See
+    _research/variants/neutrino_variants.py for what each does."""
+
+    neutrino_k_schedule_start_k: Optional[int] = None
+    """neutrino_variant=kschedule only: k at step 0. None uses the class default (32)."""
+
+    neutrino_k_schedule_end_k: Optional[int] = None
+    """neutrino_variant=kschedule only: k once the schedule finishes ramping. None uses the
+    class default (256)."""
+
+    neutrino_k_schedule_total_steps: Optional[int] = None
+    """neutrino_variant=kschedule only: steps over which k ramps from start to end (then
+    holds at end_k). None uses the class default (2000)."""
+
+    neutrino_k_schedule_style: Optional[str] = None
+    """neutrino_variant=kschedule only: 'linear' or 'cosine'. None uses the class default
+    ('linear')."""
+
+    neutrino_layer_k_overrides: Optional[str] = None
+    """neutrino_variant=perlayerk only: compact per-layer-type k spec, e.g.
+    'attention=512,mlp=128'. Layer type is inferred from param name substring
+    ('self_attention'/'attention' -> 'attention', 'mlp'/'linear_fc' -> 'mlp') at optimizer
+    construction time; anything untagged falls back to the global neutrino_k/k_ratio."""
+
+    neutrino_ef_variant: Optional[str] = None
+    """neutrino_variant=ef21 only: reserved for future EF21 sub-variants; currently unused
+    (NeutrinoEF21's behavior is fixed) but threaded through for forward compatibility."""
+
+    ###################################################################################
+    # Dion: a warm-started, power-iterated low-rank orthonormalized update (arXiv:2504.05295).
+    # Unlike Neutrino's fresh-random-basis-per-step design, Dion maintains a persistent basis Q
+    # refined by one power-iteration step per training step, giving a higher-fidelity subspace
+    # per rank at the cost of Q being real optimizer state. Reuses matrix_lr / min_lr_mode from
+    # the Muon/MDDecoupling fields above. See megatron/core/optimizer/dion.py.
+    ###################################################################################
+    dion_mu: float = 0.95
+    """Error-feedback retention factor: after projecting, the momentum buffer is reduced by
+    (1 - dion_mu) times the reconstructed low-rank part each step."""
+
+    dion_rank: int = 256
+    """Low-rank basis dimension (clamped to min(M, N) per parameter shape)."""
+
+    dion_eps: float = 1e-8
+    """Numerical epsilon for the column-normalization step when refreshing the basis."""
+
+    dion_dp_projection: bool = False
+    """Reserved for symmetry with --neutrino-dp-projection; not yet wired to a DDP-level skip
+    hook in this tree, so leaving this False is always safe (just not communication-optimal)."""
+
     # Lion.
     lion_beta1: float = 0.95
     """First beta coefficient for Lion optimizer (used in sign update). Defaults to 0.95."""

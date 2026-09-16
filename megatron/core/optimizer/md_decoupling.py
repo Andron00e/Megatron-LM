@@ -1491,6 +1491,17 @@ class MDDecoupling(_MDDecouplingBase):
                 if col is not None and partition_dim == 0:  # col gains sync only when col-sharded.
                     torch.distributed.all_reduce(gain_grads["col_gain"], group=tp_group)
 
+        # Optional data-parallel reduction of the gain grads. Default absent -> no-op, so
+        # nothing changes for plain MDDecoupling. NeutrinoMD installs it when the DDP grad
+        # buffer has been told to skip this param's dense DP reduction: the direction
+        # branch then gets the averaged signal through its thin projection, but these gain
+        # grads are built from the rank-local p.grad and would otherwise never be averaged,
+        # leaving magnitude and direction on different gradients. Averaging the sums is
+        # equivalent to averaging p.grad first, since gain_grads are linear in it.
+        dp_hook = getattr(self, "_gain_grads_dp_hook", None)
+        if dp_hook is not None:
+            dp_hook(gain_grads, p)
+
         # Chain rule: ∂L/∂g = phi'(g) · ∂L/∂phi(g). For "direct" phi'≡1 and _phi_prime returns
         # the scalar 1.0; skip the multiply.
         if self.gain_parametrization != "direct":
@@ -1818,6 +1829,10 @@ def get_megatron_mddecoupling_optimizer(
     use_gloo_process_groups: bool = True,
     layer_wise_distributed_optimizer: bool = False,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    # optimizer_cls/extra_optimizer_kwargs: behavior-preserving hook for subclasses like
+    # NeutrinoMD in _research/variants/neutrinomd.py -- None reproduces upstream behavior.
+    optimizer_cls: Optional[type] = None,
+    extra_optimizer_kwargs: Optional[dict] = None,
 ) -> MegatronOptimizer:
     """Build the MDDecoupling optimizer for the given model chunks.
 
@@ -2047,7 +2062,11 @@ def get_megatron_mddecoupling_optimizer(
         expert_param_groups = [g for g in md_param_groups if g['is_expert_parallel']]
         md_param_groups = [g for g in md_param_groups if not g['is_expert_parallel']]
 
-    optimizer = MDDecoupling(md_param_groups, **md_kwargs)
+    if optimizer_cls is None:
+        optimizer_cls = MDDecoupling
+    if extra_optimizer_kwargs:
+        md_kwargs.update(extra_optimizer_kwargs)
+    optimizer = optimizer_cls(md_param_groups, **md_kwargs)
 
     reset_config_bf16 = False
     if config.bf16:
@@ -2064,7 +2083,7 @@ def get_megatron_mddecoupling_optimizer(
     optimizers.append(optimizer)
 
     if len(expert_param_groups) > 0:
-        expert_optimizer = MDDecoupling(expert_param_groups, **md_kwargs)
+        expert_optimizer = optimizer_cls(expert_param_groups, **md_kwargs)
         if config.bf16:
             expert_optimizer = Float16OptimizerWithFloat16Params(
                 expert_optimizer, config, None, _md_init_state_fn

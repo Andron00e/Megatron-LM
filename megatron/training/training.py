@@ -184,6 +184,12 @@ from megatron.core.enums import ModelType
 from megatron.core.optimizer import get_megatron_optimizer, AdamOptimizerConfig, SGDOptimizerConfig, OptimizerConfig, ParamKey
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_optimizer
+from megatron.core.optimizer.neutrino import get_megatron_neutrino_optimizer
+from megatron.core.optimizer.dion import get_megatron_dion_optimizer
+try:
+    from _research.variants.neutrinomd import get_megatron_neutrinomd_optimizer
+except ImportError:
+    get_megatron_neutrinomd_optimizer = None
 from megatron.core.optimizer.muon_logging import (
     collect_md_gain_stats,
     collect_muon_stats,
@@ -1669,7 +1675,8 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     """Return a Megatron optimizer config object from Megatron's arguments."""
 
     config = None
-    if args.optimizer == 'adam' or 'muon' in args.optimizer or args.optimizer == 'md_decoupling':
+    if (args.optimizer == 'adam' or 'muon' in args.optimizer or args.optimizer == 'md_decoupling'
+            or args.optimizer in ('neutrino', 'dion', 'neutrinomd')):
         # TODO(deyuf): Muon needs both adam + muon but get() only receive one config
         # So for now we keep using adam config that's back compat with old way.
         # md_decoupling likewise chains an external Adam, so it reuses AdamOptimizerConfig.
@@ -1736,6 +1743,34 @@ def setup_model_and_optimizer(
 
         if config.optimizer == 'md_decoupling':
             optimizer = get_megatron_mddecoupling_optimizer(
+                config,
+                model,
+                config_overrides=config_overrides,
+                use_gloo_process_groups=args.use_gloo_process_groups,
+                layer_wise_distributed_optimizer=config.use_layer_wise_distributed_optimizer,
+            )
+        elif config.optimizer == 'neutrino':
+            optimizer = get_megatron_neutrino_optimizer(
+                config,
+                model,
+                config_overrides=config_overrides,
+                use_gloo_process_groups=args.use_gloo_process_groups,
+                layer_wise_distributed_optimizer=config.use_layer_wise_distributed_optimizer,
+            )
+        elif config.optimizer == 'dion':
+            optimizer = get_megatron_dion_optimizer(
+                config,
+                model,
+                config_overrides=config_overrides,
+                use_gloo_process_groups=args.use_gloo_process_groups,
+                layer_wise_distributed_optimizer=config.use_layer_wise_distributed_optimizer,
+            )
+        elif config.optimizer == 'neutrinomd':
+            assert get_megatron_neutrinomd_optimizer is not None, (
+                '_research/variants not on PYTHONPATH; neutrinomd optimizer unavailable. '
+                'See _research/variants/neutrinomd.py.'
+            )
+            optimizer = get_megatron_neutrinomd_optimizer(
                 config,
                 model,
                 config_overrides=config_overrides,

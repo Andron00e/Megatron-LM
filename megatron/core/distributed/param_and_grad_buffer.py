@@ -49,6 +49,107 @@ except:
 import megatron.core.nccl_allocator as nccl_allocator
 
 
+# ---------------------------------------------------------------------------------
+# DP-projection skip (Neutrino family)
+#
+# A compressing optimizer takes over the data-parallel reduction for the matrix params
+# it owns: instead of this buffer all-reducing the dense gradient, the optimizer
+# all-reduces a thin projection Y = G V. Projection is linear and V is DP-shared, so
+# avg_DP(G V) == avg_DP(G) V and the result is mathematically identical to reducing G
+# first -- it only moves the collective from O(MN) to O(Mk) bytes.
+#
+# The optimizer signals which params it owns by tagging them (see
+# `mark_dp_projected` in megatron/core/optimizer/neutrino.py). This buffer then
+# all-reduces only the ranges of each bucket NOT covered by a tagged param. Keying off
+# the tag rather than a config flag is deliberate: it needs no plumbing, works for any
+# optimizer in the family (Neutrino, NeutrinoMD, variants) without this file knowing
+# about them, and is a bit-identical no-op whenever nothing is tagged.
+DP_PROJECTED_ATTR = 'neutrino_managed'
+
+
+class _DPProjectionStats:
+    """Realized byte counts for the DP-projection skip.
+
+    Measured from the slices this buffer actually did or did not hand to NCCL, so a
+    reported saving reflects collectives that really were elided. Read and reset by
+    the optimizer's metrics block.
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """Zero all counters."""
+        self.skipped_bytes = 0
+        self.reduced_bytes = 0
+        self.syncs = 0
+
+    def snapshot(self) -> dict:
+        """Current counters as a plain dict."""
+        return {
+            'skipped_bytes': self.skipped_bytes,
+            'reduced_bytes': self.reduced_bytes,
+            'syncs': self.syncs,
+        }
+
+
+DP_PROJECTION_STATS = _DPProjectionStats()
+
+
+def _assert_ranges_agree_across_ranks(signature: int, group) -> None:
+    """Fail loudly if ranks disagree about which gradient ranges to reduce.
+
+    Every rank must issue the same collectives in the same order; if the tag were applied
+    per-rank -- which is what happens if an optimizer tags from sharded param_groups
+    rather than from the model -- ranks would emit different numbers of all-reduces and
+    NCCL would hang with no diagnostic. One min/max reduction on a scalar, once, buys a
+    readable error instead of a wedged multi-node job.
+    """
+    device = torch.cuda.current_device() if torch.cuda.is_available() else None
+    probe = torch.tensor([signature], dtype=torch.int64, device=device)
+    lo = probe.clone()
+    hi = probe.clone()
+    torch.distributed.all_reduce(lo, op=torch.distributed.ReduceOp.MIN, group=group)
+    torch.distributed.all_reduce(hi, op=torch.distributed.ReduceOp.MAX, group=group)
+    if lo.item() != hi.item():
+        raise RuntimeError(
+            "DP-projection: ranks disagree on which gradient ranges are optimizer-owned "
+            f"(this rank's signature {signature}, group range [{lo.item()}, {hi.item()}]). "
+            "The tag must be applied to the model's params identically on every rank -- "
+            "tagging from a sharded optimizer's param_groups (e.g. the layer-wise "
+            "distributed optimizer) produces exactly this mismatch."
+        )
+
+
+def _unprojected_ranges(bucket) -> List[Tuple[int, int]]:
+    """Bucket-local [start, end) ranges whose gradients this buffer must still reduce.
+
+    The complement of the tagged params' ranges, with adjacent survivors merged so a
+    contiguous run costs one collective rather than one per param. Returns the whole
+    bucket when nothing is tagged, and [] when everything is.
+    """
+    total = bucket.grad_data.numel()
+    spans = sorted(
+        bucket.param_to_index[p]
+        for p in bucket.params_list
+        if getattr(p, DP_PROJECTED_ATTR, False)
+    )
+    if not spans:
+        return [(0, total)]
+    ranges: List[Tuple[int, int]] = []
+    cursor = 0
+    for start, end in spans:
+        if start > cursor:
+            ranges.append((cursor, start))
+        cursor = max(cursor, end)
+    # Trailing remainder, including this bucket's alignment padding. Padding is zero and
+    # reducing zeros is harmless, so it rides along with the last real range rather than
+    # costing its own collective.
+    if cursor < total:
+        ranges.append((cursor, total))
+    return ranges
+
+
 class BufferType(Enum):
     """
     Enumeration for buffer type.
@@ -666,6 +767,64 @@ class _ParamAndGradBucketGroup:
                 check_for_large=self.ddp_config.check_for_large_grads,
             )
 
+        # Has a compressing optimizer claimed any param in this bucket group? Recomputed
+        # per call rather than cached: the tag is applied when the optimizer is built,
+        # which for some construction orders is after the buffers exist. The scan is over
+        # a few hundred params and is nothing next to the collective that follows.
+        dp_projected = any(
+            getattr(param, DP_PROJECTED_ATTR, False)
+            for bucket in self.buckets
+            for param in bucket.params_list
+        )
+        if dp_projected:
+            # Each of these would corrupt gradients silently rather than fail, so they are
+            # hard errors. The optimizer's own validate_args refuses the same combinations,
+            # but this buffer is reached by paths that do not go through it.
+            if self.ddp_config.use_distributed_optimizer and not force_all_reduce:
+                raise RuntimeError(
+                    "DP-projected params require the replicated all-reduce path, but "
+                    "use_distributed_optimizer=True selects reduce-scatter, which hands each "
+                    "rank a shard of the bucket rather than the whole gradient. Drop "
+                    "--use-distributed-optimizer / --use-layer-wise-distributed-optimizer."
+                )
+            if not self.ddp_config.average_in_collective:
+                raise RuntimeError(
+                    "DP-projected params require --ddp-average-in-collective. Without it the "
+                    "reduced params are scaled by gradient_scaling_factor before the SUM while "
+                    "the skipped ones are not, so the two groups end up on different scales."
+                )
+            if self.ddp_config.num_distributed_optimizer_instances > 1:
+                raise RuntimeError(
+                    "DP-projected params do not support num_distributed_optimizer_instances > 1: "
+                    "expert params then carry gradient_scaling_factor != 1, which pre-scales a "
+                    "gradient this buffer never reduces."
+                )
+            for bucket in self.buckets:
+                projected = [p for p in bucket.params_list if getattr(p, DP_PROJECTED_ATTR, False)]
+                if bucket.gradient_scaling_factor != 1.0 and projected:
+                    # The expert buffer legitimately carries expt_dp/dp_cp (0.25 at EP=8, DP*CP=32)
+                    # under average_in_collective. These gradients ARE reduced -- not by DDP, but by
+                    # the optimizer's dp_average_ with ReduceOp.AVG over the SAME expert-DP group, so
+                    # the pre-scale composes with that average onto Megatron's 1/dp_cp convention
+                    # exactly as DDP's own path would. Blanket-rejecting a non-unit factor here made
+                    # every MoE dp-projection run die at the first step (jobs 3405078/3405079).
+                    #
+                    # Do NOT "fix" this by forcing expert_gradient_scaling_factor to 1.0: that leaves
+                    # expert gradients dp_cp/expt_dp times hot, and because the update is
+                    # orthogonalized the error is invisible in the loss curve.
+                    # Expert-ness is DERIVED, not an attribute: DDP itself computes it as
+                    # `not getattr(param, 'allreduce', True)` (distributed_data_parallel.py:596).
+                    # A getattr(p, 'is_expert_parallel', False) here is always False and turns this
+                    # guard back into the blanket rejection it replaced.
+                    if not all(not getattr(p, 'allreduce', True) for p in projected):
+                        raise RuntimeError(
+                            f"bucket {bucket.bucket_id} holds non-expert DP-projected params but "
+                            f"has gradient_scaling_factor={bucket.gradient_scaling_factor}; the "
+                            "in-place pre-scale below would apply to gradients that are never "
+                            "reduced."
+                        )
+            DP_PROJECTION_STATS.syncs += 1
+
         # gradient_scaling_factor already takes into account whether we are computing
         # an average or sum in the data-parallel collective.
         for bucket in self.buckets:
@@ -711,6 +870,16 @@ class _ParamAndGradBucketGroup:
         else:
             communication_group = self.data_parallel_group
 
+        if dp_projected and not getattr(self, '_dp_projection_checked', False):
+            # Once per bucket group, before the first skipped reduction.
+            signature = 1469598103934665603
+            for bucket in self.buckets:
+                for start, end in _unprojected_ranges(bucket):
+                    for value in (bucket.bucket_id, start, end):
+                        signature = (signature * 1099511628211 + value) % (2**62)
+            _assert_ranges_agree_across_ranks(signature, communication_group)
+            self._dp_projection_checked = True
+
         # Coalesce communication kernels across buckets in the bucket group.
         grad_reduce_handle = None
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
@@ -739,9 +908,30 @@ class _ParamAndGradBucketGroup:
                         logger.info(
                             f"Performing reduction using all_reduce because {force_all_reduce=}"
                         )
-                    torch.distributed.all_reduce(
-                        bucket.grad_data, op=reduce_op, group=communication_group, async_op=async_op
-                    )
+                    if not dp_projected:
+                        torch.distributed.all_reduce(
+                            bucket.grad_data,
+                            op=reduce_op,
+                            group=communication_group,
+                            async_op=async_op,
+                        )
+                    else:
+                        # Reduce only what the optimizer has not claimed. A bucket whose
+                        # params are all projected issues no collective at all.
+                        itemsize = bucket.grad_data.element_size()
+                        reduced = 0
+                        for start, end in _unprojected_ranges(bucket):
+                            torch.distributed.all_reduce(
+                                bucket.grad_data[start:end],
+                                op=reduce_op,
+                                group=communication_group,
+                                async_op=async_op,
+                            )
+                            reduced += end - start
+                        DP_PROJECTION_STATS.reduced_bytes += reduced * itemsize
+                        DP_PROJECTION_STATS.skipped_bytes += (
+                            bucket.grad_data.numel() - reduced
+                        ) * itemsize
 
         # perform reduce of cpu grad outside the coalescing manager
         for bucket in self.buckets:

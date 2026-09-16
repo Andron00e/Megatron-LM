@@ -1,6 +1,6 @@
 [submodule "_research"]
 	path = _research
-	url = git@github.com:swiss-ai/pretrain.git
+	url = https://github.com/swiss-ai/pretrain.git
 	branch = apertus-2-pretrain-ablations
 	# Don't flag local edits / generated files inside the submodule (configs are
 	# edited independently, and packages/ + results/ live here). Megatron status
