@@ -1,7 +1,7 @@
 [submodule "_research"]
 	path = _research
-	url = https://github.com/swiss-ai/pretrain.git
-	branch = apertus-2-pretrain-ablations
+	url = https://github.com/Andron00e/pretrain.git
+	branch = neutrino
 	# Don't flag local edits / generated files inside the submodule (configs are
 	# edited independently, and packages/ + results/ live here). Megatron status
 	# still shows when _research points at a new commit (time to bump the pin).
