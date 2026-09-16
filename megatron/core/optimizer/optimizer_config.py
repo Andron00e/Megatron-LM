@@ -467,6 +467,10 @@ class OptimizerConfig:
     dion_eps: float = 1e-8
     """Numerical epsilon for the column-normalization step when refreshing the basis."""
 
+    dion_orth: str = 'colnorm'
+    """How the refreshed basis R = M^T P is turned into Q: 'colnorm' (Dion, unit columns) or
+    'qr' (Orth-Dion, arXiv:2605.16341, orthonormal columns via reduced QR)."""
+
     dion_dp_projection: bool = False
     """Reserved for symmetry with --neutrino-dp-projection; not yet wired to a DDP-level skip
     hook in this tree, so leaving this False is always safe (just not communication-optimal)."""

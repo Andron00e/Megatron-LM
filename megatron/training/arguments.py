@@ -3085,6 +3085,9 @@ def _add_training_args(parser):
                        help='Dion low-rank basis dimension (clamped to min(M, N) per shape).')
     group.add_argument('--dion-eps', type=float, default=1e-8,
                        help='Numerical epsilon for Dion basis column-normalization.')
+    group.add_argument('--dion-orth', type=str, default='colnorm', choices=['colnorm', 'qr'],
+                       help='Basis refresh for Dion: colnorm (column-normalize R, the original) '
+                       'or qr (orthonormalize R via reduced QR; Orth-Dion, arXiv:2605.16341).')
     group.add_argument('--dion-dp-projection', action='store_true',
                        help='Reserved for symmetry with --neutrino-dp-projection; not yet '
                        'wired to a DDP-level skip hook, so this flag is currently a no-op.')

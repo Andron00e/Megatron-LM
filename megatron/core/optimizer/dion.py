@@ -24,7 +24,8 @@ Per (batched) parameter of shape [M, N] with rank k:
   3. Orthonormalize P via QR (this step's U-like factor)
   4. Error feedback: M_buf -= (1 - mu) * P @ R^T  (subtract the part now captured; see below for R)
   5. R = M_buf^T @ P (after step 4's subtraction — mirrors the reference implementation's ordering)
-  6. Q <- column-normalize(R)  (the new, refined basis for *next* step's projection)
+  6. Q <- column-normalize(R)  (the new, refined basis for *next* step's projection); with
+     orth='qr' (Orth-Dion, arXiv:2605.16341) Q <- qr(R) instead, so Q has orthonormal columns
   7. Apply the weight update: W -= lr * shape_scale * (P @ Q^T)   (using the JUST-refreshed Q)
 
 Communication (default / safe mode, matching neutrino.py's non-dp_projection default): this
@@ -92,11 +93,13 @@ class Dion(Optimizer):
         dp_projection: bool = False,
         pg_collection: Optional[Any] = None,
         tp_mode: str = "duplicated",
+        orth: str = "colnorm",
     ) -> None:
         defaults = dict(lr=lr, mu=mu, weight_decay=weight_decay, rank=rank, eps=eps)
         super().__init__(params, defaults)
         self.pg_collection = pg_collection
         self.tp_mode = tp_mode
+        self.orth = orth
         self.dp_projection = dp_projection
         self._global_step = 0
 
@@ -226,8 +229,11 @@ class Dion(Optimizer):
         M.add_(mm(P32, R.transpose(-2, -1)), alpha=-(1 - mu))  # error feedback (in-place)
 
         R32 = R.to(torch.float32)
-        denom = R32.norm(dim=-2, keepdim=True) + eps
-        Q.copy_(R32 / denom)  # refreshed basis for next step
+        if self.orth == 'qr':
+            Q.copy_(torch.linalg.qr(R32)[0])  # Orth-Dion: orthonormal columns, not unit columns
+        else:
+            denom = R32.norm(dim=-2, keepdim=True) + eps
+            Q.copy_(R32 / denom)  # refreshed basis for next step
 
         m_dim, n_dim = X.shape[-2], X.shape[-1]
         scale = _shape_scale(m_dim, n_dim)
@@ -374,6 +380,7 @@ def get_megatron_dion_optimizer(
         dp_projection=config.dion_dp_projection,
         pg_collection=pg_collection,
         tp_mode='duplicated',
+        orth=config.dion_orth,
     )
 
     for param in nonlinear_params:
