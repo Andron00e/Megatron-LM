@@ -383,10 +383,13 @@ class Neutrino(Optimizer):
         # --- which side the sketch compresses ---
         sketch_side: str = "short",  # short (default, = current behavior) | long
         k_long: Optional[int] = None,  # k for the long-side (transposed) path only
+        # --- basis refresh period (ablation knob) ---
+        basis_refresh: int = 1,  # 1 = fresh basis every step; T > 1 reuses it T steps; 0 = fixed
         # --- error feedback ---
         error_feedback: bool = True,  # fold the off-subspace residual back in next step
         # --- metrics gating ---
         metrics_interval: int = 50,  # compute/log diagnostics every N steps; 0 disables
+        overlap_lags: Optional[List[int]] = None,  # log overlap of V_t vs V_{t-h} per lag h
         # --- DP projection hook (flag-gated, default off) ---
         dp_projection: bool = False,
         dp_wire_bf16: bool = False,
@@ -423,6 +426,12 @@ class Neutrino(Optimizer):
         assert k_long is None or sketch_side == "long", "k_long needs sketch_side='long'"
         self.sketch_side = sketch_side
         self.k_long = k_long
+        # basis_refresh T: the basis seed uses step // T, so one sketch V serves T
+        # consecutive steps (T == 1: fresh every step; T == 0: one fixed subspace).
+        assert basis_refresh >= 0, basis_refresh
+        self.basis_refresh = basis_refresh
+        self.overlap_lags = tuple(overlap_lags or ())
+        assert all(h > 0 for h in self.overlap_lags), self.overlap_lags
         self.error_feedback = error_feedback
         self.metrics_interval = metrics_interval
         self.dp_projection = dp_projection
@@ -506,6 +515,8 @@ class Neutrino(Optimizer):
     # ------------------------------------------------------------------
     def _basis_seed(self, bucket_id: int, step: int, tp_rank: int) -> int:
         # combine step, bucket_id, and tp_rank deterministically for a 32-bit uint seed.
+        if self.basis_refresh != 1:
+            step = step // self.basis_refresh if self.basis_refresh else 0
         return (step * 997 + bucket_id * 1000003 + tp_rank * 17) & 0xFFFFFFFF
 
     def _generate_basis(
@@ -905,6 +916,27 @@ class Neutrino(Optimizer):
                 pass
         self._subspace_log_buffer = []
 
+    @torch.no_grad()
+    def _track_basis_overlap(self, V, k_eff, bucket_id, seed_tp_rank, gen, metrics_accum):
+        """Diagnostic only — no effect on the update; runs on the metrics cadence.
+
+        Overlap ||Q_{t-h}^T Q_t||_F^2 / k (same definition as _track_subspace_drift)
+        between this step's sketch basis V_t and the basis V_{t-h} used h steps ago,
+        both orthonormalized by QR; V [P, N, k]. V_{t-h} is regenerated from its seed via
+        ``gen`` (one draw + QR per lag, no stored history), so under basis_refresh T the
+        value is exactly 1 whenever t and t-h fall in the same block of T steps and
+        ~k/N (chance) otherwise. This is the temporal-coverage measure for the (k, mu)
+        coupling: how much of the last h steps' subspace the current basis still spans.
+        """
+        Q_cur = torch.linalg.qr(V.float())[0]
+        for h in self.overlap_lags:
+            if self._global_step - h < 1:
+                continue
+            seed = self._basis_seed(bucket_id, self._global_step - h, seed_tp_rank)
+            Q_prev = torch.linalg.qr(gen(seed).float())[0]
+            ov = torch.sum(torch.bmm(Q_prev.transpose(-2, -1), Q_cur) ** 2, dim=(-2, -1)) / k_eff
+            metrics_accum.add_overlap(h, ov)
+
     def build_sharded_optimizer_state(self, model_param, value, state_key, prefix):
         """Keep non-model-shaped optimizer state out of the sharded checkpoint.
 
@@ -1018,6 +1050,9 @@ class Neutrino(Optimizer):
         seed_tp_rank = tp_rank if partition_dim == 1 else 0
         seed = self._basis_seed(bucket_id, self._global_step, seed_tp_rank)
         V = self._generate_basis(P, N, k_eff, seed, device, fdtype, N_global, basis_init)
+        if metrics_accum is not None and self.overlap_lags:
+            gen = lambda s: self._generate_basis(P, N, k_eff, s, device, fdtype, N_global, basis_init)
+            self._track_basis_overlap(V, k_eff, bucket_id, seed_tp_rank, gen, metrics_accum)
 
         # --- project: Y_local = g_adj @ V -> [P, M, k] ---
         Y_local = torch.bmm(g_adj, V)
@@ -1151,6 +1186,9 @@ class Neutrino(Optimizer):
         seed = self._basis_seed(bucket_id, self._global_step, seed_tp_rank)
         V = self._generate_basis(1, N, k_eff, seed, device, fdtype, N_global, basis_init)[0]  # [N, k]
         Vt = V.transpose(-2, -1)  # [k, N]
+        if metrics_accum is not None and self.overlap_lags:
+            gen = lambda s: self._generate_basis(1, N, k_eff, s, device, fdtype, N_global, basis_init)
+            self._track_basis_overlap(V.unsqueeze(0), k_eff, bucket_id, seed_tp_rank, gen, metrics_accum)
 
         Y_local = torch.matmul(g_adj, V)  # [E, M, k]
         self._dp_average_(Y_local, expert)
@@ -1235,6 +1273,10 @@ class _MetricsAccumulator:
         self._n = 0
         self._neutrino_bytes = 0
         self._muon_bytes = 0
+        self._overlap: dict = {}  # lag h -> [per-param overlap tensors]
+
+    def add_overlap(self, lag, ov):
+        self._overlap.setdefault(lag, []).append(ov)
 
     @torch.no_grad()
     def add_batch(self, g_adj, YV, U, update, items, lr, scale, k_eff, M, N, track_comm):
@@ -1290,6 +1332,8 @@ class _MetricsAccumulator:
             ),
             "neutrino/tp_comm_axis_active": float(has_comm),
         }
+        for h, vals in self._overlap.items():
+            metrics[f"neutrino/overlap_lag{h}"] = torch.cat(vals).mean().item()
 
         # Realized data-parallel saving, measured on both sides: skipped/reduced from the
         # slices the grad buffer did or did not hand to NCCL, thin bytes from the tensors
@@ -1412,8 +1456,10 @@ def get_megatron_neutrino_optimizer(
         k_ratio=config.neutrino_k_ratio,
         sketch_side=config.neutrino_sketch_side,
         k_long=config.neutrino_k_long,
+        basis_refresh=config.neutrino_basis_refresh,
         error_feedback=not config.neutrino_no_error_feedback,
         metrics_interval=config.neutrino_metrics_interval,
+        overlap_lags=config.neutrino_overlap_lags,
         dp_projection=config.neutrino_dp_projection,
         dp_wire_bf16=getattr(config, 'neutrino_dp_wire_bf16', False),
         log_subspace_drift=config.neutrino_log_subspace_drift,

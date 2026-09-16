@@ -1550,6 +1550,15 @@ def validate_args(args, defaults={}):
             f"transposes; got --neutrino-sketch-side {args.neutrino_sketch_side!r}."
         )
 
+    assert args.neutrino_basis_refresh >= 0, "--neutrino-basis-refresh must be >= 0"
+    if args.neutrino_overlap_lags:
+        args.neutrino_overlap_lags = tuple(sorted(
+            int(x.strip()) for x in args.neutrino_overlap_lags.split(",") if x.strip()
+        ))
+        assert all(h > 0 for h in args.neutrino_overlap_lags), (
+            "--neutrino-overlap-lags values must be positive"
+        )
+
     # Muon optimizer check
     if 'muon' in args.optimizer:
 
@@ -3001,8 +3010,17 @@ def _add_training_args(parser):
                        help='Rank used instead of --neutrino-k on exactly the matrices that '
                        '--neutrino-sketch-side long transposes (equal-bytes ablation: '
                        "k' = k * max(M, N) / min(M, N)). Requires --neutrino-sketch-side long.")
+    group.add_argument('--neutrino-basis-refresh', type=int, default=1,
+                       help='Basis refresh period T: the sketch seed uses step // T, so one '
+                       'random basis is reused for T consecutive steps. 1 (default) draws a '
+                       'fresh basis every step; 0 fixes one subspace for the whole run.')
     group.add_argument('--neutrino-metrics-interval', type=int, default=50,
                        help='Log Neutrino diagnostic metrics every N steps (0 disables).')
+    group.add_argument('--neutrino-overlap-lags', type=str, default=None,
+                       help='Diagnostic only: comma-separated lags h at which to log '
+                       'neutrino/overlap_lag{h}, the mean overlap between the current sketch '
+                       'basis and the one used h steps earlier (regenerated from its seed), '
+                       'on the --neutrino-metrics-interval cadence.')
     group.add_argument('--neutrino-dp-projection', action='store_true',
                        help='Replace the dense data-parallel gradient all-reduce with an '
                        'all-reduce of the thin projected Y (the actual communication-saving '

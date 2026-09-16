@@ -353,6 +353,16 @@ class OptimizerConfig:
     """Rank used instead of neutrino_k on exactly the matrices the 'long' path transposes
     (the equal-bytes ablation, k' = k * max(M, N) / min(M, N)). Requires 'long'."""
 
+    neutrino_basis_refresh: int = 1
+    """Basis refresh period T: the sketch seed uses step // T, so one random basis V is
+    reused for T consecutive steps. 1 (default) draws a fresh basis every step; 0 fixes one
+    subspace for the whole run."""
+
+    neutrino_overlap_lags: Optional[Tuple[int, ...]] = None
+    """Diagnostic only: lags h at which to log neutrino/overlap_lag{h}, the mean subspace
+    overlap between the current basis V_t and V_{t-h} (regenerated from its seed), on the
+    neutrino_metrics_interval cadence."""
+
     neutrino_no_error_feedback: bool = False
     """Disable error feedback (drop the off-subspace residual instead of folding it back into
     the next step). Empirically beneficial at low compression ratios in our own sweeps —
