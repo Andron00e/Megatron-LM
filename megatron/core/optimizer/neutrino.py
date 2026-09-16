@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 from torch import Tensor
@@ -382,7 +382,7 @@ class Neutrino(Optimizer):
         k_ratio: float = 0.25,  # used when k_mode == "ratio"
         # --- which side the sketch compresses ---
         sketch_side: str = "short",  # short (default, = current behavior) | long
-        k_long: Optional[int] = None,  # k for the long-side (transposed) path only
+        k_long: Optional[Union[int, str]] = None,  # int or "auto"; transposed path only
         # --- basis refresh period (ablation knob) ---
         basis_refresh: int = 1,  # 1 = fresh basis every step; T > 1 reuses it T steps; 0 = fixed
         # --- error feedback ---
@@ -421,9 +421,19 @@ class Neutrino(Optimizer):
         # matrix (fc1: M = 2.5 N) ships 2.5x the bytes of its transpose at the same k.
         # 'long' transposes such matrices before sketching so the sketched dimension is
         # always max(M, N) and every wire tensor is min(M, N) x k; k_long, if set, is the
-        # rank used on exactly those transposed matrices (the equal-bytes ablation).
+        # rank used on exactly those transposed matrices: an int is a fixed override, "auto"
+        # is the equal-bytes arm, k' = round(k M/N) per shape so N x k' has the bytes of M x k
+        # (at 350m every GQA qkv is tall too, so a single int cannot be equal-bytes for
+        # both qkv and fc1).
         assert sketch_side in ("short", "long"), sketch_side
         assert k_long is None or sketch_side == "long", "k_long needs sketch_side='long'"
+        assert k_long is None or k_long == "auto" or (isinstance(k_long, int) and k_long > 0), k_long
+        cls = type(self)
+        if sketch_side != "short" or k_long is not None:
+            assert (
+                cls._process_bucket is Neutrino._process_bucket
+                and cls._process_expert is Neutrino._process_expert
+            ), f"{cls.__name__} overrides _process_bucket/_process_expert and ignores sketch_side/k_long"
         self.sketch_side = sketch_side
         self.k_long = k_long
         # basis_refresh T: the basis seed uses step // T, so one sketch V serves T
@@ -507,7 +517,10 @@ class Neutrino(Optimizer):
 
     def _k_for_side(self, k_eff: int, transposed: bool, M_global: int, N_global: int) -> int:
         if transposed and self.k_long is not None:
-            return max(1, min(self.k_long, min(M_global, N_global)))
+            k_long = self.k_long
+            if k_long == "auto":  # equal bytes: N_global * k' == M_global * k_eff
+                k_long = round(k_eff * M_global / N_global)
+            return max(1, min(k_long, min(M_global, N_global)))
         return k_eff
 
     # ------------------------------------------------------------------

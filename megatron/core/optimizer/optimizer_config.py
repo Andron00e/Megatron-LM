@@ -349,9 +349,10 @@ class OptimizerConfig:
     is M x k. 'long' transposes any matrix with M > N before sketching so the sketched
     dimension is always max(M, N) and the wire tensor is min(M, N) x k."""
 
-    neutrino_k_long: Optional[int] = None
-    """Rank used instead of neutrino_k on exactly the matrices the 'long' path transposes
-    (the equal-bytes ablation, k' = k * max(M, N) / min(M, N)). Requires 'long'."""
+    neutrino_k_long: Optional[Union[int, str]] = None
+    """Rank used instead of neutrino_k on exactly the matrices the 'long' path transposes:
+    an int is a fixed override, 'auto' is the equal-bytes arm (k' = round(k * M / N) per
+    shape, so N x k' has the bytes of the untransposed M x k). Requires 'long'."""
 
     neutrino_basis_refresh: int = 1
     """Basis refresh period T: the sketch seed uses step // T, so one random basis V is

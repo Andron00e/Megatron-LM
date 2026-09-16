@@ -2908,6 +2908,9 @@ def _add_rl_args(parser):
                             '(e.g. --rl-inference-parsers deepseek-r1-reasoning qwen3-coder-tool).')
     return parser
 
+def _int_or_auto(value):
+    return value if value == 'auto' else int(value)
+
 def _add_training_args(parser):
     from megatron.training.config import TrainingConfig
     from megatron.training.config import ProfilingConfig
@@ -3006,10 +3009,12 @@ def _add_training_args(parser):
                        'wire tensor M x k. \'long\' transposes any matrix with M > N before '
                        'sketching, so the sketched dimension is always max(M, N) and every '
                        'wire tensor is min(M, N) x k (fc1 ships 2.5x fewer bytes at 350m).')
-    group.add_argument('--neutrino-k-long', type=int, default=None,
+    group.add_argument('--neutrino-k-long', type=_int_or_auto, default=None,
                        help='Rank used instead of --neutrino-k on exactly the matrices that '
-                       '--neutrino-sketch-side long transposes (equal-bytes ablation: '
-                       "k' = k * max(M, N) / min(M, N)). Requires --neutrino-sketch-side long.")
+                       '--neutrino-sketch-side long transposes: an int is a fixed override, '
+                       "'auto' is the equal-bytes arm, k' = round(k * M / N) per shape so the "
+                       'N x k\' wire tensor has the bytes of the untransposed M x k. '
+                       'Requires --neutrino-sketch-side long.')
     group.add_argument('--neutrino-basis-refresh', type=int, default=1,
                        help='Basis refresh period T: the sketch seed uses step // T, so one '
                        'random basis is reused for T consecutive steps. 1 (default) draws a '
