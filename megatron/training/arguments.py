@@ -3044,7 +3044,7 @@ def _add_training_args(parser):
     # ---- Neutrino algorithmic variants (see _research/variants/neutrino_variants.py) ----
     group.add_argument('--neutrino-variant', type=str, default='base',
                        choices=['base', 'srht', 'ef21', 'kschedule', 'perlayerk', 'powersgd',
-                                'signmuon', 'dion2', 'cycle', 'quant'],
+                                'signmuon', 'dion2', 'cycle', 'quant', 'int8dense'],
                        help="Select a Neutrino subclass from _research/variants/. 'base' "
                        '(default) is the unmodified optimizer above.')
     group.add_argument('--neutrino-k-schedule-start-k', type=int, default=None,
