@@ -1013,6 +1013,14 @@ class _ParamAndGradBucketGroup:
         assert self.ddp_config.num_distributed_optimizer_instances == 1, (
             "num_distributed_optimizer_instances > 1 does not support host-resident grad buffers"
         )
+        if any(getattr(p, DP_PROJECTED_ATTR, False) for p in bucket.params_list):
+            # This path reduces the whole bucket densely, so a tagged param would be averaged
+            # here AND by the optimizer's own exchange (int8/EF21 operands then see a
+            # DP-identical input). Fail rather than silently lose the projection.
+            raise RuntimeError(
+                "DP-projected params are not supported in a host-resident grad bucket "
+                "(--moe-offload-main-grad); drop one of the two."
+            )
 
         flat_cpu = bucket.grad_data.view(-1)
         if flat_cpu.numel() == 0:
