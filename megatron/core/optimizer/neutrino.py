@@ -1415,6 +1415,9 @@ def get_megatron_neutrino_optimizer(
                     opt.state[p]['momentum_buffer'] = torch.zeros_like(p.data, dtype=torch.float32)
                 if 'error_buffer' not in opt.state[p] and opt.error_feedback:
                     opt.state[p]['error_buffer'] = torch.zeros_like(p.data, dtype=torch.float32)
+                init_variant_state = getattr(opt, 'init_variant_state_', None)
+                if init_variant_state is not None:
+                    init_variant_state(p, group)
 
     def adam_init_state_fn(opt, config=None):
         for group in opt.param_groups:
