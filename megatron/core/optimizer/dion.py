@@ -230,7 +230,13 @@ class Dion(Optimizer):
 
         R32 = R.to(torch.float32)
         if self.orth == 'qr':
-            Q.copy_(torch.linalg.qr(R32)[0])  # Orth-Dion: orthonormal columns, not unit columns
+            # Orth-Dion: orthonormal columns, not unit columns. torch.linalg.qr has no sign
+            # convention (Householder picks r_jj = -sign(x_1)*||x||), so pin diag(R_factor) > 0 —
+            # otherwise ~half the columns of Q flip sign w.r.t. R and the update P @ Q^T at the
+            # end of this method ascends along them (F005).
+            Q_new, R_fac = torch.linalg.qr(R32)
+            sgn = torch.diagonal(R_fac, dim1=-2, dim2=-1).sign()
+            Q.copy_(Q_new * torch.where(sgn == 0, torch.ones_like(sgn), sgn).unsqueeze(-2))
         else:
             denom = R32.norm(dim=-2, keepdim=True) + eps
             Q.copy_(R32 / denom)  # refreshed basis for next step
