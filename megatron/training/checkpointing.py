@@ -26,6 +26,7 @@ import gc
 
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.distributed.diloco import get_diloco_outer_optimizer
 from megatron.core.dist_checkpointing.strategies.torch import TorchDistLoadShardedStrategy, TorchDistSaveShardedStrategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
@@ -1036,6 +1037,22 @@ def generate_state_dict(
             else:
                 optimizer_sd = optimizer.state_dict()
 
+            # DiLoCo's outer state is param-shaped but belongs to neither the model nor the inner
+            # optimizer: mirroring it into `optimizer.state[p]` rode the optimizer's sharding path
+            # for free but broke every inner optimizer with a fixed state-key table, TE's FusedAdam
+            # above all (F035). It gets its own section, with its own sharding, instead. Built
+            # before `optimizer` lands in `state_dict`, so it sees the same model-only sharded
+            # state dict the optimizer's own param map was built from.
+            diloco = get_diloco_outer_optimizer()
+            if diloco is not None:
+                if args.ckpt_format == "torch_dist":
+                    diloco_sd = diloco.sharded_state_dict(
+                        state_dict, is_loading=bool((optim_sd_kwargs or {}).get('is_loading'))
+                    )
+                else:
+                    diloco_sd = diloco.state_dict()
+                state_dict['diloco'] = diloco_sd
+
             state_dict['optimizer'] = optimizer_sd
 
         if opt_param_scheduler is not None:
@@ -1996,6 +2013,13 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             elif not skip_load_to_model_and_opt and optimizer is not None and not optimizer.is_stub_optimizer:
                 optimizer.load_state_dict(state_dict['optimizer'])
                 del state_dict['optimizer']
+
+            # DiLoCo outer state: adopt the loaded tensors. The outer clock is re-anchored on the
+            # loaded iteration by `setup_model_and_optimizer`, after this returns.
+            diloco = get_diloco_outer_optimizer()
+            if diloco is not None and 'diloco' in state_dict:
+                diloco.load_state_dict(state_dict['diloco'])
+                del state_dict['diloco']
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above

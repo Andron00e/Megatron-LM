@@ -53,13 +53,17 @@ rule acts on are not identical: mu2mars applies the variance-reduction term only
 (1-D params take a plain AdamW branch) and clips c_t per tensor, while here the pseudo-gradient is
 one object -- every param carries the VR term and the clip is the global l2 norm the plan asks for.
 
-The outer state is a set of param-shaped fp32 tensors owned by this controller and *mirrored*
-into the inner ``torch.optim.Optimizer``'s per-param ``state`` dict, keyed off the fp32 main param,
-so ``optim_state_to_sharding_state`` shards and checkpoints it with no extra code. The mirroring is
-deferred until the inner optimizer has allocated its own state, because every inner optimizer here
-(torch AdamW/Adam, apex FusedAdam, mars, mu2mars) allocates its moments lazily under
-``if len(state) == 0`` -- an eager write into ``opt.state[p]`` makes the first inner ``step()``
-raise ``KeyError: 'exp_avg'``.
+The outer state is a set of param-shaped fp32 tensors owned by this controller, keyed off the fp32
+main param, and *never* written into the inner ``torch.optim.Optimizer``'s per-param ``state``
+dict. Mirroring them there rides the optimizer's own sharding path for free, but it also makes the
+inner optimizer's ``state_dict()`` responsible for them, and TransformerEngine's ``FusedAdam`` --
+the class ``--optimizer adam`` resolves to inside a TE container -- looks every per-param state key
+up in a fixed ``name_to_dtype_map`` and so raises ``KeyError: 'outer_x'`` at the first save (F035).
+Instead ``sharded_state_dict()`` emits the outer tensors as ``diloco.<key>.<param>`` ShardedTensors
+built from the same model-parameter sharding the optimizer state uses, and the caller stores them
+under the checkpoint's own ``diloco`` key; ``load_state_dict()`` adopts them back on resume. Keeping
+the state here also keeps it out of the way of every inner optimizer's lazy ``if len(state) == 0``
+moment allocation, which an eager write into ``opt.state[p]`` defeated (F020).
 
 The outer clock t is an explicit counter, and a round is H iterations *since the last outer step*
 rather than a fixed multiple of H, so a forced (preemption) sync neither replays a t nor shortens
@@ -171,12 +175,12 @@ class DiLoCoOuterOptimizer:
         self.optimizers = list(optimizers)
         self.config = config
         self.dp_group = dp_group
+        self.megatron_optimizer = None
         self.outer_state = defaultdict(dict)
         self.completed_iterations = 0
         self.outer_steps = 0
         self.last_sync_iteration = 0
         self.pending = False
-        self.published = False
 
     @property
     def items(self) -> List[tuple]:
@@ -199,89 +203,122 @@ class DiLoCoOuterOptimizer:
         return keys
 
     @torch.no_grad()
-    def allocate_state(self, optimizer: Optional[torch.optim.Optimizer] = None):
+    def allocate_state(self):
         """Idempotent; `outer_x` and the descent sequence `outer_w` start at the params, not zero.
 
-        The tensors are held here, not written into ``opt.state[p]``: the inner optimizers
-        allocate their own moments lazily under ``if len(state) == 0``, so an eager write there
-        defeats that guard and the first inner ``step()`` raises. ``publish_to_inner_state``
-        mirrors them once the inner state exists. A resume finds the loaded tensors already in
-        ``opt.state[p]`` and adopts them rather than re-anchoring on the params.
+        The tensors are held here and nowhere else -- see the module docstring on why they must
+        not be written into ``opt.state[p]``. A resume allocates first and then overwrites them
+        from the checkpoint in ``load_state_dict``.
         """
-        optimizers = self.optimizers if optimizer is None else [optimizer]
         keys = self.state_keys()
-        for opt in optimizers:
+        for opt in self.optimizers:
             for group in opt.param_groups:
                 for p in group['params']:
-                    inner = opt.state.get(p, {})
                     outer = self.outer_state[p]
                     for key in keys:
-                        if key in inner:
-                            outer[key] = inner[key]
-                        elif key not in outer:
-                            if key in ('outer_x', 'outer_w'):
-                                outer[key] = p.detach().clone().float()
-                            else:
-                                outer[key] = torch.zeros_like(p, dtype=torch.float32)
-
-    @torch.no_grad()
-    def publish_to_inner_state(self, optimizer: Optional[torch.optim.Optimizer] = None) -> bool:
-        """Mirror the outer tensors into the inner optimizer's per-param state.
-
-        That is what makes ``optim_state_to_sharding_state`` checkpoint them with no extra code.
-        Params whose inner state is still empty are left alone -- writing there would defeat the
-        inner optimizer's own lazy allocation -- so this returns whether every param is published
-        and the caller retries until it is.
-        """
-        optimizers = self.optimizers if optimizer is None else [optimizer]
-        self.allocate_state(optimizer)
-        keys = self.state_keys()
-        complete = True
-        for opt in optimizers:
-            for group in opt.param_groups:
-                for p in group['params']:
-                    state = opt.state[p]
-                    if len(state) == 0:
-                        complete = False
-                        continue
-                    outer = self.outer_state[p]
-                    for key in keys:
-                        outer[key] = state.setdefault(key, outer[key])
-        return complete
+                        if key in outer:
+                            continue
+                        if key in ('outer_x', 'outer_w'):
+                            outer[key] = p.detach().clone().float()
+                        else:
+                            outer[key] = torch.zeros_like(p, dtype=torch.float32)
 
     def attach_to(self, megatron_optimizer):
-        """Make the checkpoint template carry the outer state.
+        """Record the ``MegatronOptimizer`` whose model-param sharding the outer tensors reuse."""
+        self.megatron_optimizer = megatron_optimizer
 
-        ``sharded_state_dict(is_loading=True)`` builds the load template from whatever
-        ``init_state_fn`` puts in the optimizer state, so the outer tensors have to be published
-        there too or a resume would silently drop them. Publishing inside the wrapper is safe by
-        construction: the inner allocator has just run, so nothing is left guarding on
-        ``len(state) == 0``.
+    def _param_to_sharded_param_map(self, model_sharded_state_dict):
+        """Map every fp32 main param this controller owns to the model's ShardedTensor for it.
+
+        The same mapping the optimizer builds for its own state: the model params are indexed in
+        optimizer order, and ``fp32_from_float16_groups`` is built in lockstep with
+        ``float16_groups``, so position i of the two lists is the same weight.
         """
-        for opt in getattr(megatron_optimizer, 'chained_optimizers', [megatron_optimizer]):
-            inner = getattr(opt, 'optimizer', None)
-            if inner is None:
+        from megatron.core.dist_checkpointing.optimizer import get_param_id_to_sharded_param_map
+
+        assert self.megatron_optimizer is not None, 'attach_to() was not called'
+        param_map = {}
+        for opt in getattr(
+            self.megatron_optimizer, 'chained_optimizers', [self.megatron_optimizer]
+        ):
+            if getattr(opt, 'optimizer', None) is None:
                 continue
-            original = getattr(opt, 'init_state_fn', None)
+            if getattr(opt, 'float16_groups', None) is not None:
+                model_params = [p for group in opt.float16_groups for p in group]
+                main_params = [p for group in opt.fp32_from_float16_groups for p in group]
+                fp32_params = [p for group in opt.fp32_from_fp32_groups for p in group]
+                model_params += fp32_params
+                main_params += fp32_params
+            else:
+                model_params = list(opt.get_parameters())
+                main_params = model_params
+            id_to_sharded_param = get_param_id_to_sharded_param_map(
+                model_sharded_state_dict, model_params
+            )
+            for index, main_param in enumerate(main_params):
+                if index in id_to_sharded_param:
+                    param_map[main_param] = id_to_sharded_param[index]
+        return param_map
 
-            def wrapped(o, config=None, original=original):
-                if original is not None:
-                    original(o, config)
-                self.publish_to_inner_state(o)
+    def sharded_state_dict(self, model_sharded_state_dict, is_loading: bool = False):
+        """The outer state as ShardedTensors, for the ``torch_dist`` checkpoint.
 
-            opt.init_state_fn = wrapped
+        Keys are ``diloco.<outer key>.<model param key>``, i.e. the optimizer-state naming with
+        ``diloco`` in place of ``optimizer.state``, and the sharding (including ``replica_id``, so
+        one DP rank writes) is the model param's. `is_loading` is accepted for symmetry with
+        ``MegatronOptimizer.sharded_state_dict``; the tensors are allocated either way, since a
+        load template needs the same buffers a save does.
+        """
+        from megatron.core.dist_checkpointing.optimizer import make_sharded_optimizer_tensor
 
-    def note_inner_step(self, iteration: int, stepped: bool = True):
+        del is_loading
+        self.allocate_state()
+        param_map = self._param_to_sharded_param_map(model_sharded_state_dict)
+        sharded = {}
+        for key in self.state_keys():
+            entry = {}
+            for index, (state, p) in enumerate(self.items):
+                if p not in param_map:
+                    raise ValueError(f'DiLoCo param {index} does not match any model sharded param')
+                entry[index] = make_sharded_optimizer_tensor(
+                    param_map[p], state[key], prefix=f'diloco.{key}'
+                )
+            sharded[key] = entry
+        return sharded
+
+    def state_dict(self):
+        """The unsharded form, for the plain ``torch`` checkpoint format."""
+        self.allocate_state()
+        return {key: [state[key] for state, _ in self.items] for key in self.state_keys()}
+
+    @torch.no_grad()
+    def load_state_dict(self, state_dict):
+        """Adopt a loaded outer state. Indexed by position, so it round-trips both forms above.
+
+        K is not part of it: the outer state is one set of param-shaped tensors whatever the
+        worker topology, so a K=1 checkpoint resumes at K=2 and back.
+        """
+        self.allocate_state()
+        items = self.items
+        for key in self.state_keys():
+            if key not in state_dict:
+                raise ValueError(f'DiLoCo state key {key} missing from the checkpoint')
+            loaded = state_dict[key]
+            if len(loaded) != len(items):
+                raise ValueError(
+                    f'DiLoCo state {key} has {len(loaded)} tensors, expected {len(items)}'
+                )
+            for index, (state, _) in enumerate(items):
+                state[key].copy_(loaded[index])
+
+    def note_inner_step(self, iteration: int):
         """Record that one inner iteration completed; `iteration` is the count of them.
 
         Counted whether or not the inner optimizer actually stepped: the grad scaler's skip
         verdict is reduced over the model-parallel group only, so two DiLoCo workers can disagree
         about it, and a round boundary that moved with it would both merge two rounds and hang the
-        collective outer step. `stepped` only gates the publishing of the outer state, which needs
-        a real inner step to have allocated the inner state first.
+        collective outer step.
         """
-        if stepped and not self.published:
-            self.published = self.publish_to_inner_state()
         self.completed_iterations = iteration
         self.pending = True
 
@@ -342,8 +379,6 @@ class DiLoCoOuterOptimizer:
         if config.verify_sync and world > 1:
             self._verify_sync([p for _, p in items])
 
-        if not self.published:
-            self.published = self.publish_to_inner_state()
         self.outer_steps = t
         self.last_sync_iteration = iteration
         self.pending = False

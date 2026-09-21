@@ -3467,7 +3467,7 @@ def train(
             # so iteration + 1 is the number of completed inner steps.
             diloco = get_diloco_outer_optimizer()
             if diloco is not None:
-                diloco.note_inner_step(iteration + 1, stepped=not skipped_iter)
+                diloco.note_inner_step(iteration + 1)
                 if diloco.should_sync(iteration + 1):
                     diloco_outer_step(diloco, optimizer, iteration + 1)
         if should_checkpoint:

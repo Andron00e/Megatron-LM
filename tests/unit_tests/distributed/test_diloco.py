@@ -10,7 +10,6 @@ covers the claim that setting `pg.dp` alone is enough to retarget every dense gr
 collective, without needing a GPU.
 """
 
-import copy
 import os
 
 import pytest
@@ -23,6 +22,7 @@ from megatron.core.distributed.diloco import (
     DiLoCoOuterOptimizer,
     build_worker_process_groups,
 )
+from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.optimizer.mars import MARS
 from megatron.core.optimizer.mu2mars import Mu2MARS
 
@@ -188,8 +188,13 @@ def prescribed_grad_step(params, optimizer, grads):
 
 
 @pytest.mark.parametrize("name", sorted(INNER_OPTIMIZERS))
-def test_fresh_inner_optimizer_steps_after_allocate_state(name):
-    """allocate_state() must not pre-fill opt.state[p]: that defeats every lazy init (F020)."""
+def test_outer_state_never_enters_the_inner_optimizer(name):
+    """The outer tensors stay in the controller, before and after a round.
+
+    Writing them into `opt.state[p]` defeated every inner optimizer's lazy init (F020) and, once
+    that was deferred, made the inner `state_dict()` responsible for keys it does not know --
+    which is how TE's FusedAdam killed every save (F035).
+    """
     model = tiny_model(0)
     inner = INNER_OPTIMIZERS[name](model.parameters())
     outer = DiLoCoOuterOptimizer(inner, DiLoCoConfig(inner_steps=H, outer='mu2'))
@@ -197,29 +202,65 @@ def test_fresh_inner_optimizer_steps_after_allocate_state(name):
     for p in model.parameters():
         assert inner.state.get(p, {}) == {}
 
-    local_step(model, inner, 0)  # KeyError('exp_avg') before the fix
-    outer.note_inner_step(1)
+    for step in range(H):
+        local_step(model, inner, step)  # KeyError('exp_avg') before the fix
+        outer.note_inner_step(step + 1)
+    assert outer.should_sync(H)
+    outer.outer_step(H)
 
-    # ... and once the inner state exists the outer tensors are mirrored into it, which is what
-    # puts them in the checkpoint.
-    assert outer.published
     for p in model.parameters():
         for key in outer.state_keys():
-            assert key in inner.state[p]
-            assert inner.state[p][key] is outer.outer_state[p][key]
+            assert key not in inner.state[p]
+            assert key in outer.outer_state[p]
 
 
-def test_outer_state_is_not_published_before_a_real_inner_step():
+class StrictStateOptimizer(torch.optim.Optimizer):
+    """A stand-in for TransformerEngine's FusedAdam, which is what `--optimizer adam` resolves to
+    in the cluster container and cannot be imported here.
+
+    Its `state_dict()` looks every per-param state key up in a fixed `name_to_dtype_map` and
+    raises `KeyError` on anything else, which is the exact shape of F035.
+    """
+
+    name_to_dtype_map = {'exp_avg': torch.float32, 'exp_avg_sq': torch.float32}
+
+    def __init__(self, params, lr=1e-2):
+        super().__init__(params, dict(lr=lr))
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if len(state) == 0:
+                    state['exp_avg'] = torch.zeros_like(p)
+                    state['exp_avg_sq'] = torch.zeros_like(p)
+                state['exp_avg'].mul_(0.9).add_(p.grad, alpha=0.1)
+                p.add_(state['exp_avg'], alpha=-group['lr'])
+
+    def state_dict(self):
+        for state in self.state.values():
+            for name in state:
+                _ = self.name_to_dtype_map[name]  # KeyError: 'outer_x' (F035)
+        return super().state_dict()
+
+
+def test_inner_state_dict_survives_a_round_with_a_fused_adam_like_optimizer():
+    """The regression: a full round, then a save, with a fixed-key-table inner optimizer."""
     model = tiny_model(0)
-    inner = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    inner = StrictStateOptimizer(model.parameters())
     outer = DiLoCoOuterOptimizer(inner, DiLoCoConfig(inner_steps=H, outer='mu2'))
     outer.allocate_state()
     for step in range(H):
-        outer.note_inner_step(step + 1, stepped=False)
-    assert not outer.published
-    assert outer.should_sync(H)  # the boundary does not move with the skip verdict (F028)
-    for p in model.parameters():
-        assert inner.state.get(p, {}) == {}
+        local_step(model, inner, step)
+        outer.note_inner_step(step + 1)
+    outer.outer_step(H)
+
+    saved = inner.state_dict()  # KeyError('outer_x') before the fix
+    for state in saved['state'].values():
+        assert set(state) == {'exp_avg', 'exp_avg_sq'}
 
 
 def test_outer_step_translates_the_anytime_inner_descent_sequence():
@@ -317,27 +358,42 @@ def test_forced_sync_starts_a_full_round_and_does_not_replay_t():
     assert outer.should_sync(350)
 
 
-def test_state_dict_round_trip():
-    config = DiLoCoConfig(inner_steps=H, outer='mu2', outer_precond='adam')
-    model = tiny_model(0)
-    inner = torch.optim.AdamW(model.parameters(), lr=1e-2)
+def _trained_controller(config, seed=0, rounds=2, optimizer_factory=None):
+    """A controller with a non-trivial outer state: `rounds` full rounds of real inner steps."""
+    model = tiny_model(seed)
+    factory = optimizer_factory or (lambda params: torch.optim.AdamW(params, lr=1e-2))
+    inner = factory(model.parameters())
     outer = DiLoCoOuterOptimizer(inner, config)
     outer.allocate_state()
     torch.manual_seed(11)
-    for t in range(1, 3):
+    for t in range(1, rounds + 1):
         for step in range(H):
             local_step(model, inner, t * H + step)
             outer.note_inner_step((t - 1) * H + step + 1)
         outer.outer_step(t * H)
-    # deepcopy: torch's state_dict() hands back live references, a real checkpoint would not.
-    saved = copy.deepcopy(inner.state_dict())
+    return model, inner, outer
+
+
+def _save(outer):
+    """What a checkpoint keeps: values, not the live tensors `state_dict()` hands back."""
+    return {key: [t.clone() for t in tensors] for key, tensors in outer.state_dict().items()}
+
+
+def test_state_dict_round_trip():
+    config = DiLoCoConfig(inner_steps=H, outer='mu2', outer_precond='adam')
+    model, inner, outer = _trained_controller(config)
+    saved = _save(outer)
+
+    # Nothing of the outer state leaked into the inner optimizer's own checkpoint section (F035).
+    for state in inner.state_dict()['state'].values():
+        assert not any(key.startswith('outer_') for key in state)
 
     reloaded = tiny_model(0)
     inner2 = torch.optim.AdamW(reloaded.parameters(), lr=1e-2)
     outer2 = DiLoCoOuterOptimizer(inner2, config)
-    inner2.load_state_dict(saved)
-    outer2.allocate_state()  # adopts the loaded tensors, as setup_model_and_optimizer does
-    outer2.resume_from(2 * H)  # ... which then re-anchors the outer clock on the loaded iteration
+    outer2.load_state_dict(saved)  # as load_checkpoint does
+    outer2.resume_from(2 * H)  # ... and then the outer clock is re-anchored (F025)
+    assert outer2.outer_steps == outer.outer_steps
 
     keys = outer.state_keys()
     assert set(keys) == {'outer_x', 'outer_b', 'outer_dprev', 'outer_w', 'outer_v'}
@@ -356,38 +412,113 @@ def test_state_dict_round_trip():
     torch.testing.assert_close(flat(model), flat(reloaded), rtol=0, atol=0)
 
 
-def test_init_state_fn_wrapper_allocates_outer_state():
-    """attach_to() must add the outer tensors to whatever the inner init_state_fn builds."""
+def test_state_dict_is_independent_of_the_worker_count():
+    """A K=1 checkpoint must resume at K=2 and back: outer state is per-param, not per-worker."""
+    saved_k1 = _save(_trained_controller(DiLoCoConfig(workers=1, inner_steps=H, outer='mu2'))[2])
+    saved_k2 = _save(_trained_controller(DiLoCoConfig(workers=2, inner_steps=H, outer='mu2'))[2])
+    assert saved_k1.keys() == saved_k2.keys()
 
-    class FakeMegatronOptimizer:
-        def __init__(self, torch_optimizer):
-            self.optimizer = torch_optimizer
+    for config, saved in (
+        (DiLoCoConfig(workers=2, inner_steps=H, outer='mu2'), saved_k1),
+        (DiLoCoConfig(workers=1, inner_steps=H, outer='mu2'), saved_k2),
+    ):
+        model = tiny_model(0)
+        outer = DiLoCoOuterOptimizer(torch.optim.AdamW(model.parameters(), lr=1e-2), config)
+        outer.load_state_dict(saved)
+        for key, tensors in saved.items():
+            for (state, _), tensor in zip(outer.items, tensors):
+                torch.testing.assert_close(state[key], tensor, rtol=0, atol=0)
 
-            def init_state_fn(opt, config=None):
-                for group in opt.param_groups:
-                    for p in group['params']:
-                        if len(opt.state[p]) == 0:
-                            opt.state[p]['exp_avg'] = torch.zeros_like(p)
 
-            self.init_state_fn = init_state_fn
+class FakeMegatronOptimizer:
+    """The `Float16OptimizerWithFloat16Params` shape the sharded param map is built from: model
+    params, their fp32 copies in lockstep, and the inner optimizer over the fp32 copies."""
 
+    def __init__(self, model):
+        self.float16_groups = [list(model.parameters())]
+        self.fp32_from_float16_groups = [
+            [p.detach().clone().float() for p in model.parameters()]
+        ]
+        self.fp32_from_fp32_groups = [[]]
+        self.optimizer = torch.optim.AdamW(self.fp32_from_float16_groups[0], lr=1e-2)
+
+
+def _fake_model_sharded_state_dict(megatron_optimizer):
+    """`keep_vars=True` model state: the ShardedTensors wrap the parameters themselves."""
+    return {
+        'model': {
+            f'layer{i}.weight': ShardedTensor.from_rank_offsets(
+                f'layer{i}.weight', p, replica_id=(0, 0, 3)
+            )
+            for i, p in enumerate(megatron_optimizer.float16_groups[0])
+        }
+    }
+
+
+def test_sharded_state_dict_round_trip():
+    """The torch_dist path: outer tensors as ShardedTensors under the model's own sharding."""
+    config = DiLoCoConfig(inner_steps=H, outer='mu2', outer_precond='adam')
     model = tiny_model(0)
-    inner = torch.optim.SGD(list(model.parameters()), lr=0.0)
-    megatron_optimizer = FakeMegatronOptimizer(inner)
-    outer = DiLoCoOuterOptimizer(inner, DiLoCoConfig(inner_steps=H, outer='mu2'))
+    megatron_optimizer = FakeMegatronOptimizer(model)
+    outer = DiLoCoOuterOptimizer(megatron_optimizer.optimizer, config)
     outer.attach_to(megatron_optimizer)
+    model_sd = _fake_model_sharded_state_dict(megatron_optimizer)
 
-    megatron_optimizer.init_state_fn(inner, None)
-    for p in model.parameters():
-        assert 'exp_avg' in inner.state[p]
+    sharded = outer.sharded_state_dict(model_sd, is_loading=True)
+    assert set(sharded) == set(outer.state_keys())
+    main_params = megatron_optimizer.fp32_from_float16_groups[0]
+    for key, entry in sharded.items():
+        assert sorted(entry) == list(range(len(main_params)))
+        for index, sh_ten in entry.items():
+            assert sh_ten.key == f'diloco.{key}.layer{index}.weight'
+            assert sh_ten.dtype == torch.float32
+            # The model's sharding, replica_id included, so one DP rank writes the outer state.
+            assert sh_ten.replica_id == (0, 0, 3)
+            assert sh_ten.data is outer.outer_state[main_params[index]][key]
+
+    torch.manual_seed(5)
+    for state, _ in outer.items:
         for key in outer.state_keys():
-            assert key in inner.state[p]
-    torch.testing.assert_close(
-        inner.state[list(model.parameters())[0]]['outer_x'],
-        list(model.parameters())[0].detach(),
-        rtol=0,
-        atol=0,
-    )
+            state[key].copy_(torch.randn_like(state[key]))
+    # What comes back from a torch_dist load: the same structure, plain tensors.
+    loaded = {
+        key: {index: sh_ten.data.clone() for index, sh_ten in entry.items()}
+        for key, entry in outer.sharded_state_dict(model_sd).items()
+    }
+
+    reloaded = tiny_model(1)
+    megatron_optimizer2 = FakeMegatronOptimizer(reloaded)
+    outer2 = DiLoCoOuterOptimizer(megatron_optimizer2.optimizer, config)
+    outer2.attach_to(megatron_optimizer2)
+    outer2.load_state_dict(loaded)
+    for (state, _), (state2, _) in zip(outer.items, outer2.items):
+        for key in outer.state_keys():
+            torch.testing.assert_close(state[key], state2[key], rtol=0, atol=0)
+
+
+def test_sharded_state_dict_rejects_a_param_the_model_does_not_cover():
+    config = DiLoCoConfig(inner_steps=H, outer='nesterov')
+    model = tiny_model(0)
+    megatron_optimizer = FakeMegatronOptimizer(model)
+    outer = DiLoCoOuterOptimizer(megatron_optimizer.optimizer, config)
+    outer.attach_to(megatron_optimizer)
+    model_sd = _fake_model_sharded_state_dict(megatron_optimizer)
+    model_sd['model'].pop('layer0.weight')
+    with pytest.raises(ValueError, match='does not match any model sharded param'):
+        outer.sharded_state_dict(model_sd)
+
+
+def test_load_state_dict_rejects_a_mismatched_checkpoint():
+    config = DiLoCoConfig(inner_steps=H, outer='mu2')
+    model = tiny_model(0)
+    outer = DiLoCoOuterOptimizer(torch.optim.AdamW(model.parameters(), lr=1e-2), config)
+    saved = _save(outer)
+    with pytest.raises(ValueError, match='missing from the checkpoint'):
+        outer.load_state_dict({key: value for key, value in saved.items() if key != 'outer_w'})
+    truncated = dict(saved)
+    truncated['outer_w'] = truncated['outer_w'][:-1]
+    with pytest.raises(ValueError, match='expected'):
+        outer.load_state_dict(truncated)
 
 
 # ---------------------------------------------------------------------------
@@ -560,11 +691,11 @@ def _body_fresh_run_with_real_inner_optimizer(rank, world):
                 assert not torch.equal(gathered[0], gathered[2]), name
 
         assert outer.outer_steps == 3, name
-        assert outer.published, name
         for p in model.parameters():
             assert torch.isfinite(p).all(), name
             for key in outer.state_keys():
-                assert key in inner.state[p], (name, key)
+                assert key not in inner.state[p], (name, key)
+                assert key in outer.outer_state[p], (name, key)
             if name == 'mu2mars-anytime' and 'w' in inner.state[p]:
                 assert (inner.state[p]['w'] - p.detach().float()).abs().max() > 0, name
 
