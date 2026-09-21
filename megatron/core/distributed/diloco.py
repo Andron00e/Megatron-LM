@@ -47,20 +47,33 @@ It is x_{t+1}, not w_{t+1}, that starts the workers' next round, so the pseudo-g
 at the average. ga = 1 collapses x == w (the ablation that removes the averaging half); gamma = 0
 removes the variance-reduction term; both at once plus beta = 0 reduce 'mu2' to outer SGD.
 
-The bias corrections and the order in which the denominator is applied mirror ``mu2mars.py``
-exactly, so that mu2mars and mu2diloco arms are matched on the single number gamma*beta.
+The bias corrections and the order in which the denominator is applied mirror ``mu2mars.py``,
+so that mu2mars and mu2diloco arms are matched on the single number gamma*beta. The objects the
+rule acts on are not identical: mu2mars applies the variance-reduction term only to matrix params
+(1-D params take a plain AdamW branch) and clips c_t per tensor, while here the pseudo-gradient is
+one object -- every param carries the VR term and the clip is the global l2 norm the plan asks for.
 
-The outer state lives as extra param-shaped fp32 tensors in the inner ``torch.optim.Optimizer``'s
-per-param ``state`` dict, keyed off the fp32 main param, so ``optim_state_to_sharding_state`` shards
-and checkpoints it with no extra code. No outer step counter is stored: t = ceil(iteration / H),
-which is resume-exact as long as checkpoints are only taken at round boundaries (the caller asserts
-``save_interval % H == 0`` and forces an outer step before any unscheduled save).
+The outer state is a set of param-shaped fp32 tensors owned by this controller and *mirrored*
+into the inner ``torch.optim.Optimizer``'s per-param ``state`` dict, keyed off the fp32 main param,
+so ``optim_state_to_sharding_state`` shards and checkpoints it with no extra code. The mirroring is
+deferred until the inner optimizer has allocated its own state, because every inner optimizer here
+(torch AdamW/Adam, apex FusedAdam, mars, mu2mars) allocates its moments lazily under
+``if len(state) == 0`` -- an eager write into ``opt.state[p]`` makes the first inner ``step()``
+raise ``KeyError: 'exp_avg'``.
+
+The outer clock t is an explicit counter, and a round is H iterations *since the last outer step*
+rather than a fixed multiple of H, so a forced (preemption) sync neither replays a t nor shortens
+the following round. t itself is not checkpointed -- it only enters the mu2 bias corrections
+1-beta^t, saturated after a few rounds -- and is rebuilt on resume as ceil(iteration / H), exact
+for a run that was never preempted (the caller asserts ``save_interval % H == 0`` and
+``train_iters % H == 0``, and forces an outer step before any unscheduled save).
 
 Transient memory: one fp32 model-sized list of pseudo-gradients is materialised for the duration of
 the outer step (the global c_t clip needs two passes over it). Persistent fp32 buffers per param,
 above the inner optimizer: 2 for nesterov/snoo, 4 for mu2, 5 with precond='adam'.
 """
 
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -68,6 +81,10 @@ import torch
 
 _OUTER_OPTIMIZER = None
 _LOG_STATS = {}
+
+# Inner optimizer state that is a *copy of the parameters* rather than a moment, and therefore has
+# to be rebased onto the new outer iterate (see `_rebase_inner_param_state`).
+_PARAM_VALUED_INNER_KEYS = ('w',)
 
 
 @dataclass
@@ -154,14 +171,18 @@ class DiLoCoOuterOptimizer:
         self.optimizers = list(optimizers)
         self.config = config
         self.dp_group = dp_group
+        self.outer_state = defaultdict(dict)
         self.completed_iterations = 0
+        self.outer_steps = 0
+        self.last_sync_iteration = 0
         self.pending = False
+        self.published = False
 
     @property
     def items(self) -> List[tuple]:
         """(per-param outer state, param) over every inner optimizer, in a fixed order."""
         return [
-            (opt.state[p], p)
+            (self.outer_state[p], p)
             for opt in self.optimizers
             for group in opt.param_groups
             for p in group['params']
@@ -179,27 +200,63 @@ class DiLoCoOuterOptimizer:
 
     @torch.no_grad()
     def allocate_state(self, optimizer: Optional[torch.optim.Optimizer] = None):
-        """Idempotent; `outer_x` and the descent sequence `outer_w` start at the params, not zero."""
+        """Idempotent; `outer_x` and the descent sequence `outer_w` start at the params, not zero.
+
+        The tensors are held here, not written into ``opt.state[p]``: the inner optimizers
+        allocate their own moments lazily under ``if len(state) == 0``, so an eager write there
+        defeats that guard and the first inner ``step()`` raises. ``publish_to_inner_state``
+        mirrors them once the inner state exists. A resume finds the loaded tensors already in
+        ``opt.state[p]`` and adopts them rather than re-anchoring on the params.
+        """
         optimizers = self.optimizers if optimizer is None else [optimizer]
         keys = self.state_keys()
         for opt in optimizers:
             for group in opt.param_groups:
                 for p in group['params']:
-                    state = opt.state[p]
+                    inner = opt.state.get(p, {})
+                    outer = self.outer_state[p]
                     for key in keys:
-                        if key not in state:
+                        if key in inner:
+                            outer[key] = inner[key]
+                        elif key not in outer:
                             if key in ('outer_x', 'outer_w'):
-                                state[key] = p.detach().clone().float()
+                                outer[key] = p.detach().clone().float()
                             else:
-                                state[key] = torch.zeros_like(p, dtype=torch.float32)
+                                outer[key] = torch.zeros_like(p, dtype=torch.float32)
+
+    @torch.no_grad()
+    def publish_to_inner_state(self, optimizer: Optional[torch.optim.Optimizer] = None) -> bool:
+        """Mirror the outer tensors into the inner optimizer's per-param state.
+
+        That is what makes ``optim_state_to_sharding_state`` checkpoint them with no extra code.
+        Params whose inner state is still empty are left alone -- writing there would defeat the
+        inner optimizer's own lazy allocation -- so this returns whether every param is published
+        and the caller retries until it is.
+        """
+        optimizers = self.optimizers if optimizer is None else [optimizer]
+        self.allocate_state(optimizer)
+        keys = self.state_keys()
+        complete = True
+        for opt in optimizers:
+            for group in opt.param_groups:
+                for p in group['params']:
+                    state = opt.state[p]
+                    if len(state) == 0:
+                        complete = False
+                        continue
+                    outer = self.outer_state[p]
+                    for key in keys:
+                        outer[key] = state.setdefault(key, outer[key])
+        return complete
 
     def attach_to(self, megatron_optimizer):
         """Make the checkpoint template carry the outer state.
 
         ``sharded_state_dict(is_loading=True)`` builds the load template from whatever
-        ``init_state_fn`` puts in the optimizer state, so the outer tensors have to be allocated
-        there or a resume would silently drop them. The inner ``init_state_fn`` guards on
-        ``len(state) == 0``, hence the wrapping rather than an eager allocation here.
+        ``init_state_fn`` puts in the optimizer state, so the outer tensors have to be published
+        there too or a resume would silently drop them. Publishing inside the wrapper is safe by
+        construction: the inner allocator has just run, so nothing is left guarding on
+        ``len(state) == 0``.
         """
         for opt in getattr(megatron_optimizer, 'chained_optimizers', [megatron_optimizer]):
             inner = getattr(opt, 'optimizer', None)
@@ -210,25 +267,49 @@ class DiLoCoOuterOptimizer:
             def wrapped(o, config=None, original=original):
                 if original is not None:
                     original(o, config)
-                self.allocate_state(o)
+                self.publish_to_inner_state(o)
 
             opt.init_state_fn = wrapped
 
-    def note_inner_step(self, iteration: int):
-        """Record that one inner iteration completed; `iteration` is the count of them."""
+    def note_inner_step(self, iteration: int, stepped: bool = True):
+        """Record that one inner iteration completed; `iteration` is the count of them.
+
+        Counted whether or not the inner optimizer actually stepped: the grad scaler's skip
+        verdict is reduced over the model-parallel group only, so two DiLoCo workers can disagree
+        about it, and a round boundary that moved with it would both merge two rounds and hang the
+        collective outer step. `stepped` only gates the publishing of the outer state, which needs
+        a real inner step to have allocated the inner state first.
+        """
+        if stepped and not self.published:
+            self.published = self.publish_to_inner_state()
         self.completed_iterations = iteration
         self.pending = True
 
     def should_sync(self, iteration: int) -> bool:
+        """A round is H iterations since the last outer step, not a fixed multiple of H.
+
+        So a forced (preemption) sync at an unaligned iteration starts a full-length round instead
+        of a short one, and a skipped boundary iteration cannot silently merge two rounds.
+        """
         H = self.config.inner_steps
-        return H > 0 and iteration > 0 and iteration % H == 0
+        return H > 0 and iteration - self.last_sync_iteration >= H
+
+    def resume_from(self, iteration: int):
+        """Re-anchor the outer clock on a loaded checkpoint's iteration.
+
+        Checkpoints are only written straight after an outer step, so the loaded iteration is a
+        round boundary. See the module docstring on why t is rebuilt rather than stored.
+        """
+        H = self.config.inner_steps
+        self.last_sync_iteration = iteration
+        self.outer_steps = -(-iteration // H) if H > 0 else 0
+        self.pending = False
 
     @torch.no_grad()
     def outer_step(self, iteration: int):
         """One outer round. `iteration` is the number of completed inner iterations."""
         config = self.config
-        # ceil, so that a forced sync at a non-aligned iteration still advances the outer clock.
-        t = -(-iteration // config.inner_steps)
+        t = self.outer_steps + 1
         self.allocate_state()
         items = self.items
         world = 1 if self.dp_group is None else torch.distributed.get_world_size(self.dp_group)
@@ -257,9 +338,14 @@ class DiLoCoOuterOptimizer:
 
         for state, p in items:
             p.detach().copy_(state['outer_x'])
+        self._rebase_inner_param_state()
         if config.verify_sync and world > 1:
             self._verify_sync([p for _, p in items])
 
+        if not self.published:
+            self.published = self.publish_to_inner_state()
+        self.outer_steps = t
+        self.last_sync_iteration = iteration
         self.pending = False
         _LOG_STATS.clear()
         _LOG_STATS.update(stats)
@@ -332,17 +418,35 @@ class DiLoCoOuterOptimizer:
                     update = update.div_(denom)
                 state['outer_x'].add_(update, alpha=-config.outer_lr)
 
+    def _rebase_inner_param_state(self):
+        """Restart inner state that is a copy of the params, not a moment, at the new iterate.
+
+        Keeping the inner *moments* across an outer step is what DiLoCo prescribes. A
+        parameter-valued inner state is different: mu2mars's anytime descent sequence w sits on
+        the pre-jump trajectory, and its next inner step pulls p back toward it by anytime_gamma
+        of the whole outer update, partially undoing the outer step. Rebasing w onto x_{t+1}
+        restarts both halves of the anytime pair at the outer iterate, as the params themselves
+        are.
+        """
+        for opt in self.optimizers:
+            for group in opt.param_groups:
+                for p in group['params']:
+                    state = opt.state.get(p, {})
+                    for key in _PARAM_VALUED_INNER_KEYS:
+                        if key in state:
+                            state[key].copy_(p.detach())
+
     def _verify_sync(self, params):
-        hi = torch.zeros(1, dtype=torch.float64, device=params[0].device)
-        for p in params:
-            hi += p.detach().double().sum()
-        lo = hi.clone()
+        """Max-abs spread per parameter: a signed whole-model sum hides cancelling divergence."""
         group = self.dp_group
-        torch.distributed.all_reduce(hi, op=torch.distributed.ReduceOp.MAX, group=group)
-        torch.distributed.all_reduce(lo, op=torch.distributed.ReduceOp.MIN, group=group)
-        assert (
-            hi.item() == lo.item()
-        ), f'DiLoCo workers disagree after the outer step: {lo.item()} vs {hi.item()}'
+        gap = 0.0
+        for p in params:
+            hi = p.detach().float().clone()
+            lo = hi.clone()
+            torch.distributed.all_reduce(hi, op=torch.distributed.ReduceOp.MAX, group=group)
+            torch.distributed.all_reduce(lo, op=torch.distributed.ReduceOp.MIN, group=group)
+            gap = max(gap, hi.sub_(lo).max().item())
+        assert gap == 0.0, f'DiLoCo workers disagree after the outer step: max spread {gap}'
 
 
 def set_diloco_outer_optimizer(outer_optimizer: Optional[DiLoCoOuterOptimizer]):
@@ -356,4 +460,7 @@ def get_diloco_outer_optimizer() -> Optional[DiLoCoOuterOptimizer]:
 
 
 def get_diloco_log_stats() -> dict:
-    return dict(_LOG_STATS)
+    """Consume-and-clear, so an outer round is logged once, at the iteration it happened."""
+    stats = dict(_LOG_STATS)
+    _LOG_STATS.clear()
+    return stats

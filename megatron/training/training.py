@@ -1305,6 +1305,7 @@ def pretrain(
             or (args.save_iters and iteration in args.save_iters)
         )
         if not args.skip_train and args.save and iteration != 0 and not already_saved:
+            finish_diloco_round(optimizer)
             save_checkpoint(
                 iteration,
                 model,
@@ -1606,6 +1607,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             ddp_pg_collection.tp = mpu.get_tensor_model_parallel_group()
             ddp_pg_collection.pp = mpu.get_pipeline_model_parallel_group()
             ddp_pg_collection.ep = mpu.get_expert_model_parallel_group()
+            # Without this, setup_process_groups_for_ddp falls back to a 1-rank group built from
+            # a per-rank rank list. MoE is asserted off under DiLoCo; this keeps the dense path
+            # off that fallback.
+            ddp_pg_collection.expt_dp = worker_group
 
         # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
         #  capture support with DDP, but we sync it with the current stream to avoid races.
@@ -1765,6 +1770,17 @@ def diloco_outer_step(diloco, optimizer, iteration):
     for opt in getattr(optimizer, 'chained_optimizers', [optimizer]):
         if hasattr(opt, '_copy_main_params_to_model_params'):
             opt._copy_main_params_to_model_params()
+
+
+def finish_diloco_round(optimizer):
+    """Close an open DiLoCo round before a save; a no-op without DiLoCo or at a boundary.
+
+    A checkpoint is written from one DP replica, so a save mid-round would drop the other K-1
+    workers' progress. Every save path has to go through this, not just the scheduled ones.
+    """
+    diloco = get_diloco_outer_optimizer()
+    if diloco is not None and diloco.pending:
+        diloco_outer_step(diloco, optimizer, diloco.completed_iterations)
 
 
 def setup_model_and_optimizer(
@@ -1982,6 +1998,7 @@ def setup_model_and_optimizer(
     diloco = get_diloco_outer_optimizer()
     if diloco is not None:
         diloco.allocate_state()
+        diloco.resume_from(args.iteration)
 
     return model, optimizer, opt_param_scheduler
 
@@ -2759,11 +2776,7 @@ def save_checkpoint_and_time(
     timers = get_timers()
     energy_monitor = get_energy_monitor()
 
-    # A checkpoint is written from one DP replica, so an unscheduled (preemption / fault) save
-    # mid-round would drop the other DiLoCo workers' progress; close the round first.
-    diloco = get_diloco_outer_optimizer()
-    if diloco is not None and diloco.pending:
-        diloco_outer_step(diloco, optimizer, diloco.completed_iterations)
+    finish_diloco_round(optimizer)
 
     # Synchronize forward pre-hook state before checkpoint save to avoid race conditions
     if should_disable_forward_pre_hook(args):
@@ -3453,8 +3466,8 @@ def train(
             # DiLoCo outer round, before any save below: `iteration` is still pre-increment here,
             # so iteration + 1 is the number of completed inner steps.
             diloco = get_diloco_outer_optimizer()
-            if diloco is not None and not skipped_iter:
-                diloco.note_inner_step(iteration + 1)
+            if diloco is not None:
+                diloco.note_inner_step(iteration + 1, stepped=not skipped_iter)
                 if diloco.should_sync(iteration + 1):
                     diloco_outer_step(diloco, optimizer, iteration + 1)
         if should_checkpoint:
