@@ -168,6 +168,14 @@ from megatron.core.transformer.module import Float16Module
 from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
+from megatron.core.distributed.diloco import (
+    DiLoCoConfig,
+    DiLoCoOuterOptimizer,
+    build_worker_process_groups,
+    get_diloco_log_stats,
+    get_diloco_outer_optimizer,
+    set_diloco_outer_optimizer,
+)
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 
 from megatron.core.optimizer.qk_clip import clip_qk
@@ -1585,6 +1593,20 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             if not ddp_config.overlap_grad_reduce:
                 ddp_config.bucket_size = None
 
+        # DiLoCo: confine the inner gradient all-reduce to the worker's own slice of the DP group.
+        # dp_cp falls back to dp and intra_dp_cp to dp_cp inside setup_process_groups_for_ddp, so
+        # setting dp alone is enough to retarget every dense grad-buffer collective.
+        ddp_pg_collection = None
+        if args.diloco_inner_steps > 0 and args.diloco_workers > 1:
+            worker_group = build_worker_process_groups(
+                mpu.get_data_parallel_group(), args.diloco_workers
+            )
+            ddp_pg_collection = ProcessGroupCollection()
+            ddp_pg_collection.dp = worker_group
+            ddp_pg_collection.tp = mpu.get_tensor_model_parallel_group()
+            ddp_pg_collection.pp = mpu.get_pipeline_model_parallel_group()
+            ddp_pg_collection.ep = mpu.get_expert_model_parallel_group()
+
         # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
         #  capture support with DDP, but we sync it with the current stream to avoid races.
         ddp_stream = torch.cuda.Stream()
@@ -1600,6 +1622,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                     # Turn off bucketing for model_chunk 2 onwards, since communication
                     # for these model chunks is overlapped with compute anyway.
                     disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
+                    **({} if ddp_pg_collection is None else {'pg_collection': ddp_pg_collection}),
                 )
                 for (model_chunk_idx, model_chunk) in enumerate(model)
             ]
@@ -1702,6 +1725,48 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     return config, config_overrides
 
 
+def build_diloco_outer_optimizer(args, optimizer):
+    """Wrap the inner torch optimizer(s) in the DiLoCo/SNOO/mu^2-DiLoCo outer loop, or None."""
+    if args.diloco_inner_steps <= 0:
+        return None
+    inner_optimizers = [
+        opt.optimizer
+        for opt in getattr(optimizer, 'chained_optimizers', [optimizer])
+        if getattr(opt, 'optimizer', None) is not None
+    ]
+    diloco_config = DiLoCoConfig(
+        workers=args.diloco_workers,
+        inner_steps=args.diloco_inner_steps,
+        outer=args.diloco_outer,
+        outer_lr=args.diloco_outer_lr,
+        outer_momentum=args.diloco_outer_momentum,
+        outer_nesterov=args.diloco_outer_nesterov,
+        outer_precond=args.diloco_outer_precond,
+        outer_beta2=args.diloco_outer_beta2,
+        outer_eps=args.diloco_outer_eps,
+        mu2_beta=args.mu2diloco_beta,
+        mu2_beta3=args.mu2diloco_beta3,
+        mu2_gamma=args.mu2diloco_gamma,
+        mu2_clip=args.mu2diloco_clip,
+        mu2_anytime_gamma=args.mu2diloco_anytime_gamma,
+        mu2_variant=args.mu2diloco_variant,
+        verify_sync=args.diloco_verify_sync,
+    )
+    diloco = DiLoCoOuterOptimizer(
+        inner_optimizers, diloco_config, dp_group=mpu.get_data_parallel_group()
+    )
+    diloco.attach_to(optimizer)
+    return diloco
+
+
+def diloco_outer_step(diloco, optimizer, iteration):
+    """Run one outer round and push the updated fp32 main params back to the model params."""
+    diloco.outer_step(iteration)
+    for opt in getattr(optimizer, 'chained_optimizers', [optimizer]):
+        if hasattr(opt, '_copy_main_params_to_model_params'):
+            opt._copy_main_params_to_model_params()
+
+
 def setup_model_and_optimizer(
     model_provider_func,
     model_type,
@@ -1798,6 +1863,10 @@ def setup_model_and_optimizer(
                 layer_wise_distributed_optimizer='dist' in config.optimizer,
             )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+
+        # Built before load_checkpoint so that attach_to() has wrapped init_state_fn by the time
+        # the sharded-state-dict load template is constructed.
+        set_diloco_outer_optimizer(build_diloco_outer_optimizer(args, optimizer))
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
@@ -1907,6 +1976,12 @@ def setup_model_and_optimizer(
         print_rank_0("> converted checkpoint: %s -> %s." % (load_ckpt_format, args.ckpt_format))
         torch.distributed.barrier()
         exit()
+
+    # After the load, so that a fresh run anchors outer_x on the initial params rather than on
+    # the params of the first outer round; idempotent, so a resumed outer state is kept.
+    diloco = get_diloco_outer_optimizer()
+    if diloco is not None:
+        diloco.allocate_state()
 
     return model, optimizer, opt_param_scheduler
 
@@ -2368,6 +2443,14 @@ def training_log(
         if wandb_writer:
             wandb_writer.log(md_gain_stats, iteration)
 
+    diloco_stats = get_diloco_log_stats()
+    if diloco_stats:
+        if writer:
+            for metric_name, metric_value in diloco_stats.items():
+                writer.add_scalar(metric_name, metric_value, iteration)
+        if wandb_writer:
+            wandb_writer.log(diloco_stats, iteration)
+
     # Log MoE metrics.
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
@@ -2675,6 +2758,12 @@ def save_checkpoint_and_time(
     args = get_args()
     timers = get_timers()
     energy_monitor = get_energy_monitor()
+
+    # A checkpoint is written from one DP replica, so an unscheduled (preemption / fault) save
+    # mid-round would drop the other DiLoCo workers' progress; close the round first.
+    diloco = get_diloco_outer_optimizer()
+    if diloco is not None and diloco.pending:
+        diloco_outer_step(diloco, optimizer, diloco.completed_iterations)
 
     # Synchronize forward pre-hook state before checkpoint save to avoid race conditions
     if should_disable_forward_pre_hook(args):
@@ -3361,6 +3450,13 @@ def train(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
             )
             ft_integration.on_training_step_end()
+            # DiLoCo outer round, before any save below: `iteration` is still pre-increment here,
+            # so iteration + 1 is the number of completed inner steps.
+            diloco = get_diloco_outer_optimizer()
+            if diloco is not None and not skipped_iter:
+                diloco.note_inner_step(iteration + 1)
+                if diloco.should_sync(iteration + 1):
+                    diloco_outer_step(diloco, optimizer, iteration + 1)
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,

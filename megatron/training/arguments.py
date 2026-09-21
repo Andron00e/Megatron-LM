@@ -1581,6 +1581,31 @@ def validate_args(args, defaults={}):
         assert not args.use_torch_fsdp2, f"{args.optimizer} does not support Torch-FSDP2."
         assert not args.use_megatron_fsdp, f"{args.optimizer} does not support Megatron-FSDP."
 
+    # DiLoCo / SNOO / mu^2-DiLoCo check. Between syncs the K workers hold different params while
+    # the checkpoint is saved from one DP replica, so a save at i % H != 0 would silently discard
+    # K-1 workers' progress; training.py forces an outer step before unscheduled saves, and the
+    # scheduled ones are pinned to round boundaries here.
+    if args.diloco_workers < 1:
+        args.diloco_workers = 1
+    if args.diloco_inner_steps > 0:
+        assert args.diloco_outer != 'snoo' or args.diloco_workers == 1, (
+            "--diloco-outer snoo is the single-worker rule; use nesterov for --diloco-workers > 1.")
+        assert args.data_parallel_size % args.diloco_workers == 0, (
+            f"--diloco-workers {args.diloco_workers} must divide the data-parallel size "
+            f"{args.data_parallel_size}.")
+        assert args.save_interval is None or args.save_interval % args.diloco_inner_steps == 0, (
+            f"--save-interval {args.save_interval} must be a multiple of --diloco-inner-steps "
+            f"{args.diloco_inner_steps}; checkpoints are only consistent at round boundaries.")
+        assert not args.use_torch_fsdp2, "DiLoCo does not support Torch-FSDP2."
+        assert not args.use_megatron_fsdp, "DiLoCo does not support Megatron-FSDP."
+        if args.diloco_workers > 1:
+            assert not args.use_distributed_optimizer, (
+                "--diloco-workers > 1 does not support the distributed optimizer; it shards main "
+                "params across the whole DP group, i.e. across workers, so no rank holds a whole "
+                "x and the param all-gather would mix workers.")
+            assert not args.overlap_param_gather, (
+                "--diloco-workers > 1 does not support --overlap-param-gather.")
+
     # MDDecoupling optimizer check. The 2D hypersphere/Muon math is incompatible with the standard
     # distributed optimizer (it flattens each param shard to 1D); shard optimizer state via
     # --use-layer-wise-distributed-optimizer instead.
@@ -3151,6 +3176,65 @@ def _add_training_args(parser):
     group.add_argument('--mu2mars-anytime-gamma', type=float, default=0.1,
                        help='Anytime-averaging weight for --mu2mars-variant anytime: '
                        'x_t = gamma * w_t + (1 - gamma) * x_{t-1}. 1.0 gives back MARS.')
+    # ---- DiLoCo / SNOO / mu^2-DiLoCo outer loop (--diloco-inner-steps > 0) ----
+    # See megatron/core/distributed/diloco.py for the exact update rules. Orthogonal to
+    # --optimizer: the inner optimizer is whatever --optimizer selects, the outer rule acts on
+    # the H-step pseudo-gradient. --diloco-workers only controls the *reduction topology*;
+    # K <= 1 keeps the single global DDP group, which is the SNOO setting.
+    group.add_argument('--diloco-inner-steps', type=int, default=0,
+                       help='H, the number of inner iterations per outer round. 0 disables the '
+                       'outer loop entirely.')
+    group.add_argument('--diloco-workers', type=int, default=1,
+                       help='K, the number of DiLoCo workers. Must divide the data-parallel '
+                       'size; each worker is a contiguous slice of the DP group and reduces '
+                       'inner gradients only within itself. 0 or 1 leaves the DP group whole.')
+    group.add_argument('--diloco-outer', type=str, default='nesterov',
+                       choices=['nesterov', 'snoo', 'mu2'],
+                       help='Outer rule. nesterov = DiLoCo (arXiv:2311.08105); snoo = the same '
+                       'rule asserted single-worker (arXiv:2510.04967); mu2 = the STORM-corrected '
+                       'anytime-averaged rule of this work.')
+    group.add_argument('--diloco-outer-lr', type=float, default=0.7,
+                       help="Outer learning rate. DiLoCo's grid-searched value; no outer decay.")
+    group.add_argument('--diloco-outer-momentum', type=float, default=0.9,
+                       help='Outer momentum mu for the nesterov/snoo rule.')
+    group.add_argument('--diloco-outer-nesterov', action='store_true',
+                       dest='diloco_outer_nesterov', default=True,
+                       help='Nesterov extrapolation in the outer step. On by default; kept as an '
+                       'explicit flag so recipes can state it.')
+    group.add_argument('--no-diloco-outer-nesterov', action='store_false',
+                       dest='diloco_outer_nesterov',
+                       help='Use plain heavy-ball instead of Nesterov extrapolation in the outer '
+                       'step (the SlowMo outer rule, without its 1/lr rescaling).')
+    group.add_argument('--diloco-outer-precond', type=str, default='sgd',
+                       choices=['sgd', 'adam'],
+                       help='Preconditioner applied to the mu2 outer direction: sgd = identity, '
+                       'adam = normalisation by the second moment of c_t.')
+    group.add_argument('--diloco-outer-beta2', type=float, default=0.99,
+                       help='Second-moment EMA coefficient for --diloco-outer-precond adam.')
+    group.add_argument('--diloco-outer-eps', type=float, default=1e-8,
+                       help='Epsilon for --diloco-outer-precond adam.')
+    group.add_argument('--diloco-verify-sync', action='store_true',
+                       help='Assert after every outer step that all workers hold identical '
+                       'parameters (one extra scalar all-reduce).')
+    group.add_argument('--mu2diloco-beta', type=float, default=0.025,
+                       help='STORM correction weight beta of the mu2 outer rule; with '
+                       '--mu2diloco-gamma 1 this is a correction weight, not a momentum '
+                       '(the role of --mu2mars-beta1).')
+    group.add_argument('--mu2diloco-beta3', type=float, default=0.95,
+                       help='Outer EMA coefficient for --mu2diloco-variant ema.')
+    group.add_argument('--mu2diloco-gamma', type=float, default=1.0,
+                       help='Scale of the variance-reduction term of the mu2 outer rule, '
+                       'gamma * beta / (1 - beta) * (Delta_t - Delta_{t-1}). 0 removes it.')
+    group.add_argument('--mu2diloco-clip', type=float, default=1.0,
+                       help='Global L2-norm clip on the corrected pseudo-gradient c_t. 0 is off.')
+    group.add_argument('--mu2diloco-anytime-gamma', type=float, default=0.1,
+                       help='Anytime-averaging weight for --mu2diloco-variant anytime: '
+                       'x_{t+1} = gamma * w_{t+1} + (1 - gamma) * x_t. 1.0 collapses x to w.')
+    group.add_argument('--mu2diloco-variant', type=str, default='anytime',
+                       choices=['anytime', 'ema'],
+                       help='mu2 outer formulation: anytime = the mu2-SGD descent/query split '
+                       '(arXiv:2304.04172); ema = a second EMA over the corrected momentum, '
+                       'which ignores --mu2diloco-anytime-gamma.')
     group.add_argument('--ademamix-beta3', type=float, default=0.9999,
                        help='Slow-EMA coefficient for AdEMAMix.')
     group.add_argument('--ademamix-alpha', type=float, default=8.0,
