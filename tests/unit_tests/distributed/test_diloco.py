@@ -23,9 +23,22 @@ from megatron.core.distributed.diloco import (
     DiLoCoOuterOptimizer,
     build_worker_process_groups,
 )
+from megatron.core.optimizer.mars import MARS
+from megatron.core.optimizer.mu2mars import Mu2MARS
 
 H = 3
 OUTER_ROUNDS = 5
+
+# Every inner optimizer of interest allocates its per-param state lazily under
+# `if len(state) == 0`, which is what the outer state must not defeat (F020). SGD is not in the
+# list on purpose: with momentum 0 it has no per-param state at all, so it cannot see the bug.
+INNER_OPTIMIZERS = {
+    'adamw': lambda params: torch.optim.AdamW(params, lr=1e-2),
+    'adam': lambda params: torch.optim.Adam(params, lr=1e-2),
+    'mars': lambda params: MARS(params, lr=1e-2),
+    'mu2mars-ema': lambda params: Mu2MARS(params, lr=1e-2, variant='ema'),
+    'mu2mars-anytime': lambda params: Mu2MARS(params, lr=1e-2, variant='anytime'),
+}
 
 
 def tiny_model(seed=0):
@@ -155,25 +168,115 @@ def test_anytime_gamma_one_collapses_x_to_w():
             torch.testing.assert_close(state['outer_w'], state['outer_x'], rtol=0, atol=0)
 
 
+def local_step(model, optimizer, step):
+    """One ordinary inner iteration, no distribution."""
+    torch.manual_seed(step)
+    optimizer.zero_grad()
+    model(torch.randn(8, 4)).pow(2).mean().backward()
+    optimizer.step()
+
+
+@pytest.mark.parametrize("name", sorted(INNER_OPTIMIZERS))
+def test_fresh_inner_optimizer_steps_after_allocate_state(name):
+    """allocate_state() must not pre-fill opt.state[p]: that defeats every lazy init (F020)."""
+    model = tiny_model(0)
+    inner = INNER_OPTIMIZERS[name](model.parameters())
+    outer = DiLoCoOuterOptimizer(inner, DiLoCoConfig(inner_steps=H, outer='mu2'))
+    outer.allocate_state()
+    for p in model.parameters():
+        assert inner.state.get(p, {}) == {}
+
+    local_step(model, inner, 0)  # KeyError('exp_avg') before the fix
+    outer.note_inner_step(1)
+
+    # ... and once the inner state exists the outer tensors are mirrored into it, which is what
+    # puts them in the checkpoint.
+    assert outer.published
+    for p in model.parameters():
+        for key in outer.state_keys():
+            assert key in inner.state[p]
+            assert inner.state[p][key] is outer.outer_state[p][key]
+
+
+def test_outer_state_is_not_published_before_a_real_inner_step():
+    model = tiny_model(0)
+    inner = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    outer = DiLoCoOuterOptimizer(inner, DiLoCoConfig(inner_steps=H, outer='mu2'))
+    outer.allocate_state()
+    for step in range(H):
+        outer.note_inner_step(step + 1, stepped=False)
+    assert not outer.published
+    assert outer.should_sync(H)  # the boundary does not move with the skip verdict (F028)
+    for p in model.parameters():
+        assert inner.state.get(p, {}) == {}
+
+
+def test_outer_step_rebases_the_anytime_inner_descent_sequence():
+    """mu2mars anytime keeps a copy of the params; left stale it undoes part of the outer step."""
+    model = tiny_model(0)
+    inner = Mu2MARS(model.parameters(), lr=0.1, variant='anytime', anytime_gamma=0.1)
+    outer = DiLoCoOuterOptimizer(inner, DiLoCoConfig(inner_steps=H, outer='nesterov'))
+    outer.allocate_state()
+    for step in range(H):
+        local_step(model, inner, step)
+        outer.note_inner_step(step + 1)
+    outer.outer_step(H)
+
+    rebased = 0
+    for p in model.parameters():
+        w = inner.state[p].get('w')
+        if w is None:
+            continue
+        rebased += 1
+        torch.testing.assert_close(w, p.detach().float(), rtol=0, atol=0)
+    assert rebased > 0
+
+
+def test_forced_sync_starts_a_full_round_and_does_not_replay_t():
+    """A preemption sync at an unaligned iteration must not shorten the next round (F025)."""
+    config = DiLoCoConfig(inner_steps=100, outer='mu2')
+    model = tiny_model(0)
+    outer = DiLoCoOuterOptimizer(torch.optim.SGD(list(model.parameters()), lr=0.0), config)
+    outer.allocate_state()
+
+    assert outer.should_sync(100)
+    outer.outer_step(100)
+    assert outer.outer_steps == 1
+    assert not outer.should_sync(150)
+    outer.outer_step(150)  # forced, unscheduled
+    assert outer.outer_steps == 2
+    assert not outer.should_sync(200)
+    assert outer.should_sync(250)
+    outer.outer_step(250)
+    assert outer.outer_steps == 3
+
+    outer.resume_from(250)
+    assert outer.outer_steps == 3
+    assert not outer.should_sync(300)
+    assert outer.should_sync(350)
+
+
 def test_state_dict_round_trip():
     config = DiLoCoConfig(inner_steps=H, outer='mu2', outer_precond='adam')
     model = tiny_model(0)
-    inner = torch.optim.SGD(list(model.parameters()), lr=0.0)
+    inner = torch.optim.AdamW(model.parameters(), lr=1e-2)
     outer = DiLoCoOuterOptimizer(inner, config)
     outer.allocate_state()
     torch.manual_seed(11)
     for t in range(1, 3):
-        with torch.no_grad():
-            for p in model.parameters():
-                p.copy_(torch.randn_like(p) * 0.1)
+        for step in range(H):
+            local_step(model, inner, t * H + step)
+            outer.note_inner_step((t - 1) * H + step + 1)
         outer.outer_step(t * H)
     # deepcopy: torch's state_dict() hands back live references, a real checkpoint would not.
     saved = copy.deepcopy(inner.state_dict())
 
     reloaded = tiny_model(0)
-    inner2 = torch.optim.SGD(list(reloaded.parameters()), lr=0.0)
+    inner2 = torch.optim.AdamW(reloaded.parameters(), lr=1e-2)
     outer2 = DiLoCoOuterOptimizer(inner2, config)
     inner2.load_state_dict(saved)
+    outer2.allocate_state()  # adopts the loaded tensors, as setup_model_and_optimizer does
+    outer2.resume_from(2 * H)  # ... which then re-anchors the outer clock on the loaded iteration
 
     keys = outer.state_keys()
     assert set(keys) == {'outer_x', 'outer_b', 'outer_dprev', 'outer_w', 'outer_v'}
@@ -349,6 +452,61 @@ def _body_h1_equals_parameter_averaging(rank, world):
         torch.testing.assert_close(flat(model), flat(averaged), rtol=0, atol=1e-6)
 
 
+def _body_fresh_run_with_real_inner_optimizer(rank, world):
+    """A fresh K=2 run over 3 outer rounds with an inner optimizer that initialises lazily.
+
+    This is the production sequence -- allocate_state() at setup, then note_inner_step /
+    should_sync / outer_step per iteration -- and it raised KeyError('exp_avg') on the first
+    inner step before F020 was fixed.
+    """
+    group = build_worker_process_groups(dist.group.WORLD, WORKERS)
+    for name in ('adamw', 'mu2mars-ema', 'mu2mars-anytime'):
+        model = tiny_model(0)
+        inner = INNER_OPTIMIZERS[name](model.parameters())
+        config = DiLoCoConfig(
+            workers=WORKERS, inner_steps=H, outer='mu2', mu2_variant='anytime', verify_sync=True
+        )
+        outer = DiLoCoOuterOptimizer(inner, config, dp_group=dist.group.WORLD)
+        outer.allocate_state()
+
+        gathered = [torch.zeros_like(flat(model)) for _ in range(world)]
+        for step in range(3 * H):
+            _inner_step(model, inner, group, rank, step)
+            outer.note_inner_step(step + 1)
+            if outer.should_sync(step + 1):
+                outer.outer_step(step + 1)
+                dist.all_gather(gathered, flat(model))
+                for other in gathered[1:]:
+                    torch.testing.assert_close(gathered[0], other, rtol=0, atol=0, msg=name)
+            else:
+                dist.all_gather(gathered, flat(model))
+                assert not torch.equal(gathered[0], gathered[2]), name
+
+        assert outer.outer_steps == 3, name
+        assert outer.published, name
+        for p in model.parameters():
+            assert torch.isfinite(p).all(), name
+            for key in outer.state_keys():
+                assert key in inner.state[p], (name, key)
+            if name == 'mu2mars-anytime' and 'w' in inner.state[p]:
+                torch.testing.assert_close(inner.state[p]['w'], p.detach().float(), rtol=0, atol=0)
+
+
+def _body_verify_sync_catches_cancelling_divergence(rank, world):
+    """A signed whole-model sum cannot separate [1, -1] from [-1, 1] (F029)."""
+    model = tiny_model(0)
+    outer = DiLoCoOuterOptimizer(
+        torch.optim.SGD(list(model.parameters()), lr=0.0),
+        DiLoCoConfig(workers=WORKERS, inner_steps=H, verify_sync=True),
+        dp_group=dist.group.WORLD,
+    )
+    diverged = [torch.tensor([1.0, -1.0] if rank < 2 else [-1.0, 1.0])]
+    assert diverged[0].sum().item() == 0.0
+    with pytest.raises(AssertionError, match='workers disagree'):
+        outer._verify_sync(diverged)
+    outer._verify_sync([torch.tensor([1.0, -1.0])])
+
+
 def test_build_worker_process_groups():
     _spawn(_body_subgroups, 29531)
 
@@ -363,6 +521,14 @@ def test_single_worker_outer_step_is_identity():
 
 def test_h1_equals_parameter_averaging():
     _spawn(_body_h1_equals_parameter_averaging, 29534)
+
+
+def test_fresh_run_with_real_inner_optimizer():
+    _spawn(_body_fresh_run_with_real_inner_optimizer, 29535)
+
+
+def test_verify_sync_catches_cancelling_divergence():
+    _spawn(_body_verify_sync_catches_cancelling_divergence, 29536)
 
 
 def test_pg_collection_routes_dp_to_worker_group():
