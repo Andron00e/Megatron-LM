@@ -1596,15 +1596,53 @@ def validate_args(args, defaults={}):
         assert args.save_interval is None or args.save_interval % args.diloco_inner_steps == 0, (
             f"--save-interval {args.save_interval} must be a multiple of --diloco-inner-steps "
             f"{args.diloco_inner_steps}; checkpoints are only consistent at round boundaries.")
+        # The end of training is a save like any other, and the reported final iterate has to be
+        # x_t rather than one worker's partial round, so the budget has to end on a boundary too.
+        assert args.train_iters is None or args.train_iters % args.diloco_inner_steps == 0, (
+            f"--train-iters {args.train_iters} must be a multiple of --diloco-inner-steps "
+            f"{args.diloco_inner_steps}; the last partial round would never be synced.")
+        assert args.train_samples is None or (
+            args.train_samples // args.global_batch_size) % args.diloco_inner_steps == 0, (
+            f"--train-samples {args.train_samples} / --global-batch-size "
+            f"{args.global_batch_size} must be a multiple of --diloco-inner-steps "
+            f"{args.diloco_inner_steps}.")
+        # Between syncs the workers hold different params, so a validation loss reduced over the
+        # DP group would be the mean of K distinct models' losses, not the loss of x_t.
+        assert args.eval_interval is None or args.eval_interval % args.diloco_inner_steps == 0, (
+            f"--eval-interval {args.eval_interval} must be a multiple of --diloco-inner-steps "
+            f"{args.diloco_inner_steps}; between rounds the K workers hold different params.")
+        assert args.exit_interval is None or args.exit_interval % args.diloco_inner_steps == 0, (
+            f"--exit-interval {args.exit_interval} must be a multiple of --diloco-inner-steps "
+            f"{args.diloco_inner_steps}.")
         assert not args.use_torch_fsdp2, "DiLoCo does not support Torch-FSDP2."
         assert not args.use_megatron_fsdp, "DiLoCo does not support Megatron-FSDP."
+        assert args.context_parallel_size == 1, (
+            "DiLoCo does not support context parallelism; the worker sub-group is only built for "
+            "the data-parallel group.")
+        # The expert grad buffers get their own collective group, which the DiLoCo worker split
+        # does not build; without it MoE expert grads would be reduced over a 1-rank group.
+        assert args.num_experts is None, "DiLoCo does not support MoE (--num-experts) for now."
+        # The distributed optimizer is banned at every K, not just K > 1: at K = 1 its param
+        # groups hold flat per-rank *shards*, its save/load path enumerates
+        # ("param", "exp_avg", "exp_avg_sq") explicitly and would drop the outer state, and the
+        # write-back's _copy_main_params_to_model_params only stages shards into the grad buffer
+        # -- the all-gather that publishes them lives in step().
+        assert not args.use_distributed_optimizer, (
+            "DiLoCo does not support the distributed optimizer: it shards main params across the "
+            "DP group, its checkpoint path drops the outer state, and the outer write-back is "
+            "never all-gathered to the model params.")
+        assert not args.overlap_param_gather, "DiLoCo does not support --overlap-param-gather."
         if args.diloco_workers > 1:
-            assert not args.use_distributed_optimizer, (
-                "--diloco-workers > 1 does not support the distributed optimizer; it shards main "
-                "params across the whole DP group, i.e. across workers, so no rank holds a whole "
-                "x and the param all-gather would mix workers.")
-            assert not args.overlap_param_gather, (
-                "--diloco-workers > 1 does not support --overlap-param-gather.")
+            # The gradient sum is worker-local (DDP reduces over pg.dp = the worker sub-group)
+            # but finalize_model_grads normalises by a num_tokens all-reduced over the *global*
+            # DP group, which it takes from parallel_state rather than from that pg_collection,
+            # so every inner gradient would come out K times too small. Fixing the normaliser
+            # means threading the worker pg_collection into config.finalize_model_grads_func;
+            # until then the flag is banned rather than silently mis-scaled.
+            assert not args.calculate_per_token_loss, (
+                "--diloco-workers > 1 does not support --calculate-per-token-loss: the gradient "
+                "sum is worker-local but the token-count normaliser is global, which scales "
+                "every inner gradient by 1/K.")
 
     # MDDecoupling optimizer check. The 2D hypersphere/Muon math is incompatible with the standard
     # distributed optimizer (it flattens each param shard to 1D); shard optimizer state via
