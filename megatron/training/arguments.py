@@ -1571,6 +1571,16 @@ def validate_args(args, defaults={}):
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
 
+    # MARS / Mu2MARS check. Both route on param.ndim, and the standard distributed optimizer
+    # flattens every param shard to 1D, which would silently send every matrix down the AdamW
+    # path. 1-node dense runs replicate optimizer state anyway.
+    if args.optimizer in ('mars', 'mu2mars'):
+        assert not args.use_distributed_optimizer, (
+            f"{args.optimizer} does not support the distributed optimizer; its 2D/1D split "
+            "reads param.ndim, which distributed-optimizer shards flatten to 1D.")
+        assert not args.use_torch_fsdp2, f"{args.optimizer} does not support Torch-FSDP2."
+        assert not args.use_megatron_fsdp, f"{args.optimizer} does not support Megatron-FSDP."
+
     # MDDecoupling optimizer check. The 2D hypersphere/Muon math is incompatible with the standard
     # distributed optimizer (it flattens each param shard to 1D); shard optimizer state via
     # --use-layer-wise-distributed-optimizer instead.
@@ -2970,7 +2980,8 @@ def _add_training_args(parser):
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'md_decoupling',
-                                'neutrino', 'dion', 'neutrinomd'],
+                                'neutrino', 'dion', 'neutrinomd', 'mars', 'mu2mars',
+                                'ademamix'],
                        help='Optimizer function')
     # ---- Neutrino optimizer (--optimizer neutrino) ----
     # Communication-efficient Muon: projects the momentum matrix onto a thin k-dim random
@@ -3097,6 +3108,47 @@ def _add_training_args(parser):
     group.add_argument('--dion-dp-projection', action='store_true',
                        help='Reserved for symmetry with --neutrino-dp-projection; not yet '
                        'wired to a DDP-level skip hook, so this flag is currently a no-op.')
+    # ---- MARS / Mu2MARS / AdEMAMix (--optimizer mars | mu2mars | ademamix) ----
+    # MARS (arXiv:2411.10438) is AdamW on a variance-reduction-corrected gradient; Mu2MARS adds
+    # an outer EMA over the corrected momentum; AdEMAMix (arXiv:2409.03137) mixes a fast and a
+    # slow EMA. All three reuse --lr / --weight-decay / --adam-beta1 / --adam-beta2 / --adam-eps
+    # (the latter three drive the AdamW path taken by 1D/embedding/output params).
+    group.add_argument('--mars-beta1', type=float, default=0.95,
+                       help='Inner EMA coefficient of the MARS corrected gradient.')
+    group.add_argument('--mars-beta2', type=float, default=0.99,
+                       help='Second-moment EMA coefficient for MARS.')
+    group.add_argument('--mars-vr-gamma', type=float, default=0.025,
+                       help='Scale of the MARS variance-reduction term, '
+                       'gamma * beta1 / (1 - beta1) * (g_t - g_{t-1}).')
+    group.add_argument('--mars-type', type=str, default='mars-adamw',
+                       choices=['mars-adamw'],
+                       help='Which version of the MARS framework to use. Only the AdamW inner '
+                       'optimizer is ported; mars-lion/mars-shampoo are not.')
+    group.add_argument('--mars-clip', type=float, default=1.0,
+                       help='L2-norm clip on the MARS/Mu2MARS corrected gradient c_t, per '
+                       'parameter tensor.')
+    group.add_argument('--mars-lr-1d', type=float, default=None,
+                       help='Absolute LR for the AdamW-managed (1D, embedding, output) params '
+                       'under mars/mu2mars, applied as the constant ratio mars_lr_1d / lr on '
+                       'top of the LR schedule. When unset those params track --lr.')
+    group.add_argument('--mars-optimize-1d', action='store_true',
+                       help='Run 1D params through the MARS/Mu2MARS rule instead of AdamW.')
+    group.add_argument('--mu2mars-beta1', type=float, default=0.025,
+                       help='Inner EMA coefficient for Mu2MARS. With --mu2mars-gamma 1 this is '
+                       'the STORM correction weight, not a momentum.')
+    group.add_argument('--mu2mars-beta2', type=float, default=0.99,
+                       help='Second-moment EMA coefficient for Mu2MARS.')
+    group.add_argument('--mu2mars-beta3', type=float, default=0.95,
+                       help='Outer (mu^2) EMA coefficient for Mu2MARS. 0.0 gives back MARS.')
+    group.add_argument('--mu2mars-gamma', type=float, default=1.0,
+                       help='Scale of the variance-reduction term for Mu2MARS.')
+    group.add_argument('--ademamix-beta3', type=float, default=0.9999,
+                       help='Slow-EMA coefficient for AdEMAMix.')
+    group.add_argument('--ademamix-alpha', type=float, default=8.0,
+                       help='Weight of the slow EMA in the AdEMAMix update.')
+    group.add_argument('--ademamix-t-alpha-beta3', type=int, default=None,
+                       help='Warmup length T_{alpha,beta3} for both the AdEMAMix alpha and beta3 '
+                       'schedules. When unset, both stay at their final values from step 1.')
     # ---- MDDecoupling optimizer (--optimizer md_decoupling) ----
     # Magnitude-direction decoupling: hypersphere normalization (direction) + learnable per-axis
     # gains (magnitude) + optional Muon orthogonalized updates. Reuses --adam-beta1/--adam-beta2/

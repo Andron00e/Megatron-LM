@@ -60,8 +60,11 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
+from .ademamix import AdEMAMix
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
+from .mars import MARS
+from .mu2mars import Mu2MARS
 from .optimizer import (
     ChainedOptimizer,
     Float16OptimizerWithFloat16Params,
@@ -603,6 +606,65 @@ def _get_megatron_optimizer_based_on_param_groups(
                     for p in group['params']:
                         if len(opt.state[p]) == 0:
                             opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
+
+        elif config.optimizer in ('mars', 'mu2mars'):
+            kwargs = {
+                "params": param_groups,
+                "lr": config.lr,
+                "weight_decay": config.weight_decay,
+                "eps": config.adam_eps,
+                "clip": config.mars_clip,
+                "optimize_1d": config.mars_optimize_1d,
+                "lr_1d": config.mars_lr_1d,
+                "betas_1d": (config.adam_beta1, config.adam_beta2),
+            }
+            if config.optimizer == 'mars':
+                optimizer = MARS(
+                    betas=(config.mars_beta1, config.mars_beta2),
+                    gamma=config.mars_vr_gamma,
+                    mars_type=config.mars_type,
+                    **kwargs,
+                )
+                state_keys = ('exp_avg', 'exp_avg_sq', 'last_grad')
+            else:
+                optimizer = Mu2MARS(
+                    betas=(config.mu2mars_beta1, config.mu2mars_beta2, config.mu2mars_beta3),
+                    gamma=config.mu2mars_gamma,
+                    **kwargs,
+                )
+                state_keys = ('exp_avg', 'exp_avg_sq', 'mu_avg', 'last_grad')
+
+            def init_state_fn(opt, config=None, state_keys=state_keys):
+                for group in opt.param_groups:
+                    for p in group['params']:
+                        if len(opt.state[p]) == 0:
+                            opt.state[p]['step'] = 0
+                            for key in state_keys:
+                                opt.state[p][key] = torch.zeros_like(p.data)
+
+        elif config.optimizer == 'ademamix':
+            optimizer = AdEMAMix(
+                param_groups,
+                lr=config.lr,
+                betas=(config.adam_beta1, config.adam_beta2, config.ademamix_beta3),
+                alpha=config.ademamix_alpha,
+                beta3_warmup=config.ademamix_t_alpha_beta3,
+                alpha_warmup=config.ademamix_t_alpha_beta3,
+                eps=config.adam_eps,
+                weight_decay=config.weight_decay,
+            )
+
+            def init_state_fn(opt, config=None):
+                for group in opt.param_groups:
+                    for p in group['params']:
+                        if len(opt.state[p]) == 0:
+                            opt.state[p]['step'] = 0
+                            # Mirrors AdEMAMix.step: no fast EMA at all when beta1 == 0.
+                            opt.state[p]['exp_avg_fast'] = (
+                                torch.zeros_like(p.data) if group['betas'][0] != 0.0 else None
+                            )
+                            opt.state[p]['exp_avg_slow'] = torch.zeros_like(p.data)
+                            opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
 
         elif config.optimizer == 'sgd':
             optimizer = SGD(

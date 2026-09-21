@@ -476,6 +476,57 @@ class OptimizerConfig:
     """Reserved for symmetry with --neutrino-dp-projection; not yet wired to a DDP-level skip
     hook in this tree, so leaving this False is always safe (just not communication-optimal)."""
 
+    ###################################################################################
+    # MARS / Mu2MARS / AdEMAMix. See megatron/core/optimizer/{mars,mu2mars,ademamix}.py.
+    # The 1D (and embedding/output) params of mars/mu2mars fall back to AdamW on
+    # adam_beta1/adam_beta2/adam_eps unless mars_optimize_1d is set.
+    ###################################################################################
+    mars_beta1: float = 0.95
+    """Inner EMA coefficient of the MARS corrected gradient."""
+
+    mars_beta2: float = 0.99
+    """Second-moment EMA coefficient for MARS."""
+
+    mars_vr_gamma: float = 0.025
+    """Scale of the MARS variance-reduction term gamma * beta1 / (1 - beta1) * (g_t - g_{t-1})."""
+
+    mars_type: str = 'mars-adamw'
+    """Which version of the MARS framework to use. Only 'mars-adamw' is ported."""
+
+    mars_clip: float = 1.0
+    """L2-norm clip applied to the MARS corrected gradient c_t, per parameter tensor."""
+
+    mars_lr_1d: Optional[float] = None
+    """Absolute LR for the AdamW-managed (1D / embedding / output) params under mars and
+    mu2mars. Applied as the constant ratio mars_lr_1d / lr on top of the LR schedule.
+    When unset those params track --lr."""
+
+    mars_optimize_1d: bool = False
+    """Run 1D params through the MARS/Mu2MARS rule instead of AdamW."""
+
+    mu2mars_beta1: float = 0.025
+    """Inner EMA coefficient for Mu2MARS. With mu2mars_gamma == 1 this is the STORM correction
+    weight rather than a momentum; the heavy momentum lives in mu2mars_beta3."""
+
+    mu2mars_beta2: float = 0.99
+    """Second-moment EMA coefficient for Mu2MARS."""
+
+    mu2mars_beta3: float = 0.95
+    """Outer (mu^2) EMA coefficient for Mu2MARS. 0.0 reduces Mu2MARS to MARS."""
+
+    mu2mars_gamma: float = 1.0
+    """Scale of the variance-reduction term for Mu2MARS."""
+
+    ademamix_beta3: float = 0.9999
+    """Slow-EMA coefficient for AdEMAMix."""
+
+    ademamix_alpha: float = 8.0
+    """Weight of the slow EMA in the AdEMAMix update."""
+
+    ademamix_t_alpha_beta3: Optional[int] = None
+    """Warmup length T_{alpha,beta3} for both the alpha and beta3 schedules. When unset, both
+    are held at their final values from step 1."""
+
     # Lion.
     lion_beta1: float = 0.95
     """First beta coefficient for Lion optimizer (used in sign update). Defaults to 0.95."""

@@ -1676,7 +1676,8 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
 
     config = None
     if (args.optimizer == 'adam' or 'muon' in args.optimizer or args.optimizer == 'md_decoupling'
-            or args.optimizer in ('neutrino', 'dion', 'neutrinomd')):
+            or args.optimizer in ('neutrino', 'dion', 'neutrinomd', 'mars', 'mu2mars',
+                                  'ademamix')):
         # TODO(deyuf): Muon needs both adam + muon but get() only receive one config
         # So for now we keep using adam config that's back compat with old way.
         # md_decoupling likewise chains an external Adam, so it reuses AdamOptimizerConfig.
