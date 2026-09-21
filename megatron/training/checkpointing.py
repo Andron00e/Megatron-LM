@@ -1040,7 +1040,7 @@ def generate_state_dict(
             # DiLoCo's outer state is param-shaped but belongs to neither the model nor the inner
             # optimizer: mirroring it into `optimizer.state[p]` rode the optimizer's sharding path
             # for free but broke every inner optimizer with a fixed state-key table, TE's FusedAdam
-            # above all (F035). It gets its own section, with its own sharding, instead. Built
+            # above all (F039). It gets its own section, with its own sharding, instead. Built
             # before `optimizer` lands in `state_dict`, so it sees the same model-only sharded
             # state dict the optimizer's own param map was built from.
             diloco = get_diloco_outer_optimizer()

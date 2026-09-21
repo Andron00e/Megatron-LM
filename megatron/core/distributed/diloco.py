@@ -58,7 +58,7 @@ main param, and *never* written into the inner ``torch.optim.Optimizer``'s per-p
 dict. Mirroring them there rides the optimizer's own sharding path for free, but it also makes the
 inner optimizer's ``state_dict()`` responsible for them, and TransformerEngine's ``FusedAdam`` --
 the class ``--optimizer adam`` resolves to inside a TE container -- looks every per-param state key
-up in a fixed ``name_to_dtype_map`` and so raises ``KeyError: 'outer_x'`` at the first save (F035).
+up in a fixed ``name_to_dtype_map`` and so raises ``KeyError: 'outer_x'`` at the first save (F039).
 Instead ``sharded_state_dict()`` emits the outer tensors as ``diloco.<key>.<param>`` ShardedTensors
 built from the same model-parameter sharding the optimizer state uses, and the caller stores them
 under the checkpoint's own ``diloco`` key; ``load_state_dict()`` adopts them back on resume. Keeping

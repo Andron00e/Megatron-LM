@@ -193,7 +193,7 @@ def test_outer_state_never_enters_the_inner_optimizer(name):
 
     Writing them into `opt.state[p]` defeated every inner optimizer's lazy init (F020) and, once
     that was deferred, made the inner `state_dict()` responsible for keys it does not know --
-    which is how TE's FusedAdam killed every save (F035).
+    which is how TE's FusedAdam killed every save (F039).
     """
     model = tiny_model(0)
     inner = INNER_OPTIMIZERS[name](model.parameters())
@@ -219,7 +219,7 @@ class StrictStateOptimizer(torch.optim.Optimizer):
     in the cluster container and cannot be imported here.
 
     Its `state_dict()` looks every per-param state key up in a fixed `name_to_dtype_map` and
-    raises `KeyError` on anything else, which is the exact shape of F035.
+    raises `KeyError` on anything else, which is the exact shape of F039.
     """
 
     name_to_dtype_map = {'exp_avg': torch.float32, 'exp_avg_sq': torch.float32}
@@ -243,7 +243,7 @@ class StrictStateOptimizer(torch.optim.Optimizer):
     def state_dict(self):
         for state in self.state.values():
             for name in state:
-                _ = self.name_to_dtype_map[name]  # KeyError: 'outer_x' (F035)
+                _ = self.name_to_dtype_map[name]  # KeyError: 'outer_x' (F039)
         return super().state_dict()
 
 
@@ -384,7 +384,7 @@ def test_state_dict_round_trip():
     model, inner, outer = _trained_controller(config)
     saved = _save(outer)
 
-    # Nothing of the outer state leaked into the inner optimizer's own checkpoint section (F035).
+    # Nothing of the outer state leaked into the inner optimizer's own checkpoint section (F039).
     for state in inner.state_dict()['state'].values():
         assert not any(key.startswith('outer_') for key in state)
 
