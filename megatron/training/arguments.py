@@ -1644,6 +1644,14 @@ def validate_args(args, defaults={}):
                 "sum is worker-local but the token-count normaliser is global, which scales "
                 "every inner gradient by 1/K.")
 
+    # AdEMAMix check. It is elementwise, so it keeps the standard distributed optimizer, but its
+    # state keys are exp_avg_fast/exp_avg_slow/exp_avg_sq and the legacy gather/scatter save path
+    # hardcodes ("param", "exp_avg", "exp_avg_sq") -> KeyError at the first checkpoint.
+    if args.optimizer == 'ademamix' and args.use_distributed_optimizer:
+        assert args.ckpt_format == 'torch_dist', (
+            "ademamix with the distributed optimizer requires --ckpt-format torch_dist; the "
+            "legacy 'torch' format saves only exp_avg/exp_avg_sq.")
+
     # MDDecoupling optimizer check. The 2D hypersphere/Muon math is incompatible with the standard
     # distributed optimizer (it flattens each param shard to 1D); shard optimizer state via
     # --use-layer-wise-distributed-optimizer instead.

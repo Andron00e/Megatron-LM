@@ -52,6 +52,7 @@ from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_b
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
+from .ademamix import AdEMAMix
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
     MixedPrecisionOptimizer,
@@ -524,11 +525,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
 
+        # AdEMAMix is elementwise like Adam, so sharding its state is sound; its state keys
+        # (exp_avg_fast/exp_avg_slow/exp_avg_sq) are only a problem for the legacy
+        # gather/scatter save paths, which hardcode ("param", "exp_avg", "exp_avg_sq").
+        # arguments.py restricts it to --ckpt-format torch_dist, whose model-space path
+        # (_get_main_param_and_optimizer_states) is generic over state keys.
         assert (
-            isinstance(optimizer, (Adam, torch.optim.AdamW, HybridDeviceOptimizer))
+            isinstance(optimizer, (Adam, torch.optim.AdamW, AdEMAMix, HybridDeviceOptimizer))
             or optimizer is None
         ), (
-            "Only Adam and HybridDeviceOptimizer currently supported, "
+            "Only Adam, AdEMAMix and HybridDeviceOptimizer currently supported, "
             "due to checkpointing requirements."
         )
 
