@@ -517,6 +517,15 @@ class OptimizerConfig:
     mu2mars_gamma: float = 1.0
     """Scale of the variance-reduction term for Mu2MARS."""
 
+    mu2mars_variant: str = 'ema'
+    """Which double-momentum formulation Mu2MARS uses: 'ema' (outer EMA over the corrected
+    momentum) or 'anytime' (the mu^2-SGD descent/query split, arXiv:2304.04172).
+    mu2mars_beta3 is unused by 'anytime'."""
+
+    mu2mars_anytime_gamma: float = 0.1
+    """Anytime-averaging weight of mu2mars_variant='anytime': x_t = gamma * w_t +
+    (1 - gamma) * x_{t-1}. 1.0 collapses the average onto the descent sequence, i.e. MARS."""
+
     ademamix_beta3: float = 0.9999
     """Slow-EMA coefficient for AdEMAMix."""
 

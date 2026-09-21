@@ -3142,6 +3142,15 @@ def _add_training_args(parser):
                        help='Outer (mu^2) EMA coefficient for Mu2MARS. 0.0 gives back MARS.')
     group.add_argument('--mu2mars-gamma', type=float, default=1.0,
                        help='Scale of the variance-reduction term for Mu2MARS.')
+    group.add_argument('--mu2mars-variant', type=str, default='ema',
+                       choices=['ema', 'anytime'],
+                       help='Double-momentum formulation for Mu2MARS: ema = outer EMA over the '
+                       'corrected momentum; anytime = the mu2-SGD descent/query split '
+                       '(arXiv:2304.04172), which ignores --mu2mars-beta3 and costs one extra '
+                       'fp32 copy of every 2D param.')
+    group.add_argument('--mu2mars-anytime-gamma', type=float, default=0.1,
+                       help='Anytime-averaging weight for --mu2mars-variant anytime: '
+                       'x_t = gamma * w_t + (1 - gamma) * x_{t-1}. 1.0 gives back MARS.')
     group.add_argument('--ademamix-beta3', type=float, default=0.9999,
                        help='Slow-EMA coefficient for AdEMAMix.')
     group.add_argument('--ademamix-alpha', type=float, default=8.0,

@@ -63,7 +63,7 @@ from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_versio
 from .ademamix import AdEMAMix
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
-from .mars import MARS
+from .mars import MARS, is_matrix_param
 from .mu2mars import Mu2MARS
 from .optimizer import (
     ChainedOptimizer,
@@ -630,17 +630,24 @@ def _get_megatron_optimizer_based_on_param_groups(
                 optimizer = Mu2MARS(
                     betas=(config.mu2mars_beta1, config.mu2mars_beta2, config.mu2mars_beta3),
                     gamma=config.mu2mars_gamma,
+                    variant=config.mu2mars_variant,
+                    anytime_gamma=config.mu2mars_anytime_gamma,
                     **kwargs,
                 )
                 state_keys = ('exp_avg', 'exp_avg_sq', 'mu_avg', 'last_grad')
+            anytime_w = config.optimizer == 'mu2mars' and config.mu2mars_variant == 'anytime'
 
-            def init_state_fn(opt, config=None, state_keys=state_keys):
+            def init_state_fn(opt, config=None, state_keys=state_keys, anytime_w=anytime_w):
                 for group in opt.param_groups:
                     for p in group['params']:
                         if len(opt.state[p]) == 0:
                             opt.state[p]['step'] = 0
                             for key in state_keys:
                                 opt.state[p][key] = torch.zeros_like(p.data)
+                            # The mu^2-SGD descent sequence starts at the param, not at zero,
+                            # and only exists for params Mu2MARS keeps off the AdamW path.
+                            if anytime_w and (opt.optimize_1d or is_matrix_param(p)):
+                                opt.state[p]['w'] = p.data.clone().float()
 
         elif config.optimizer == 'ademamix':
             optimizer = AdEMAMix(
