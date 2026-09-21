@@ -83,7 +83,7 @@ _OUTER_OPTIMIZER = None
 _LOG_STATS = {}
 
 # Inner optimizer state that is a *copy of the parameters* rather than a moment, and therefore has
-# to be rebased onto the new outer iterate (see `_rebase_inner_param_state`).
+# to follow the params through the outer step (see `_rebase_inner_param_state`).
 _PARAM_VALUED_INNER_KEYS = ('w',)
 
 
@@ -337,8 +337,8 @@ class DiLoCoOuterOptimizer:
         )
 
         for state, p in items:
+            self._rebase_inner_param_state(p, state['outer_x'])
             p.detach().copy_(state['outer_x'])
-        self._rebase_inner_param_state()
         if config.verify_sync and world > 1:
             self._verify_sync([p for _, p in items])
 
@@ -418,23 +418,31 @@ class DiLoCoOuterOptimizer:
                     update = update.div_(denom)
                 state['outer_x'].add_(update, alpha=-config.outer_lr)
 
-    def _rebase_inner_param_state(self):
-        """Restart inner state that is a copy of the params, not a moment, at the new iterate.
+    def _rebase_inner_param_state(self, param, outer_x):
+        """Translate inner state that is a copy of the params, not a moment, by the outer step.
+
+        Called with the pre-jump `param` still in place, once per param, so the displacement
+        x_{t+1} - x^(k)_{t,H} is available without a second copy of the model.
 
         Keeping the inner *moments* across an outer step is what DiLoCo prescribes. A
         parameter-valued inner state is different: mu2mars's anytime descent sequence w sits on
         the pre-jump trajectory, and its next inner step pulls p back toward it by anytime_gamma
-        of the whole outer update, partially undoing the outer step. Rebasing w onto x_{t+1}
-        restarts both halves of the anytime pair at the outer iterate, as the params themselves
-        are.
+        of the whole outer update, partially undoing the outer step. Setting w := x_{t+1} removes
+        that drag, but the anytime pair's steady state is a *lead* w - p = -((1-ga)/ga) lr u, and
+        it is that lead, not ga, that makes p advance by the full lr u per inner step: a reset
+        would run the first ~2/ga iterations of every round at a reduced effective inner LR (22
+        iterations at the default ga = 0.1, against H = 30-100), mismatching the inner step of a
+        mu2diloco arm against its non-DiLoCo mu2mars control by an amount that depends on H.
+        Translating w by the same displacement the params take removes the drag and preserves the
+        lead: the inner optimizer sees only its new position.
         """
         for opt in self.optimizers:
-            for group in opt.param_groups:
-                for p in group['params']:
-                    state = opt.state.get(p, {})
-                    for key in _PARAM_VALUED_INNER_KEYS:
-                        if key in state:
-                            state[key].copy_(p.detach())
+            state = opt.state.get(param)
+            if not state:
+                continue
+            for key in _PARAM_VALUED_INNER_KEYS:
+                if key in state:
+                    state[key].sub_(param.detach()).add_(outer_x)
 
     def _verify_sync(self, params):
         """Max-abs spread per parameter: a signed whole-model sum hides cancelling divergence."""

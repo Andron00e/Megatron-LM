@@ -176,6 +176,17 @@ def local_step(model, optimizer, step):
     optimizer.step()
 
 
+def prescribed_grad_step(params, optimizer, grads):
+    """One inner step on a fixed gradient; returns the l2 norm of the parameter displacement."""
+    before = [p.detach().clone() for p in params]
+    for p, grad in zip(params, grads):
+        p.grad = grad.clone()
+    optimizer.step()
+    return torch.cat(
+        [(p.detach() - b).reshape(-1) for p, b in zip(params, before)]
+    ).norm().item()
+
+
 @pytest.mark.parametrize("name", sorted(INNER_OPTIMIZERS))
 def test_fresh_inner_optimizer_steps_after_allocate_state(name):
     """allocate_state() must not pre-fill opt.state[p]: that defeats every lazy init (F020)."""
@@ -211,7 +222,7 @@ def test_outer_state_is_not_published_before_a_real_inner_step():
         assert inner.state.get(p, {}) == {}
 
 
-def test_outer_step_rebases_the_anytime_inner_descent_sequence():
+def test_outer_step_translates_the_anytime_inner_descent_sequence():
     """mu2mars anytime keeps a copy of the params; left stale it undoes part of the outer step."""
     model = tiny_model(0)
     inner = Mu2MARS(model.parameters(), lr=0.1, variant='anytime', anytime_gamma=0.1)
@@ -220,16 +231,66 @@ def test_outer_step_rebases_the_anytime_inner_descent_sequence():
     for step in range(H):
         local_step(model, inner, step)
         outer.note_inner_step(step + 1)
+
+    # Only the matrix params take the anytime branch and so carry `w`; 1-D params are AdamW.
+    before = {
+        p: (p.detach().clone(), inner.state[p]['w'].clone())
+        for p in model.parameters()
+        if 'w' in inner.state[p]
+    }
     outer.outer_step(H)
 
-    rebased = 0
-    for p in model.parameters():
-        w = inner.state[p].get('w')
-        if w is None:
-            continue
-        rebased += 1
-        torch.testing.assert_close(w, p.detach().float(), rtol=0, atol=0)
-    assert rebased > 0
+    moved = 0
+    for p, (p_before, w_before) in before.items():
+        displacement = p.detach() - p_before
+        if displacement.norm() > 1e-3:
+            moved += 1
+        # w follows the params: it is neither left on the pre-jump trajectory (F026) nor reset
+        # onto x_{t+1}, which would zero the lead w - p the anytime pair runs on (F032).
+        torch.testing.assert_close(
+            inner.state[p]['w'], w_before + displacement, rtol=1e-6, atol=1e-7
+        )
+    assert moved > 0
+
+
+def test_outer_step_preserves_the_anytime_inner_step_size():
+    """The whole point of translating w: the inner optimizer must not feel the outer jump (F032).
+
+    The gradient is prescribed rather than taken from the model, so with weight_decay 0 the
+    mu2mars update depends only on the optimizer state -- a control that never saw the outer step
+    then gives the inner displacement the round would have had, exactly.
+    """
+    model, control_model = tiny_model(0), tiny_model(0)
+    params = list(model.parameters())
+    control_params = list(control_model.parameters())
+    inner = Mu2MARS(params, lr=0.05, variant='anytime', anytime_gamma=0.1, weight_decay=0.0)
+    control_inner = Mu2MARS(
+        control_params, lr=0.05, variant='anytime', anytime_gamma=0.1, weight_decay=0.0
+    )
+    outer = DiLoCoOuterOptimizer(inner, DiLoCoConfig(inner_steps=H, outer='nesterov'))
+    outer.allocate_state()
+
+    torch.manual_seed(7)
+    grads = [torch.randn_like(p) * 0.1 for p in params]
+    for step in range(20):
+        prescribed_grad_step(params, inner, grads)
+        prescribed_grad_step(control_params, control_inner, grads)
+        outer.note_inner_step(step + 1)
+
+    # The 20 inner steps have moved the params away from the anchor, so this is a real jump.
+    outer.outer_step(20)
+    assert (
+        torch.cat([(p.detach() - c.detach()).reshape(-1) for p, c in zip(params, control_params)])
+        .norm()
+        .item()
+        > 1e-3
+    )
+
+    for _ in range(5):
+        after = prescribed_grad_step(params, inner, grads)
+        undisturbed = prescribed_grad_step(control_params, control_inner, grads)
+        assert undisturbed > 0
+        assert after == pytest.approx(undisturbed, rel=1e-6)
 
 
 def test_forced_sync_starts_a_full_round_and_does_not_replay_t():
@@ -474,7 +535,23 @@ def _body_fresh_run_with_real_inner_optimizer(rank, world):
             _inner_step(model, inner, group, rank, step)
             outer.note_inner_step(step + 1)
             if outer.should_sync(step + 1):
+                leads = {
+                    p: inner.state[p]['w'] - p.detach().float()
+                    for p in model.parameters()
+                    if 'w' in inner.state[p]
+                }
                 outer.outer_step(step + 1)
+                # The anytime descent sequence is translated by the outer jump, so the lead it
+                # runs on survives the round boundary (F032); it stays worker-local like the
+                # moments, so it is not part of the cross-worker agreement checked below.
+                for p, lead in leads.items():
+                    torch.testing.assert_close(
+                        inner.state[p]['w'] - p.detach().float(),
+                        lead,
+                        rtol=1e-6,
+                        atol=1e-7,
+                        msg=name,
+                    )
                 dist.all_gather(gathered, flat(model))
                 for other in gathered[1:]:
                     torch.testing.assert_close(gathered[0], other, rtol=0, atol=0, msg=name)
@@ -489,7 +566,7 @@ def _body_fresh_run_with_real_inner_optimizer(rank, world):
             for key in outer.state_keys():
                 assert key in inner.state[p], (name, key)
             if name == 'mu2mars-anytime' and 'w' in inner.state[p]:
-                torch.testing.assert_close(inner.state[p]['w'], p.detach().float(), rtol=0, atol=0)
+                assert (inner.state[p]['w'] - p.detach().float()).abs().max() > 0, name
 
 
 def _body_verify_sync_catches_cancelling_divergence(rank, world):
