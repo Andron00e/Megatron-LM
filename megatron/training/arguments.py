@@ -1614,6 +1614,18 @@ def validate_args(args, defaults={}):
         assert args.exit_interval is None or args.exit_interval % args.diloco_inner_steps == 0, (
             f"--exit-interval {args.exit_interval} must be a multiple of --diloco-inner-steps "
             f"{args.diloco_inner_steps}.")
+        # The other two save cadences. Both route through the same forced outer step, so an
+        # unaligned one would not corrupt a checkpoint -- it would silently redefine H, which is
+        # the axis being ablated.
+        assert args.non_persistent_save_interval is None or (
+            args.non_persistent_save_interval % args.diloco_inner_steps == 0), (
+            f"--non-persistent-save-interval {args.non_persistent_save_interval} must be a "
+            f"multiple of --diloco-inner-steps {args.diloco_inner_steps}; a save off a round "
+            f"boundary forces an unscheduled outer step and shortens that round.")
+        assert args.save_iters is None or all(
+            i % args.diloco_inner_steps == 0 for i in args.save_iters), (
+            f"every --save-iters entry must be a multiple of --diloco-inner-steps "
+            f"{args.diloco_inner_steps}; got {sorted(args.save_iters or [])}.")
         assert not args.use_torch_fsdp2, "DiLoCo does not support Torch-FSDP2."
         assert not args.use_megatron_fsdp, "DiLoCo does not support Megatron-FSDP."
         assert args.context_parallel_size == 1, (
@@ -1643,6 +1655,13 @@ def validate_args(args, defaults={}):
                 "--diloco-workers > 1 does not support --calculate-per-token-loss: the gradient "
                 "sum is worker-local but the token-count normaliser is global, which scales "
                 "every inner gradient by 1/K.")
+            # broadcast_params() broadcasts over DDP's dp_cp_group, which DiLoCo has retargeted
+            # to the worker sub-group, so the K workers would start from K different x_0 -- the
+            # outer step averages them into something no worker ever had and only
+            # --diloco-verify-sync would notice.
+            assert not args.data_parallel_random_init, (
+                "--diloco-workers > 1 does not support --data-parallel-random-init: the initial "
+                "parameter broadcast is worker-local, so the workers would never agree on x_0.")
 
     # AdEMAMix check. It is elementwise, so it keeps the standard distributed optimizer, but its
     # state keys are exp_avg_fast/exp_avg_slow/exp_avg_sq and the legacy gather/scatter save path
