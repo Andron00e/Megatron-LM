@@ -41,6 +41,7 @@ def as_state(params):
             'm': [0.0] * p.numel(),
             'v': [0.0] * p.numel(),
             'mu': [0.0] * p.numel(),
+            'w': p.detach().flatten().double().tolist(),
             'lg': [0.0] * p.numel(),
             'ndim': p.ndim,
         }
@@ -96,6 +97,27 @@ def ref_mu2mars_step(states, grads, step, lr, wd, betas, eps, gamma, clip, optim
                 st['v'][i] = beta2 * st['v'][i] + (1.0 - beta2) * c[i] * c[i]
                 denom = math.sqrt(st['v'][i] / bc2) + eps
                 st['p'][i] -= lr * (wd * st['p'][i] + (st['mu'][i] / bc3) / denom)
+        else:
+            for i in range(len(g)):
+                ref_adamw_element(st, i, g[i], lr * lr_1d_factor, wd, *betas_1d, eps, step)
+        st['lg'] = g
+
+
+def ref_mu2mars_anytime_step(states, grads, step, lr, wd, betas, eps, gamma, clip,
+                             anytime_gamma, optimize_1d, lr_1d_factor, betas_1d):
+    beta1, beta2 = betas[0], betas[1]
+    for st, grad in zip(states, grads):
+        g = grad.flatten().double().tolist()
+        if optimize_1d or st['ndim'] == 2:
+            c = corrected(st, g, beta1, gamma if st['ndim'] == 2 else 0.0, clip)
+            bc1 = 1.0 - beta1**step
+            bc2 = 1.0 - beta2**step
+            for i in range(len(g)):
+                st['m'][i] = beta1 * st['m'][i] + (1.0 - beta1) * c[i]
+                st['v'][i] = beta2 * st['v'][i] + (1.0 - beta2) * c[i] * c[i]
+                denom = math.sqrt(st['v'][i] / bc2) + eps
+                st['w'][i] -= lr * (wd * st['w'][i] + (st['m'][i] / bc1) / denom)
+                st['p'][i] = anytime_gamma * st['w'][i] + (1.0 - anytime_gamma) * st['p'][i]
         else:
             for i in range(len(g)):
                 ref_adamw_element(st, i, g[i], lr * lr_1d_factor, wd, *betas_1d, eps, step)
@@ -187,6 +209,79 @@ def test_mu2mars_optimize_1d_matches_reference():
         ref_mu2mars_step(states, grads, step, lr, wd, betas, eps, gamma, clip, True, 1.0,
                          (0.9, 0.95))
     assert_matches(params, states)
+
+
+def test_mu2mars_anytime_matches_reference():
+    model = make_model()
+    params = list(model.parameters())
+    states = as_state(params)
+    lr, wd, eps, gamma, clip = 1e-2, 0.1, 1e-8, 1.0, 1.0
+    betas, betas_1d, anytime_gamma = (0.025, 0.99, 0.95), (0.9, 0.95), 0.1
+    opt = Mu2MARS(params, lr=lr, betas=betas, eps=eps, weight_decay=wd, gamma=gamma, clip=clip,
+                  variant='anytime', anytime_gamma=anytime_gamma, betas_1d=betas_1d)
+    for step in range(1, 11):
+        grads = make_grads(model, seed=step)
+        set_grads(params, grads)
+        opt.step()
+        ref_mu2mars_anytime_step(states, grads, step, lr, wd, betas, eps, gamma, clip,
+                                 anytime_gamma, False, 1.0, betas_1d)
+    assert_matches(params, states)
+
+
+def test_mu2mars_anytime_optimize_1d_matches_reference():
+    model = make_model()
+    params = list(model.parameters())
+    states = as_state(params)
+    lr, wd, eps, gamma, clip = 1e-2, 0.05, 1e-8, 1.0, 2.0
+    betas, anytime_gamma = (0.1, 0.99, 0.9), 0.25
+    opt = Mu2MARS(params, lr=lr, betas=betas, eps=eps, weight_decay=wd, gamma=gamma, clip=clip,
+                  variant='anytime', anytime_gamma=anytime_gamma, optimize_1d=True)
+    for step in range(1, 11):
+        grads = make_grads(model, seed=300 + step)
+        set_grads(params, grads)
+        opt.step()
+        ref_mu2mars_anytime_step(states, grads, step, lr, wd, betas, eps, gamma, clip,
+                                 anytime_gamma, True, 1.0, (0.9, 0.95))
+    assert_matches(params, states)
+
+
+def test_mu2mars_anytime_gamma_one_equals_mars():
+    """x_{t+1} = w_{t+1} kills the averaging, so the 2D rule is exactly MARS."""
+    model = make_model()
+    params = list(model.parameters())
+    reference = [p.detach().clone().requires_grad_(True) for p in params]
+    lr, wd, eps, gamma, clip = 1e-2, 0.1, 1e-8, 0.025, 1.0
+    opt = Mu2MARS(params, lr=lr, betas=(0.95, 0.99, 0.5), eps=eps, weight_decay=wd, gamma=gamma,
+                  clip=clip, variant='anytime', anytime_gamma=1.0)
+    ref = MARS(reference, lr=lr, betas=(0.95, 0.99), eps=eps, weight_decay=wd, gamma=gamma,
+               clip=clip)
+    for step in range(1, 11):
+        grads = make_grads(model, seed=step)
+        set_grads(params, grads)
+        set_grads(reference, grads)
+        opt.step()
+        ref.step()
+    for p, q in zip(params, reference):
+        torch.testing.assert_close(p.detach(), q.detach(), **TOL)
+
+
+def test_mu2mars_anytime_w_is_not_aliased():
+    """p is the query sequence x_t and state['w'] the descent sequence; they must diverge."""
+    model = make_model()
+    params = list(model.parameters())
+    opt = Mu2MARS(params, lr=1e-2, weight_decay=0.1, variant='anytime', anytime_gamma=0.1)
+    for step in range(1, 4):
+        set_grads(params, make_grads(model, seed=step))
+        opt.step()
+    matrices = [p for p in params if p.ndim == 2]
+    assert matrices
+    for p in matrices:
+        w = opt.state[p]['w']
+        assert w.data_ptr() != p.data_ptr()
+        assert not torch.allclose(w, p.detach())
+    for p in params:
+        if p.ndim != 2:
+            assert 'w' not in opt.state[p]
 
 
 def test_ademamix_matches_reference():
@@ -298,15 +393,25 @@ def test_mu2mars_beta3_zero_equals_mars():
 
 @pytest.mark.parametrize('cls', [MARS, Mu2MARS, AdEMAMix])
 def test_state_dict_round_trip(cls):
+    check_state_dict_round_trip(lambda ps: cls(ps, lr=1e-2, weight_decay=0.1))
+
+
+def test_mu2mars_anytime_state_dict_round_trip():
+    check_state_dict_round_trip(
+        lambda ps: Mu2MARS(ps, lr=1e-2, weight_decay=0.1, variant='anytime', anytime_gamma=0.1)
+    )
+
+
+def check_state_dict_round_trip(make_opt):
     model = make_model()
     params = list(model.parameters())
-    opt = cls(params, lr=1e-2, weight_decay=0.1)
+    opt = make_opt(params)
     for step in range(1, 4):
         set_grads(params, make_grads(model, seed=step))
         opt.step()
 
     resumed = [p.detach().clone().requires_grad_(True) for p in params]
-    opt2 = cls(resumed, lr=1e-2, weight_decay=0.1)
+    opt2 = make_opt(resumed)
     opt2.load_state_dict(copy.deepcopy(opt.state_dict()))
 
     grads = make_grads(model, seed=99)
