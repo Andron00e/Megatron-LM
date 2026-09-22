@@ -644,6 +644,30 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         return getattr(self, 'grad_stats_parallel_group', None)
 
+    def _inner_optimizer_state_keys(self, group_index: int) -> Tuple[str, ...]:
+        """Per-param state keys the inner optimizer creates for the params of
+        `param_groups[group_index]`.
+
+        Optimizers whose state is not Adam-shaped (e.g. AdEMAMix) declare their keys with a
+        `state_keys(group)` method; everything else keeps Adam's two.
+        """
+        declared = getattr(self.optimizer, "state_keys", None)
+        if declared is None:
+            return ("exp_avg", "exp_avg_sq")
+        return tuple(declared(self.optimizer.param_groups[group_index]))
+
+    def _inner_optimizer_keeps_step(self) -> bool:
+        """Whether the inner optimizer keeps `step` in per-param state.
+
+        Every sharded param state format skips 0-dim `step` tensors and reads `step` back from
+        `param_groups`, so such an optimizer's step has to be published there (as TE FusedAdam
+        does) or it is lost on resume.
+        """
+        return any(
+            "step" in self._inner_optimizer_state_keys(group_index)
+            for group_index in range(len(self.optimizer.param_groups))
+        )
+
     def state_dict(self):
         """
         The state dict contains all non-DP-rank-dependent (i.e., non-parameter-
@@ -654,9 +678,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         inner_state_dict = self.optimizer.state_dict()
         state_dict = {}
+        # Optimizers that declare `step` themselves are handled below, not by the Adam branches.
+        keeps_step = self._inner_optimizer_keeps_step()
 
         # Extract 'step', for non-Apex/TE support.
-        if not HAVE_APEX_OR_TE:
+        if not HAVE_APEX_OR_TE and not keeps_step:
             steps = list(set([s["step"].item() for s in inner_state_dict["state"].values()]))
             assert len(steps) == 1
             step = steps[0]
@@ -688,7 +714,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         state_dict['optimizer'] = {k: v for k, v in inner_state_dict.items() if k != "state"}
         for param_group in state_dict["optimizer"]["param_groups"]:
             del param_group["params"]
-            if not HAVE_APEX_OR_TE:
+            if not HAVE_APEX_OR_TE and not keeps_step:
                 # Native PyTorch param group requires step (i.e., iteration).
                 param_group["step"] = step
             elif (
@@ -699,6 +725,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 # TE FusedAdam will not accumulate step for empty param groups, so we need to
                 # align the step across param groups.
                 param_group["step"] = int(step)
+
+        if keeps_step and len(inner_state_dict["state"]) > 0:
+            # The branches above only know Adam's step locations. An optimizer that keeps step
+            # in per-param state must publish it in param_groups too, since that is the only
+            # place a step survives the sharded param state formats. Empty state means this is
+            # a load, where the step comes from the checkpoint instead.
+            steps = set(int(s["step"].item()) for s in inner_state_dict["state"].values())
+            assert len(steps) == 1, f"steps: {steps}"
+            step = steps.pop()
+            for param_group in state_dict["optimizer"]["param_groups"]:
+                param_group["step"] = step
 
         # Grad scaler state.
         if self.grad_scaler:
@@ -747,6 +784,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if len(self.optimizer.state) == 0:
             if isinstance(self.optimizer, HybridDeviceOptimizer):
                 self.optimizer.dummy_step()
+
+        # Optimizers that declare `step` themselves are handled below, not by the Adam branches.
+        keeps_step = self._inner_optimizer_keeps_step()
 
         # Get the Torch optimizer's state dict.
         # - This 'inner' optimizer at this point is unallocated, and only
@@ -806,16 +846,26 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                             # Allocate dummy tensors.
                             numel = len(param_range_map["gbuf_world"])
+                            # The shard main params live on the current device; taking the
+                            # device from one of them keeps this path runnable on CPU.
+                            device = self.optimizer.param_groups[group_index]["params"][
+                                group_order
+                            ].device
                             init_shard = lambda dtype=torch.float32: torch.empty(
-                                (numel,), dtype=dtype, device=torch.cuda.current_device()
+                                (numel,), dtype=dtype, device=device
                             )
 
                             # For precision_aware_optimizer, the empty tensors should also be
                             #  initialized with the correct dtype.
-                            tensors = {
-                                "exp_avg": init_shard(self.config.exp_avg_dtype),
-                                "exp_avg_sq": init_shard(self.config.exp_avg_sq_dtype),
-                            }
+                            tensors = {}
+                            for state_key in self._inner_optimizer_state_keys(group_index):
+                                if state_key == "step":
+                                    # 0-dim and on CPU, not a shard of the grad buffer.
+                                    tensors[state_key] = torch.zeros((), dtype=torch.float32)
+                                elif state_key.startswith("exp_avg_sq"):
+                                    tensors[state_key] = init_shard(self.config.exp_avg_sq_dtype)
+                                else:
+                                    tensors[state_key] = init_shard(self.config.exp_avg_dtype)
                             if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                                 if self.config.store_param_remainders and self.config.bf16:
                                     tensors["master_param"] = init_shard(torch.int16)
@@ -834,7 +884,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             state_dict_state = inner_state_dict["state"]
 
         # Extract 'step', for non-Apex/TE support.
-        if not HAVE_APEX_OR_TE:
+        if not HAVE_APEX_OR_TE and not keeps_step:
             steps = list(set([g["step"] for g in state_dict["optimizer"]["param_groups"]]))
             assert len(steps) == 1
             step = torch.tensor(steps[0], dtype=torch.float)
@@ -853,6 +903,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 step = torch.tensor(steps[0], dtype=torch.float32, device="cpu")
                 for v in self.optimizer.state.values():
                     v["step"] = step.detach().clone()
+
+        if keeps_step:
+            # Inverse of the param_groups publication in state_dict(): put the checkpointed step
+            # back into per-param state, where such an optimizer reads it. Filled in place, so
+            # that each param keeps its own step tensor and the sharded param state built from
+            # these same tensors (as a LocalNonpersistentObject) does not copy a stale value
+            # back over it.
+            steps = set(g["step"] for g in state_dict["optimizer"]["param_groups"] if "step" in g)
+            assert len(steps) <= 1, f"steps: {steps}"
+            if steps:
+                step = float(steps.pop())
+                for s in state_dict_state.values():
+                    s["step"].fill_(step)
 
         # Optimizer.
         self.optimizer.load_state_dict(

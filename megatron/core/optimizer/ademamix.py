@@ -2,9 +2,11 @@
 AdEMAMix (arXiv:2409.03137).
 
 Ported verbatim from Andron00e/Megatron-LM origin/muon (f3dfe32f1), except that the step
-counter now lives in per-param state: Megatron checkpoints per-param `step` as a single
-`common_step` and silently drops a per-group one, which reset bias correction and the
-alpha/beta3 warmups on every restart.
+counter now lives in per-param state as a 0-dim tensor: Megatron checkpoints per-param `step`
+as a single `common_step` and silently drops a per-group one, and the distributed optimizer
+only carries a step it can read as a tensor, so a Python int reset bias correction and the
+alpha/beta3 warmups on every restart (F031). `state_keys` declares the state layout the
+distributed optimizer preallocates on `--load` (F088).
 """
 
 import math
@@ -71,6 +73,17 @@ class AdEMAMix(torch.optim.Optimizer):
         )
         super().__init__(params, defaults)
 
+    def state_keys(self, group: Dict[str, Any]) -> Tuple[str, ...]:
+        """Per-param state keys this optimizer creates for the params of `group`.
+
+        The distributed optimizer preallocates its placeholder state from this list when it
+        loads a checkpoint before the first step; `step` is a 0-dim tensor and there is no fast
+        EMA at all when beta1 == 0 (see `step`).
+        """
+        if group["betas"][0] == 0.0:
+            return ("step", "exp_avg_slow", "exp_avg_sq")
+        return ("step", "exp_avg_fast", "exp_avg_slow", "exp_avg_sq")
+
     @torch.no_grad()
     def step(self, closure=None):
         """Performs a single optimization step."""
@@ -99,21 +112,20 @@ class AdEMAMix(torch.optim.Optimizer):
 
                 # State initialization
                 if len(state) == 0:
-                    state["step"] = 0
+                    # On CPU, like torch.optim.Adam: incrementing it must not sync the device.
+                    state["step"] = torch.zeros((), dtype=torch.float32)
                     if beta1 != 0.0:  # save memory in case beta1 is 0.0
                         state["exp_avg_fast"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    else:
-                        state["exp_avg_fast"] = None
                     state["exp_avg_slow"] = torch.zeros_like(p, memory_format=torch.preserve_format)
                     state["exp_avg_sq"]   = torch.zeros_like(p, memory_format=torch.preserve_format)
 
                 # Now retrieve the states
-                exp_avg_fast  = state["exp_avg_fast"]
+                exp_avg_fast  = state.get("exp_avg_fast")
                 exp_avg_slow  = state["exp_avg_slow"]
                 exp_avg_sq    = state["exp_avg_sq"]
 
                 state["step"] += 1
-                step = state["step"]
+                step = int(state["step"].item())
                 bias_correction1 = 1.0 - (beta1 ** step)
                 bias_correction2 = 1.0 - (beta2 ** step)
 

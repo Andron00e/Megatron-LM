@@ -8,11 +8,13 @@ ademamix}, otherwise a bug in the tensorized implementation would cancel out.
 
 import copy
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from megatron.core.optimizer.ademamix import AdEMAMix
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.mars import MARS, is_matrix_param
 from megatron.core.optimizer.mu2mars import Mu2MARS
 
@@ -518,3 +520,132 @@ def test_param_with_more_than_three_dims_is_rejected(cls):
     p.grad = torch.randn(p.shape, generator=g)
     with pytest.raises(AssertionError, match='param.ndim'):
         cls([p], lr=1e-2).step()
+
+
+# ---- AdEMAMix checkpoint state: F088 (dist-opt placeholder keys) and F031 (step) ----
+
+
+def make_ademamix(params, beta1=0.9):
+    """One param group carrying the keys DistributedOptimizer matches groups on."""
+    group = dict(
+        params=params, wd_mult=1.0, lr_mult=1.0, is_expert_parallel=False, is_decoupled_lr=False
+    )
+    return AdEMAMix([group], lr=1e-2, betas=(beta1, 0.999, 0.9999), weight_decay=0.1)
+
+
+def fake_distributed_optimizer(opt, params):
+    """A DistributedOptimizer carrying only what the state_dict/load_state_dict pair reads, so
+    the "load before the first step" path can run on CPU, without CUDA or torch.distributed."""
+    dist_opt = DistributedOptimizer.__new__(DistributedOptimizer)
+    dist_opt.optimizer = opt
+    dist_opt.grad_scaler = None
+    dist_opt.ddp_config = SimpleNamespace(use_megatron_fsdp=False)
+    dist_opt.config = SimpleNamespace(
+        fp16=False,
+        exp_avg_dtype=torch.float32,
+        exp_avg_sq_dtype=torch.float32,
+        use_precision_aware_optimizer_no_fp8_or_ds_fp8=False,
+    )
+    # One grad buffer holding every param whole (a single DP rank).
+    dist_opt.gbuf_ranges = [
+        {torch.float32: [{'param_map': {p: {'gbuf_world': range(p.numel())} for p in params}}]}
+    ]
+    dist_opt.model_param_group_index_map = {p: (0, i) for i, p in enumerate(params)}
+    return dist_opt
+
+
+def sharded_state_keys(opt, param):
+    """The state a sharded param-state format writes per param: tensors, minus the 0-dim step."""
+    return {k for k, v in opt.state[param].items() if torch.is_tensor(v) and v.dim() > 0}
+
+
+def validate_global_keys(requested, in_checkpoint):
+    """Mirrors dist_checkpointing.strategies.torch._validate_global_shapes: every sharded tensor
+    the loading run asks for must be present in the checkpoint."""
+    for key in sorted(requested):
+        if key not in in_checkpoint:
+            raise KeyError(f"{key} from model not in state dict: {sorted(in_checkpoint)}")
+
+
+@pytest.mark.parametrize('beta1', [0.9, 0.0])
+def test_ademamix_state_keys_match_the_allocated_state(beta1):
+    params = list(make_model().parameters())
+    opt = make_ademamix(params, beta1=beta1)
+    set_grads(params, grads_like(params, seed=1))
+    opt.step()
+    keys = opt.state_keys(opt.param_groups[0])
+    assert ('exp_avg_fast' in keys) == (beta1 != 0.0)
+    for p in params:
+        assert set(opt.state[p]) == set(keys)
+        assert opt.state[p]['step'].shape == ()
+
+
+def test_ademamix_beta1_zero_state_dict_round_trip():
+    check_state_dict_round_trip(lambda ps: make_ademamix(ps, beta1=0.0))
+
+
+@pytest.mark.parametrize('beta1', [0.9, 0.0])
+def test_distributed_optimizer_load_allocates_ademamix_state(beta1):
+    """F088: on `--load` the inner optimizer state is still empty, so DistributedOptimizer
+    allocates a placeholder state whose keys name the checkpoint's sharded tensors. Those keys
+    used to be Adam's, so every ademamix resume died in _validate_global_shapes."""
+    params = list(make_model().parameters())
+    trained = make_ademamix(params, beta1=beta1)
+    for step in range(1, 4):
+        set_grads(params, grads_like(params, seed=step))
+        trained.step()
+    checkpoint = fake_distributed_optimizer(trained, params).state_dict()
+    assert [g['step'] for g in checkpoint['optimizer']['param_groups']] == [3]
+    in_checkpoint = sharded_state_keys(trained, params[0])
+
+    resumed = [p.detach().clone().requires_grad_(True) for p in params]
+    fresh = make_ademamix(resumed, beta1=beta1)
+    dist_opt = fake_distributed_optimizer(fresh, resumed)
+    assert len(fresh.state) == 0
+
+    # sharded_state_dict(is_loading=True) preallocates the state that names the sharded tensors.
+    dist_opt.load_state_dict(dist_opt.state_dict())
+    expected = {'exp_avg_slow', 'exp_avg_sq'} | ({'exp_avg_fast'} if beta1 != 0.0 else set())
+    assert in_checkpoint == expected
+    for p in resumed:
+        requested = sharded_state_keys(fresh, p)
+        validate_global_keys(requested, in_checkpoint)
+        assert requested == expected
+    # The sharded param state holds these very tensors, so their identity must survive the load.
+    steps = {id(fresh.state[p]['step']) for p in resumed}
+    assert len(steps) == len(resumed)
+
+    dist_opt.load_state_dict(copy.deepcopy(checkpoint))
+    for p in resumed:
+        assert sharded_state_keys(fresh, p) == expected
+        assert fresh.state[p]['step'] == 3  # F031: the step survives the round trip
+    assert {id(fresh.state[p]['step']) for p in resumed} == steps
+
+
+def test_distributed_optimizer_load_keeps_adam_keys():
+    """The default path must stay exactly Adam's two keys."""
+    params = list(make_model().parameters())
+    group = dict(
+        params=params, wd_mult=1.0, lr_mult=1.0, is_expert_parallel=False, is_decoupled_lr=False
+    )
+    trained = torch.optim.AdamW([group], lr=1e-2)
+    set_grads(params, grads_like(params, seed=1))
+    trained.step()
+    checkpoint = fake_distributed_optimizer(trained, params).state_dict()
+
+    resumed = [p.detach().clone().requires_grad_(True) for p in params]
+    fresh = torch.optim.AdamW([{**group, 'params': resumed}], lr=1e-2)
+    dist_opt = fake_distributed_optimizer(fresh, resumed)
+    assert dist_opt._inner_optimizer_state_keys(0) == ('exp_avg', 'exp_avg_sq')
+    assert not dist_opt._inner_optimizer_keeps_step()
+    dist_opt.load_state_dict(copy.deepcopy(checkpoint))
+    for p in resumed:
+        assert sharded_state_keys(fresh, p) == {'exp_avg', 'exp_avg_sq'}
+
+
+@pytest.mark.parametrize('cls', [MARS, Mu2MARS])
+def test_distributed_optimizer_state_keys_default_for_other_optimizers(cls):
+    params = list(make_model().parameters())
+    dist_opt = fake_distributed_optimizer(cls(params, lr=1e-2), params)
+    assert dist_opt._inner_optimizer_state_keys(0) == ('exp_avg', 'exp_avg_sq')
+    assert not dist_opt._inner_optimizer_keeps_step()

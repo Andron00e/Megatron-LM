@@ -662,16 +662,18 @@ def _get_megatron_optimizer_based_on_param_groups(
             )
 
             def init_state_fn(opt, config=None):
+                # AdEMAMix.state_keys is the single declaration of its state layout (no fast EMA
+                # when beta1 == 0, step a 0-dim tensor); the distributed optimizer preallocates
+                # its placeholder state from the same list.
                 for group in opt.param_groups:
                     for p in group['params']:
                         if len(opt.state[p]) == 0:
-                            opt.state[p]['step'] = 0
-                            # Mirrors AdEMAMix.step: no fast EMA at all when beta1 == 0.
-                            opt.state[p]['exp_avg_fast'] = (
-                                torch.zeros_like(p.data) if group['betas'][0] != 0.0 else None
-                            )
-                            opt.state[p]['exp_avg_slow'] = torch.zeros_like(p.data)
-                            opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
+                            for key in opt.state_keys(group):
+                                opt.state[p][key] = (
+                                    torch.zeros((), dtype=torch.float32)
+                                    if key == 'step'
+                                    else torch.zeros_like(p.data)
+                                )
 
         elif config.optimizer == 'sgd':
             optimizer = SGD(
