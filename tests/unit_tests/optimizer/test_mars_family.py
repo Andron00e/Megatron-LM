@@ -649,3 +649,142 @@ def test_distributed_optimizer_state_keys_default_for_other_optimizers(cls):
     dist_opt = fake_distributed_optimizer(cls(params, lr=1e-2), params)
     assert dist_opt._inner_optimizer_state_keys(0) == ('exp_avg', 'exp_avg_sq')
     assert not dist_opt._inner_optimizer_keeps_step()
+
+
+# ---- AdEMAMix step seeding for pre-fix checkpoints: F092 ----
+
+
+WAVE_A_WARMUP = dict(alpha=8.0, alpha_warmup=5000, beta3_warmup=5000)
+
+
+def shard_shaped_params(seed=7):
+    """Flat params, so that the state DistributedOptimizer allocates per shard (1-D, numel of the
+    grad buffer range) has the shape the inner optimizer steps on, as it does on a real rank."""
+    g = torch.Generator().manual_seed(seed)
+    return [torch.randn(n, generator=g).requires_grad_(True) for n in (12, 7)]
+
+
+def ademamix_reference_update(p, grad, m_fast, m_slow, v, step, lr, betas, alpha_final,
+                              alpha_warmup, wd, eps=1e-8):
+    """One AdEMAMix update written from the published algorithm, element by element, for a step
+    past the beta3 warmup (beta3 is then its final value)."""
+    beta1, beta2, beta3 = betas
+    bc1 = 1.0 - beta1**step
+    bc2 = 1.0 - beta2**step
+    alpha = alpha_final * min(step / float(alpha_warmup), 1.0)
+    out = []
+    for i in range(len(p)):
+        mf = beta1 * m_fast[i] + (1.0 - beta1) * grad[i]
+        ms = beta3 * m_slow[i] + (1.0 - beta3) * grad[i]
+        vv = beta2 * v[i] + (1.0 - beta2) * grad[i] * grad[i]
+        denom = math.sqrt(vv) / math.sqrt(bc2) + eps
+        out.append(p[i] - lr * ((mf / bc1 + alpha * ms) / denom + wd * p[i]))
+    return out
+
+
+def ademamix_checkpoint(params, steps=3, **warmup):
+    """A trained AdEMAMix and the checkpoint a DistributedOptimizer writes for it."""
+    group = dict(
+        params=params, wd_mult=1.0, lr_mult=1.0, is_expert_parallel=False, is_decoupled_lr=False
+    )
+    trained = AdEMAMix([group], lr=1e-2, betas=(0.9, 0.999, 0.9999), weight_decay=0.1, **warmup)
+    for step in range(1, steps + 1):
+        set_grads(params, grads_like(params, seed=step))
+        trained.step()
+    return trained, fake_distributed_optimizer(trained, params).state_dict()
+
+
+def resume_from(checkpoint, trained, params, **warmup):
+    """Resume `checkpoint` the way `--load` does: allocate the placeholder state (that is what
+    names the sharded tensors), let the sharded load write the checkpoint's tensors into it, then
+    load the checkpoint's own (non-sharded) half."""
+    resumed = [p.detach().clone().requires_grad_(True) for p in params]
+    group = dict(
+        params=resumed, wd_mult=1.0, lr_mult=1.0, is_expert_parallel=False, is_decoupled_lr=False
+    )
+    fresh = AdEMAMix([group], lr=1e-2, betas=(0.9, 0.999, 0.9999), weight_decay=0.1, **warmup)
+    dist_opt = fake_distributed_optimizer(fresh, resumed)
+    dist_opt.load_state_dict(dist_opt.state_dict())
+    for src, dst in zip(params, resumed):
+        # The 0-dim step is skipped by every sharded param-state format; only the shards land.
+        for key, tensor in trained.state[src].items():
+            if key != 'step':
+                fresh.state[dst][key].copy_(tensor)
+    dist_opt.load_state_dict(copy.deepcopy(checkpoint))
+    return fresh, dist_opt, resumed
+
+
+def test_ademamix_missing_step_is_seeded_from_the_training_iteration():
+    """F092: a checkpoint written before the step was published to param_groups carries none, so
+    the resumed run restarted the alpha warmup and the bias correction from step 0. Seeded from
+    the iteration, the very next update is the one step 26001 prescribes, with alpha at 8."""
+    params = shard_shaped_params()
+    trained, checkpoint = ademamix_checkpoint(params, **WAVE_A_WARMUP)
+    assert [g['step'] for g in checkpoint['optimizer']['param_groups']] == [3]
+    for g in checkpoint['optimizer']['param_groups']:  # a pre-e0c0921fc checkpoint
+        del g['step']
+
+    fresh, dist_opt, resumed = resume_from(checkpoint, trained, params, **WAVE_A_WARMUP)
+    assert dist_opt._step_missing_from_checkpoint
+    assert all(fresh.state[p]['step'] == 0 for p in resumed)
+
+    dist_opt.set_missing_step(26000)
+    assert all(fresh.state[p]['step'] == 26000 for p in resumed)
+    assert not dist_opt._step_missing_from_checkpoint
+
+    p = resumed[0]
+    before = dict(
+        p=p.detach().double().flatten().tolist(),
+        m_fast=fresh.state[p]['exp_avg_fast'].double().flatten().tolist(),
+        m_slow=fresh.state[p]['exp_avg_slow'].double().flatten().tolist(),
+        v=fresh.state[p]['exp_avg_sq'].double().flatten().tolist(),
+    )
+    grads = grads_like(resumed, seed=4)
+    set_grads(resumed, grads)
+    fresh.step()
+
+    assert fresh.state[p]['step'] == 26001
+    grad = grads[0].double().flatten().tolist()
+    common = dict(
+        lr=1e-2, betas=(0.9, 0.999, 0.9999), alpha_final=8.0, alpha_warmup=5000, wd=0.1
+    )
+    warmed = ademamix_reference_update(**before, grad=grad, step=26001, **common)
+    restarted = ademamix_reference_update(**before, grad=grad, step=1, **common)
+    got = p.detach().double().flatten().tolist()
+    assert torch.allclose(torch.tensor(got), torch.tensor(warmed), **TOL)
+    assert not torch.allclose(torch.tensor(got), torch.tensor(restarted), **TOL)
+
+
+def test_ademamix_step_from_the_checkpoint_is_not_overridden():
+    """A checkpoint that carries its own step keeps it: seeding is only for the pre-fix ones."""
+    params = shard_shaped_params()
+    trained, checkpoint = ademamix_checkpoint(params, **WAVE_A_WARMUP)
+    fresh, dist_opt, resumed = resume_from(checkpoint, trained, params, **WAVE_A_WARMUP)
+    assert not dist_opt._step_missing_from_checkpoint
+    assert all(fresh.state[p]['step'] == 3 for p in resumed)
+
+    dist_opt.set_missing_step(26000)
+    assert all(fresh.state[p]['step'] == 3 for p in resumed)
+
+    set_grads(resumed, grads_like(resumed, seed=4))
+    fresh.step()
+    assert all(fresh.state[p]['step'] == 4 for p in resumed)
+
+
+def test_set_missing_step_is_a_no_op_for_optimizers_without_a_step():
+    params = shard_shaped_params()
+    group = dict(
+        params=params, wd_mult=1.0, lr_mult=1.0, is_expert_parallel=False, is_decoupled_lr=False
+    )
+    trained = torch.optim.AdamW([group], lr=1e-2)
+    set_grads(params, grads_like(params, seed=1))
+    trained.step()
+    checkpoint = fake_distributed_optimizer(trained, params).state_dict()
+
+    resumed = [p.detach().clone().requires_grad_(True) for p in params]
+    fresh = torch.optim.AdamW([{**group, 'params': resumed}], lr=1e-2)
+    dist_opt = fake_distributed_optimizer(fresh, resumed)
+    dist_opt.load_state_dict(copy.deepcopy(checkpoint))
+    steps = [fresh.state[p]['step'].clone() for p in resumed]
+    dist_opt.set_missing_step(26000)
+    assert [fresh.state[p]['step'] for p in resumed] == steps

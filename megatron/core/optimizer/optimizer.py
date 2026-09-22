@@ -300,6 +300,15 @@ class MegatronOptimizer(ABC):
         """Load pass-in `state_dict`."""
         pass
 
+    def set_missing_step(self, step: int) -> None:
+        """Seed the inner optimizer's `step` when the loaded checkpoint carried none (F092).
+
+        Called by `load_checkpoint()`, which is the only place the loaded training iteration is
+        known. A no-op here; `DistributedOptimizer` overrides it for the optimizers that keep
+        `step` in per-param state.
+        """
+        pass
+
     # Promote state so it can be retrieved or set via
     # "optimizer_instance.state"
     def _get_state(self):
@@ -1320,6 +1329,11 @@ class ChainedOptimizer(MegatronOptimizer):
         for optimizer, state in zip(self.chained_optimizers, state_dict):
             optimizer.load_state_dict(state)
         self._synchronize_steps()
+
+    def set_missing_step(self, step: int) -> None:
+        """Seed each chained optimizer's step when its checkpoint carried none (F092)."""
+        for optimizer in self.chained_optimizers:
+            optimizer.set_missing_step(step)
 
     @torch.no_grad()
     def prepare_grads(self) -> bool:

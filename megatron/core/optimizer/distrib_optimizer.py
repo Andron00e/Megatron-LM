@@ -668,6 +668,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for group_index in range(len(self.optimizer.param_groups))
         )
 
+    def set_missing_step(self, step: int) -> None:
+        """Seed the inner optimizer's `step` when the loaded checkpoint carried none (F092).
+
+        One optimizer step is taken per training iteration (gradient accumulation does not
+        change that), so the iteration the checkpoint was written at *is* the step. A
+        checkpoint that carries its own step is left untouched, and so is every optimizer that
+        does not keep `step` in per-param state.
+        """
+        if not getattr(self, "_step_missing_from_checkpoint", False):
+            return
+        for s in self.optimizer.state.values():
+            if "step" in s:
+                s["step"].fill_(float(step))
+        self._step_missing_from_checkpoint = False
+        logger.info(f"optimizer step was missing from the checkpoint; initialized to {step}")
+
     def state_dict(self):
         """
         The state dict contains all non-DP-rank-dependent (i.e., non-parameter-
@@ -912,6 +928,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # back over it.
             steps = set(g["step"] for g in state_dict["optimizer"]["param_groups"] if "step" in g)
             assert len(steps) <= 1, f"steps: {steps}"
+            # F092: a checkpoint written before the step was published to param_groups carries
+            # none, and resuming at step 0 restarts AdEMAMix's alpha/beta3 warmups and its bias
+            # correction. `set_missing_step()` seeds it from the training iteration once
+            # `load_checkpoint()` reaches it. Recomputed on every load, since the placeholder
+            # allocation above loads a self-generated state dict that has no step either.
+            self._step_missing_from_checkpoint = not steps
             if steps:
                 step = float(steps.pop())
                 for s in state_dict_state.values():

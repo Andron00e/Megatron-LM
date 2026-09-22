@@ -2014,6 +2014,13 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 optimizer.load_state_dict(state_dict['optimizer'])
                 del state_dict['optimizer']
 
+            # F092: a checkpoint written before the optimizer published its step carries none,
+            # and resuming at step 0 restarts AdEMAMix's alpha/beta3 warmups and its bias
+            # correction. This is the only place the loaded iteration is known; it is a no-op
+            # unless the optimizer kept a step and the checkpoint had none.
+            if optimizer is not None and not optimizer.is_stub_optimizer:
+                optimizer.set_missing_step(iteration)
+
             # DiLoCo outer state: adopt the loaded tensors. The outer clock is re-anchored on the
             # loaded iteration by `setup_model_and_optimizer`, after this returns.
             diloco = get_diloco_outer_optimizer()
