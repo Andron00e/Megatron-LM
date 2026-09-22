@@ -682,7 +682,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             if "step" in s:
                 s["step"].fill_(float(step))
         self._step_missing_from_checkpoint = False
-        logger.info(f"optimizer step was missing from the checkpoint; initialized to {step}")
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"optimizer step missing from the checkpoint; initialized to the loaded iteration "
+            f"{step}",
+        )
 
     def state_dict(self):
         """
