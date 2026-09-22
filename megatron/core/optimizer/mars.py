@@ -19,13 +19,33 @@ def exists(val):
 
 
 def is_matrix_param(p):
-    """Params MARS treats as matrices, mirroring the Muon/MDDecoupling split in muon.py."""
+    """Params MARS treats as matrices, mirroring the Muon/MDDecoupling split in muon.py.
+
+    A 3-D param is a grouped expert stack [local_experts, out, in] (OffloadingExpertsMLP under
+    --moe-use-inplace-fp8-param; TEGroupedMLP keeps one 2-D `weight{i}` per expert instead), and
+    every slice along dim 0 is one expert's own matrix -- the same reading as the `ndim == 3`
+    branches in dion.py and neutrino.py.
+    """
+    assert p.ndim <= 3, (
+        f"MARS routes on param.ndim and knows 1-D, 2-D and 3-D expert stacks only, "
+        f"got shape {tuple(p.shape)}"
+    )
+    if p.ndim == 3:
+        return True
     return p.ndim == 2 and not getattr(p, 'is_embedding_or_output_parameter', False)
 
 
 def mars_correction(grad, last_grad, beta1, gamma, clip):
-    """c_t = g_t + gamma * beta1 / (1 - beta1) * (g_t - g_{t-1}), clipped to L2 norm `clip`."""
+    """c_t = g_t + gamma * beta1 / (1 - beta1) * (g_t - g_{t-1}), clipped to L2 norm `clip`.
+
+    An expert stack is clipped one expert at a time, so each expert gets the clip MARS would
+    give it as a standalone matrix and the update does not depend on how many experts the
+    stack holds (i.e. on the expert-parallel degree).
+    """
     c_t = (grad - last_grad).mul(gamma * (beta1 / (1.0 - beta1))).add(grad)
+    if c_t.ndim == 3:
+        c_t_norm = c_t.flatten(1).norm(dim=1).view(-1, 1, 1)
+        return c_t.mul(torch.clamp(clip / c_t_norm, max=1.0))
     c_t_norm = torch.norm(c_t)
     if c_t_norm > clip:
         c_t = c_t.mul(clip / c_t_norm)

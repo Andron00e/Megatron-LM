@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from megatron.core.optimizer.ademamix import AdEMAMix
-from megatron.core.optimizer.mars import MARS
+from megatron.core.optimizer.mars import MARS, is_matrix_param
 from megatron.core.optimizer.mu2mars import Mu2MARS
 
 TOL = dict(atol=1e-6, rtol=1e-6)
@@ -25,8 +25,12 @@ def make_model(seed=1234):
 
 
 def make_grads(model, seed):
+    return grads_like(list(model.parameters()), seed)
+
+
+def grads_like(params, seed):
     g = torch.Generator().manual_seed(seed)
-    return [torch.randn(p.shape, generator=g) for p in model.parameters()]
+    return [torch.randn(p.shape, generator=g) for p in params]
 
 
 def set_grads(params, grads):
@@ -402,19 +406,19 @@ def test_mu2mars_anytime_state_dict_round_trip():
     )
 
 
-def check_state_dict_round_trip(make_opt):
-    model = make_model()
-    params = list(model.parameters())
+def check_state_dict_round_trip(make_opt, params=None):
+    if params is None:
+        params = list(make_model().parameters())
     opt = make_opt(params)
     for step in range(1, 4):
-        set_grads(params, make_grads(model, seed=step))
+        set_grads(params, grads_like(params, seed=step))
         opt.step()
 
     resumed = [p.detach().clone().requires_grad_(True) for p in params]
     opt2 = make_opt(resumed)
     opt2.load_state_dict(copy.deepcopy(opt.state_dict()))
 
-    grads = make_grads(model, seed=99)
+    grads = grads_like(params, seed=99)
     set_grads(params, grads)
     set_grads(resumed, grads)
     opt.step()
@@ -423,3 +427,94 @@ def check_state_dict_round_trip(make_opt):
         torch.testing.assert_close(p.detach(), q.detach())
     for p, q in zip(params, resumed):
         assert opt.state[p]['step'] == opt2.state[q]['step'] == 4
+
+
+def expert_stack(num_experts=3, size_out=5, size_in=4, seed=11):
+    g = torch.Generator().manual_seed(seed)
+    return torch.nn.Parameter(torch.randn(num_experts, size_out, size_in, generator=g))
+
+
+@pytest.mark.parametrize('cls', [MARS, Mu2MARS])
+def test_expert_stack_matches_independent_experts(cls):
+    """A grouped-expert weight [local_experts, out, in] must move exactly as the same experts
+    held as separate 2D matrices. clip is small enough that it binds on every expert, so a
+    joint ||c_t|| over the whole stack (the pre-fix --mars-optimize-1d reading) fails here."""
+    stacked = expert_stack()
+    num_experts = stacked.shape[0]
+    singles = [torch.nn.Parameter(stacked.detach()[i].clone()) for i in range(num_experts)]
+    kwargs = dict(lr=1e-2, weight_decay=0.1, eps=1e-8, clip=0.5)
+    opt = cls([stacked], **kwargs)
+    refs = [cls([s], **kwargs) for s in singles]
+    for step in range(1, 11):
+        grad = grads_like([stacked], seed=400 + step)[0]
+        stacked.grad = grad.clone()
+        opt.step()
+        for i, (single, ref) in enumerate(zip(singles, refs)):
+            single.grad = grad[i].clone()
+            ref.step()
+    for i, single in enumerate(singles):
+        torch.testing.assert_close(stacked.detach()[i], single.detach(), **TOL)
+
+
+@pytest.mark.parametrize('cls', [MARS, Mu2MARS])
+def test_expert_stack_takes_the_matrix_path(cls):
+    """The stack must not fall through to the AdamW-on-betas_1d branch (F006)."""
+    stacked = expert_stack()
+    assert is_matrix_param(stacked)
+    lr, wd, eps, betas_1d = 1e-2, 0.1, 1e-8, (0.9, 0.95)
+    opt = cls([stacked], lr=lr, weight_decay=wd, eps=eps, betas_1d=betas_1d)
+    adamw_param = stacked.detach().clone().requires_grad_(True)
+    adamw = torch.optim.AdamW([adamw_param], lr=lr, betas=betas_1d, eps=eps, weight_decay=wd)
+    for step in range(1, 6):
+        grad = grads_like([stacked], seed=500 + step)[0]
+        stacked.grad = grad.clone()
+        adamw_param.grad = grad.clone()
+        opt.step()
+        adamw.step()
+    assert not torch.allclose(stacked.detach(), adamw_param.detach())
+
+
+@pytest.mark.parametrize('cls', [MARS, Mu2MARS])
+def test_router_weight_is_a_matrix(cls):
+    """muon.py keeps router.weight (2D) in linear_params, so MARS keeps it on the matrix rule:
+    an is_router tag must change nothing."""
+    g = torch.Generator().manual_seed(13)
+    router = torch.nn.Parameter(torch.randn(8, 6, generator=g))
+    router.is_router = True
+    plain = torch.nn.Parameter(router.detach().clone())
+    assert is_matrix_param(router)
+    opt = cls([router], lr=1e-2, weight_decay=0.1)
+    ref = cls([plain], lr=1e-2, weight_decay=0.1)
+    for step in range(1, 6):
+        grad = grads_like([router], seed=600 + step)[0]
+        router.grad = grad.clone()
+        plain.grad = grad.clone()
+        opt.step()
+        ref.step()
+    torch.testing.assert_close(router.detach(), plain.detach(), **TOL)
+
+
+@pytest.mark.parametrize('cls', [MARS, Mu2MARS])
+def test_expert_stack_state_dict_round_trip(cls):
+    g = torch.Generator().manual_seed(17)
+    check_state_dict_round_trip(
+        lambda ps: cls(ps, lr=1e-2, weight_decay=0.1),
+        params=[expert_stack(), torch.nn.Parameter(torch.randn(5, generator=g))],
+    )
+
+
+def test_mu2mars_anytime_expert_stack_state_dict_round_trip():
+    check_state_dict_round_trip(
+        lambda ps: Mu2MARS(ps, lr=1e-2, weight_decay=0.1, variant='anytime', anytime_gamma=0.1),
+        params=[expert_stack()],
+    )
+
+
+@pytest.mark.parametrize('cls', [MARS, Mu2MARS])
+def test_param_with_more_than_three_dims_is_rejected(cls):
+    """Anything the ndim routing does not know about must fail loudly, not pick a branch."""
+    g = torch.Generator().manual_seed(19)
+    p = torch.nn.Parameter(torch.randn(2, 3, 4, 5, generator=g))
+    p.grad = torch.randn(p.shape, generator=g)
+    with pytest.raises(AssertionError, match='param.ndim'):
+        cls([p], lr=1e-2).step()

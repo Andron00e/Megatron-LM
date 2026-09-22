@@ -1580,6 +1580,10 @@ def validate_args(args, defaults={}):
             "reads param.ndim, which distributed-optimizer shards flatten to 1D.")
         assert not args.use_torch_fsdp2, f"{args.optimizer} does not support Torch-FSDP2."
         assert not args.use_megatron_fsdp, f"{args.optimizer} does not support Megatron-FSDP."
+        assert args.hybrid_layer_pattern is None, (
+            f"{args.optimizer} reads every 3D param as a grouped expert stack "
+            "[local_experts, out, in]; a Mamba/GDN/KDA depthwise conv1d weight is 3D too and "
+            "would be optimized as a stack of 1-row matrices.")
 
     # DiLoCo / SNOO / mu^2-DiLoCo check. Between syncs the K workers hold different params while
     # the checkpoint is saved from one DP replica, so a save at i % H != 0 would silently discard

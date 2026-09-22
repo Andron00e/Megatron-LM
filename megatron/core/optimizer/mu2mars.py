@@ -26,8 +26,8 @@ the forward/backward happens, as the theory requires). Same c_t, m_t, v_t as abo
 beta3 and the mu_avg buffer are unused under this variant (mu_avg is still allocated, so the
 two variants share one state layout and one checkpoint shape). anytime_gamma = 1 makes
 x_{t+1} = w_{t+1} and reduces the rule exactly to MARS on the params it governs. Memory: +1
-fp32 param-shaped copy (state["w"]) per param on the Mu2MARS path, i.e. per 2-D param unless
-optimize_1d is set.
+fp32 param-shaped copy (state["w"]) per param on the Mu2MARS path, i.e. per matrix param (2-D,
+or a 3-D expert stack) unless optimize_1d is set.
 
 With beta3 = 0 this is exactly MARS. Note the role swap behind the recorded configs:
 MARS(beta1=0.95, gamma=0.025) has gradient-difference coefficient gamma*beta1 = 0.02375 and
