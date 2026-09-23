@@ -218,6 +218,7 @@ from megatron.core.transformer.moe.experts_fp8_util import (
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+from megatron.core.transformer.nitp import NITPLossLoggingHelper
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
     destroy_model_parallel,
@@ -2406,6 +2407,12 @@ def training_log(
         mtp_loss_scale = 1 / get_num_microbatches()
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
+        )
+
+    # Log the NITP auxiliary loss.
+    if getattr(args, 'nitp_loss_coeff', 0) and args.nitp_loss_coeff > 0:
+        NITPLossLoggingHelper.track_nitp_metrics(
+            1 / get_num_microbatches(), iteration, writer, wandb_writer, total_loss_dict
         )
 
     # Track sparse attention indexer loss.

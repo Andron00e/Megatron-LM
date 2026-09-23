@@ -234,6 +234,7 @@ def forward_step_calc_loss(
     """Calculate the loss and number of tokens for forward_step()"""
 
     from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
+    from megatron.core.transformer.nitp import NITPLossAutoScaler
 
     model_vp_stage = getattr(model, "vp_stage", None)
     if vp_stage is not None and model_vp_stage is not None:
@@ -309,6 +310,18 @@ def forward_step_calc_loss(
             MTPLossAutoScaler.set_loss_scale(loss_scale)
         else:
             MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+
+    # Set the loss scale for the NITP auxiliary loss (same scaling as MTP).
+    if getattr(config, 'nitp_loss_coeff', 0) and config.nitp_loss_coeff > 0:
+        loss_scale = (
+            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            if config.grad_scale_func is not None
+            else torch.ones(1, device=output_tensor.device)
+        )
+        if config.calculate_per_token_loss:
+            NITPLossAutoScaler.set_loss_scale(loss_scale)
+        else:
+            NITPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
 
     return output_tensor, num_tokens
 

@@ -25,6 +25,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import CudaGraphScope, ModelType
+from megatron.core.transformer.nitp import NITPHead, process_nitp_loss
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
@@ -224,6 +225,9 @@ class GPTModel(LanguageModule):
             )
 
         # Output
+        if self.post_process and self.config.nitp_loss_coeff > 0:
+            self.nitp_head = NITPHead(self.config)
+
         if self.post_process:
 
             if self.config.defer_embedding_wgrad_compute:
@@ -653,6 +657,22 @@ class GPTModel(LanguageModule):
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                 )
+        if (
+            self.config.nitp_loss_coeff > 0
+            and labels is not None
+            and self.training
+            and not (in_inference_mode or is_spec_decode)
+        ):
+            hidden_states = process_nitp_loss(
+                hidden_states=hidden_states,
+                target_hidden=self.decoder.nitp_target_hidden,
+                head=self.nitp_head,
+                loss_mask=loss_mask,
+                config=self.config,
+                is_training=self.training,
+                tp_group=self.pg_collection.tp,
+            )
+
         sequence_parallel_override = False
 
         if in_inference_mode and inference_context.config.materialize_only_last_token_logits:

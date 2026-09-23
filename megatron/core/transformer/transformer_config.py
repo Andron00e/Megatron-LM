@@ -76,6 +76,29 @@ class TransformerConfig(ModelParallelConfig):
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
+    nitp_loss_coeff: float = 0.0
+    """Weight of the Next Implicit Token Prediction (NITP) auxiliary loss (arXiv 2605.24956).
+    NITP asks the final hidden state at position t to predict the stop-gradient hidden state of
+    position t+nitp_shift taken from a shallow layer of the same forward pass, with a cosine loss.
+    0 disables it. The projection head is dropped at inference."""
+
+    nitp_target_layer: Optional[int] = None
+    """1-indexed transformer layer whose output is the NITP target. Overrides nitp_target_layer_frac."""
+
+    nitp_target_layer_frac: float = 0.2
+    """Depth fraction of the NITP target layer when nitp_target_layer is unset:
+    target = max(1, round(frac * num_layers))."""
+
+    nitp_shift: int = 1
+    """How many positions ahead the implicit target is taken from (1 = next token)."""
+
+    nitp_head: Literal['linear', 'mlp'] = 'linear'
+    """NITP projection head applied to the final hidden state: a single linear map or a two-layer
+    GELU MLP (hidden -> hidden -> hidden). Neither has a bias."""
+
+    nitp_loss_type: Literal['cosine', 'mse'] = 'cosine'
+    """NITP loss: 1 - cosine similarity (default, scale-free) or mean squared error."""
+
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
     Legacy argument for loading old checkpoints.
@@ -2866,6 +2889,23 @@ class TransformerConfig(ModelParallelConfig):
                 or fused_unpermute is None
             ):
                 raise ValueError("fused permutation is not available. Please install TE >= 2.1.0.")
+
+        if self.nitp_loss_coeff > 0:
+            assert self.pipeline_model_parallel_size == 1, (
+                'NITP needs the target layer and the final hidden state on one rank; '
+                'pipeline_model_parallel_size must be 1.'
+            )
+            assert self.context_parallel_size == 1, 'NITP does not support context parallelism yet.'
+            assert self.recompute_granularity != 'full', (
+                'NITP captures a shallow-layer output inside the layer loop, which the full '
+                'activation-recompute path bypasses; use selective recompute.'
+            )
+            assert self.nitp_shift >= 1, 'nitp_shift must be >= 1.'
+            if self.nitp_target_layer is None:
+                self.nitp_target_layer = max(1, int(round(self.nitp_target_layer_frac * self.num_layers)))
+            assert 1 <= self.nitp_target_layer < self.num_layers, (
+                f'nitp_target_layer={self.nitp_target_layer} must lie in [1, num_layers-1].'
+            )
 
         if self.overlap_moe_expert_parallel_comm:
             # TODO: remove this after we fix the hang issue with torch version < 2.6.0
