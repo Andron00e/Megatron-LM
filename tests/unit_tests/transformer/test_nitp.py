@@ -43,7 +43,8 @@ class TestNITP:
         NITPLossLoggingHelper.tracker = {}
         NITPLossAutoScaler.main_loss_backward_scale = None
 
-    def create_test_args(self, tp, coeff=1.0, head='linear', shift=1, num_layers=4):
+    def create_test_args(self, tp, coeff=1.0, head='linear', shift=1, num_layers=4,
+                         horizon=1, readout=0.0, tie=True):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
         sys.argv = ['test_nitp.py']
@@ -53,6 +54,9 @@ class TestNITP:
         args.nitp_target_layer_frac = 0.25
         args.nitp_head = head
         args.nitp_shift = shift
+        args.nitp_horizon = horizon
+        args.nitp_token_readout_coeff = readout
+        args.nitp_tie_chain = tie
         args.vocab_size = 1024
         args.hidden_size = 128
         args.num_attention_heads = 8
@@ -184,6 +188,53 @@ class TestNITP:
         args, model, out, loss_mask = self._run(tp=1, coeff=0.0)
         assert not hasattr(model, 'nitp_head')
         assert 'values' not in NITPLossLoggingHelper.tracker
+
+    def test_horizon2_readout_logged_and_trainable(self):
+        args, model, out, loss_mask = self._run(tp=1, horizon=2, readout=0.1)
+        v = NITPLossLoggingHelper.tracker['values']
+        assert v.numel() == 4  # 2 representation depths + 2 token read-outs
+        assert torch.isfinite(v).all() and (v > 0).all(), v
+        assert 0.0 <= v[0].item() <= 2.0 and 0.0 <= v[1].item() <= 2.0
+        assert v[2].item() > 1.0 and v[3].item() > 1.0  # CE over a 1024 vocab at init
+        (out.view(-1) * loss_mask.view(-1)).sum().backward()
+        chain = model.nitp_chain
+        assert len(chain.heads) == 1 and len(chain.merges) == 1  # tied
+        for name, w in [('merge', chain.merges[0].weight), ('readout', chain.readout.weight)]:
+            g = w.main_grad if getattr(w, 'main_grad', None) is not None else w.grad
+            assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0, name
+
+    def test_horizon2_depth2_matches_manual_recompute(self):
+        args, model, out, loss_mask = self._run(tp=1, horizon=2, readout=0.0)
+        v2 = NITPLossLoggingHelper.tracker['values'][1].item()
+        captured = {}
+        h = model.decoder.register_forward_hook(lambda m, i, o: captured.__setitem__('final', o))
+        NITPLossLoggingHelper.clean_loss_in_tracker()
+        tokens, labels, lm, attention_mask, position_ids = self.get_batch()
+        model(input_ids=tokens, position_ids=position_ids, attention_mask=attention_mask,
+              labels=labels, loss_mask=lm)
+        h.remove()
+        final, target = captured['final'], model.decoder.nitp_target_hidden
+        preds = model.nitp_chain(final, tokens, position_ids, model.embedding)
+        shift = args.nitp_shift + 1
+        per_tok = nitp_per_token_loss(preds[1][:-shift], target[shift:], 'cosine')
+        mask = lm.transpose(0, 1)[shift:]
+        manual = (per_tok * mask).sum() / mask.sum()
+        assert abs(manual.item() - v2) < 1e-4, (manual.item(), v2)
+
+    def test_untied_chain_has_separate_heads(self):
+        args, model, out, loss_mask = self._run(tp=1, horizon=3, tie=False)
+        chain = model.nitp_chain
+        assert len(chain.heads) == 3 and len(chain.merges) == 2
+        assert NITPLossLoggingHelper.tracker['values'].numel() == 6
+
+    @pytest.mark.skipif(int(os.environ.get('WORLD_SIZE', '1')) < 2, reason='needs a 2-rank launch')
+    def test_tp2_horizon2_matches_tp1(self):
+        _ = self._run(tp=1, horizon=2, readout=0.1)
+        ref = NITPLossLoggingHelper.tracker['values'].clone()
+        self.teardown_method(None)
+        _ = self._run(tp=2, horizon=2, readout=0.1)
+        val = NITPLossLoggingHelper.tracker['values']
+        assert (val[:2] - ref[:2]).abs().max().item() < 0.2, (val, ref)
 
     @pytest.mark.skipif(int(os.environ.get('WORLD_SIZE', '1')) < 2, reason='needs a 2-rank launch')
     def test_tp2_sequence_parallel_matches_tp1(self):

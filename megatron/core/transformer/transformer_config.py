@@ -99,6 +99,20 @@ class TransformerConfig(ModelParallelConfig):
     nitp_loss_type: Literal['cosine', 'mse'] = 'cosine'
     """NITP loss: 1 - cosine similarity (default, scale-free) or mean squared error."""
 
+    nitp_horizon: int = 1
+    """Number of future positions the NITP chain predicts (latent MTP). 1 = plain NITP. Depth j>1
+    is teacher-forced with the true token x_{t+j-1} through a 2h->h merge, DeepSeek-MTP style."""
+
+    nitp_horizon_decay: float = 1.0
+    """Geometric weight decay over depths: depth j gets nitp_loss_coeff * decay^(j-1)."""
+
+    nitp_token_readout_coeff: float = 0.0
+    """Weight of the token read-out loss: OutHead(U z^_{t+j}) predicts x_{t+j+1} at every depth,
+    making the chain a drafter for speculative decoding. 0 disables it (no U, no logits)."""
+
+    nitp_tie_chain: bool = True
+    """Share the head P and the merge M across depths (Nemotron-style tied MTP)."""
+
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
     Legacy argument for loading old checkpoints.
@@ -2901,6 +2915,8 @@ class TransformerConfig(ModelParallelConfig):
                 'activation-recompute path bypasses; use selective recompute.'
             )
             assert self.nitp_shift >= 1, 'nitp_shift must be >= 1.'
+            assert self.nitp_horizon >= 1, 'nitp_horizon must be >= 1.'
+            assert self.nitp_token_readout_coeff >= 0, 'nitp_token_readout_coeff must be >= 0.'
             if self.nitp_target_layer is None:
                 self.nitp_target_layer = max(1, int(round(self.nitp_target_layer_frac * self.num_layers)))
             assert 1 <= self.nitp_target_layer < self.num_layers, (
