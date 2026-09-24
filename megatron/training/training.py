@@ -15,6 +15,10 @@ _STARTUP_TIMESTAMPS = {
     'pretrain_entry': None, # Set at top of pretrain()
 }
 
+# Accumulated throughput
+_ACC_ELAPSED_TIME = 0.0
+_ACC_TOKENS = 0.0
+
 
 def set_startup_timestamps(program_start=None, main_entry=None):
     """Set startup timestamps from the entry script.
@@ -1985,6 +1989,18 @@ def setup_model_and_optimizer(
                 'load_checkpoint_time': timers('load-checkpoint').active_time(),
             }
         )
+
+        # Release the checkpoint LOAD strategy retained in checkpointing_context.
+        # With --ckpt-fully-parallel-load it is a FullyParallelLoadStrategyWrapper that
+        # holds the broadcast-exchange state; left in place it stays resident into the
+        # first SAVE (checkpointing.py reuses checkpointing_context['load_strategy']) and
+        # the save OOMs on top of it. gc.collect() returns that memory to the caching
+        # allocator WITHOUT unmapping, so it is reused safely under expandable_segments --
+        # unlike torch.cuda.empty_cache(), which unmaps segments NCCL has registered for
+        # pipeline-parallel P2P and triggers illegal memory accesses.
+        if checkpointing_context is not None:
+            checkpointing_context.pop("load_strategy", None)
+        gc.collect()
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
@@ -2191,6 +2207,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update parameters.
 
+    # some all reduce can be safely skipped because they are always True
+    skip_reduce_check = args.skip_reduce_check and \
+        (args.optimizer == 'md_decoupling' and isinstance(optimizer, LayerWiseDistributedOptimizer))
+
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if args.optimizer == 'md_decoupling' and args.check_grad_norm and isinstance(optimizer, LayerWiseDistributedOptimizer):
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step_after_grad_norm(grad_norm)
@@ -2207,10 +2227,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
-    update_successful = logical_and_across_model_parallel_group(update_successful)
+    if not skip_reduce_check:
+        update_successful = logical_and_across_model_parallel_group(update_successful)
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
-    grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
+    if not skip_reduce_check:
+        grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
     if args.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(num_zeros_in_grad)
 
@@ -2364,7 +2386,8 @@ def training_log(
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
-    learning_rate: float | None = reduce_max_stat_across_model_parallel_group(learning_rate)
+    if not args.skip_reduce_check:
+        learning_rate: float | None = reduce_max_stat_across_model_parallel_group(learning_rate)
     # Tensorboard values.
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
@@ -2374,6 +2397,13 @@ def training_log(
                 'consumed-tokens': args.consumed_train_samples * args.seq_length ,
                 },
                 iteration)
+            # Training progress as a percentage of the total run (current step / total steps).
+            # args.train_iters is the total step count (set by update_train_iters from
+            # train_samples // global_batch_size for sample-based runs).
+            if args.train_iters:
+                wandb_writer.log(
+                    {'training-progress-pct': iteration / args.train_iters * 100},
+                    iteration)
         if learning_rate is not None:
             writer.add_scalar('learning-rate', learning_rate, iteration)
             writer.add_scalar('learning-rate vs samples', learning_rate, args.consumed_train_samples)
@@ -2484,17 +2514,25 @@ def training_log(
             track_names.append("expert_max_violation")
             track_names.append("expert_min_violation")
             track_names.append("expert_median_violation")
+            track_names.append("expert_std_violation")
+            track_names.append("expert_entropy")
         if "seq" in args.moe_router_violation_metrics:
             track_names.append("seq_expert_max_violation")
             track_names.append("seq_expert_min_violation")
             track_names.append("seq_expert_median_violation")
+            track_names.append("seq_expert_std_violation")
+            track_names.append("seq_expert_entropy")
         track_names.append("global_expert_max_violation")
         track_names.append("global_expert_min_violation")
         track_names.append("global_expert_median_violation")
+        track_names.append("global_expert_std_violation")
+        track_names.append("global_expert_entropy")
         if "ep" in args.moe_router_violation_metrics:
             track_names.append("ep_expert_max_violation")
             track_names.append("ep_expert_min_violation")
             track_names.append("ep_expert_median_violation")
+            track_names.append("ep_expert_std_violation")
+            track_names.append("ep_expert_entropy")
         if args.moe_router_bias_metrics:
             uses_quantile_balancing = "quantile_balancing" in args.moe_router_load_balancing_type
             if args.moe_router_enable_expert_bias and not uses_quantile_balancing:
@@ -2572,6 +2610,15 @@ def training_log(
         tokens_per_iteration = args.global_batch_size * args.seq_length
         tokens_per_sec = tokens_per_iteration / elapsed_time_per_iteration
         tokens_per_sec_per_gpu = tokens_per_sec / args.world_size
+        global _ACC_ELAPSED_TIME
+        global _ACC_TOKENS
+        if should_reset:
+            _ACC_ELAPSED_TIME += elapsed_time
+            _ACC_TOKENS += tokens_per_iteration * total_iterations
+        if _ACC_ELAPSED_TIME > 0:
+            avg_tokens_per_sec_per_gpu = _ACC_TOKENS / _ACC_ELAPSED_TIME / args.world_size
+        else:
+            avg_tokens_per_sec_per_gpu = tokens_per_sec_per_gpu
         iterations_remaining = max(args.train_iters - iteration, 0)
         eta_seconds = iterations_remaining * elapsed_time_per_iteration
         eta = str(timedelta(seconds=int(eta_seconds)))
@@ -2605,6 +2652,7 @@ def training_log(
         log_string += f' eta: {eta} |'
         if args.log_throughput:
             log_string += f' tokens per sec per GPU: {tokens_per_sec_per_gpu:.2f} |'
+            log_string += f' avg tokens per sec per GPU: {avg_tokens_per_sec_per_gpu:.2f} |'
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
             log_string += f' MFU: {mfu:.2f}% |'
             if args.log_timers_to_tensorboard:
@@ -2615,7 +2663,8 @@ def training_log(
                     wandb_writer.log({'throughput': throughput}, iteration)
                     wandb_writer.log({
                         'iteration-time': elapsed_time_per_iteration,
-                        'tokens-per-sec-per-GPU': tokens_per_sec_per_gpu
+                        'tokens-per-sec-per-GPU': tokens_per_sec_per_gpu,
+                        'avg-tokens-per-sec-per-GPU': avg_tokens_per_sec_per_gpu
                     }, iteration)
         if args.log_energy:
             energy = (energy_monitor.lap() / total_iterations) / args.world_size
@@ -2643,6 +2692,7 @@ def training_log(
                     total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
+            grad_norm = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
             log_string += f' grad norm: {grad_norm:.3f} |'
         if num_zeros_in_grad is not None:
             log_string += f' num zeros: {num_zeros_in_grad} |'
@@ -2773,11 +2823,18 @@ def save_checkpoint_and_time(
     one_logger_utils.track_e2e_metrics()
     # Free overlap param-gather buffers and release cached GPU memory so
     # that the async checkpoint worker process has enough GPU headroom for
-    # D2H tensor transfers.
-    for model_chunk in model:
-        if hasattr(model_chunk, 'free_overlap_buffers'):
-            model_chunk.free_overlap_buffers()
-    torch.cuda.empty_cache()
+    # D2H tensor transfers. GUARDED on async_save: torch.cuda.empty_cache()
+    # unmaps CUDA segments NCCL has registered for pipeline-parallel P2P
+    # (fragile under expandable_segments), so with PP>1 the next P2P after the
+    # save touches an unmapped address -> CUDA illegal memory access (the run
+    # dies right after checkpointing; a fresh resume re-registers and continues).
+    # It only buys headroom for the async-save worker PROCESS, so for synchronous
+    # saves it is pure downside -- skip the whole block.
+    if args.async_save:
+        for model_chunk in model:
+            if hasattr(model_chunk, 'free_overlap_buffers'):
+                model_chunk.free_overlap_buffers()
+        torch.cuda.empty_cache()
 
     global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
     should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED

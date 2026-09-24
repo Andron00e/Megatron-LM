@@ -18,7 +18,10 @@ from megatron.core.tokenizers.utils.tokenizer_extra_metadata import (
     ModelSpecialTokens,
     TokenizerExtraMetadata,
 )
-from megatron.core.utils import _merge_cu_seqlens_across_micro_batch
+from megatron.core.utils import (
+    _merge_cu_seqlens_across_micro_batch,
+    flatten_batch_for_packed_sequences,
+)
 from tests.unit_tests.test_utilities import Utils
 
 _MOCK_VOCAB_SIZE = 8192
@@ -116,6 +119,71 @@ def test_mock_gpt_dataset():
 
     # Check handling of None index
     assert not torch.any(sample['loss_mask'])
+
+
+def test_bfd_dataset_emits_compact_padding_boundary():
+    """The compact BFD metadata must not classify the last real token as padding."""
+    if torch.distributed.is_available():
+        Utils.initialize_distributed()
+        if torch.distributed.get_rank() == 0:
+            compile_helpers()
+        torch.distributed.barrier()
+    else:
+        compile_helpers()
+
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
+    config = GPTDatasetConfig(
+        random_seed=1234,
+        sequence_length=4,
+        split="990,9,1",
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        tokenizer=tokenizer,
+        mid_level_dataset_surplus=0.005,
+        pretraining_packing_strategy="bfd",
+        inter_document_masking=True,
+    )
+    dataset = BlendedMegatronDatasetBuilder(
+        MockGPTDataset, [10, 0, 0], lambda: True, config
+    ).build()[0]
+
+    pad = dataset._pad_token_id
+    dataset._query_bfd_packed_sample = lambda _idx: (
+        numpy.array([11, 12, 13, pad, pad], dtype=numpy.int64),
+        numpy.array([0], dtype=numpy.int64),
+        [3],
+    )
+    sample = dataset[0]
+
+    assert sample["num_valid_tokens"].dtype == torch.int32
+    assert sample["num_valid_tokens"].item() == 3
+    assert torch.equal(sample["tokens"], torch.tensor([11, 12, 13, 0]))
+    assert "cu_seqlens" in sample
+    # This real token predicts the first pad, so it is absent from LM loss but
+    # remains inside the routing-valid prefix [0:num_valid_tokens].
+    assert sample["loss_mask"][2] == 0
+
+
+def test_packed_batch_flattens_padding_mask():
+    batch = {
+        "tokens": torch.arange(8).reshape(2, 4),
+        "padding_mask": torch.tensor(
+            [[False, False, False, True], [False, False, True, True]]
+        ),
+        "cu_seqlens": torch.tensor([[0, 3, 4, 4, 4], [0, 2, 4, 4, 4]], dtype=torch.int32),
+        "max_seqlen": torch.tensor([3, 2], dtype=torch.int32),
+    }
+
+    flattened = flatten_batch_for_packed_sequences(batch)
+
+    assert flattened["padding_mask"].shape == (1, 8)
+    assert torch.equal(
+        flattened["padding_mask"],
+        torch.tensor([[False, False, False, True, False, False, True, True]]),
+    )
 
 
 def test_inter_document_masking():
@@ -330,6 +398,60 @@ def test_mock_gpt_dataset_goldfish():
         ).build()
     assert isinstance(excinfo.value.__cause__, AssertionError)
     assert "outside the tokenizer vocab" in str(excinfo.value.__cause__)
+
+
+def test_mask_loss_token_ids_masks_targets_only(monkeypatch):
+    import pretrain_gpt
+
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
+    base = dict(
+        random_seed=1234,
+        sequence_length=1024,
+        split="990,9,1",
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        tokenizer=tokenizer,
+        mid_level_dataset_surplus=0.005,
+    )
+    masked_dataset = BlendedMegatronDatasetBuilder(
+        MockGPTDataset,
+        [100, 0, 0],
+        lambda: True,
+        GPTDatasetConfig(**base, loss_mask_token_ids=(10, 11)),
+    ).build()[0]
+    baseline_dataset = BlendedMegatronDatasetBuilder(
+        MockGPTDataset, [100, 0, 0], lambda: True, GPTDatasetConfig(**base)
+    ).build()[0]
+
+    args = type(
+        "Args",
+        (),
+        {"modelopt_enabled": False, "check_for_nan_in_loss_and_grad": False,
+         "check_for_spiky_loss": False},
+    )()
+    monkeypatch.setattr(pretrain_gpt, "get_args", lambda: args)
+    monkeypatch.setattr(pretrain_gpt, "has_nvidia_modelopt", False)
+
+    masked_target_count = 0
+    for index in range(100):
+        sample, baseline = masked_dataset[index], baseline_dataset[index]
+        assert torch.equal(sample["labels"], baseline["labels"])
+        masked_targets = (sample["labels"] == 10) | (sample["labels"] == 11)
+        expected_loss_mask = baseline["loss_mask"].clone()
+        expected_loss_mask[masked_targets] = 0.0
+        assert torch.equal(sample["loss_mask"], expected_loss_mask)
+
+        masked_target_count += int(masked_targets.sum())
+    assert masked_target_count > 0
+
+    # Verify the exact pretraining loss function excludes these targets.
+    losses = torch.arange(sample["loss_mask"].numel(), dtype=torch.float)
+    loss, num_tokens, _ = pretrain_gpt.loss_func(sample["loss_mask"], losses)
+    assert loss == torch.sum(losses * expected_loss_mask)
+    assert num_tokens == expected_loss_mask.sum()
 
 
 def test_goldfish_config_validation():

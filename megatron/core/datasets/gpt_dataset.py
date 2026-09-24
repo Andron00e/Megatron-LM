@@ -257,6 +257,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     eod_mask_loss: Optional[bool] = None
     """Option to enable the EOD mask loss"""
 
+    loss_mask_token_ids: Optional[Tuple[int, ...]] = None
+    """Token IDs whose next-token losses are masked."""
+
     create_attention_mask: bool = True
     """Option to enable the attention masks generation. Can be disabled if attention kernel
        generates masks by itself.
@@ -551,6 +554,19 @@ class GPTDataset(MegatronDataset):
             labels = torch.roll(text, shifts=-1, dims=0)
             labels[-1] = self._pad_token_id
 
+        # BFD only appends padding to the end of a packed bin, so one scalar
+        # carries the same routing information as a sequence-length mask.
+        # Derive it from the lengths returned by the packer, not token IDs,
+        # shifted labels, or loss_mask. This keeps the boundary exact even if
+        # the tokenizer's pad ID is ambiguous, and the last real token predicts
+        # the first pad without becoming padding itself.
+        num_valid_tokens = None
+        if self.config.pretraining_packing_strategy == "bfd":
+            num_valid_tokens = torch.tensor(
+                0 if idx is None else min(sum(document_lengths), tokens.numel()),
+                dtype=torch.int32,
+            )
+
         if (
             not self.masks_and_position_ids_are_cacheable
             or not self.masks_and_position_ids_are_cached
@@ -576,6 +592,12 @@ class GPTDataset(MegatronDataset):
 
         # For padded sequences, mask the loss
         loss_mask[labels == self._pad_token_id] = 0.0
+
+        # Mask only the specified next-token targets. This stays in the CPU data
+        # worker, so it adds neither GPU work nor distributed communication.
+        if self.config.loss_mask_token_ids:
+            for token_id in self.config.loss_mask_token_ids:
+                loss_mask[labels == token_id] = 0.0
 
         # For padded sequences, ensure the embedding layer can map the token ID
         tokens[tokens == self._pad_token_id] = 0
@@ -651,7 +673,7 @@ class GPTDataset(MegatronDataset):
             )
             padded_cu_seqlens[: cu_seqlens.numel()] = cu_seqlens
 
-            return {
+            sample = {
                 "tokens": tokens,
                 "labels": labels,
                 "loss_mask": loss_mask,
@@ -660,7 +682,7 @@ class GPTDataset(MegatronDataset):
                 "max_seqlen": max_seqlen,
             }
         elif self.config.create_attention_mask:
-            return {
+            sample = {
                 "tokens": tokens,
                 "labels": labels,
                 "attention_mask": attention_mask,
@@ -668,12 +690,16 @@ class GPTDataset(MegatronDataset):
                 "position_ids": position_ids,
             }
         else:
-            return {
+            sample = {
                 "tokens": tokens,
                 "labels": labels,
                 "loss_mask": loss_mask,
                 "position_ids": position_ids,
             }
+
+        if num_valid_tokens is not None:
+            sample["num_valid_tokens"] = num_valid_tokens
+        return sample
 
     def _query_document_sample_shuffle_indices(
         self, idx: int

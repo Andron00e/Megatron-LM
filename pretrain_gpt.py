@@ -94,9 +94,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             route through ``get_thd_batch_on_this_cp_rank`` to produce a
             ``PackedSeqParams`` object that carries ``cu_seqlens`` and
             ``max_seqlen`` to the attention kernel.
-          - Middle PP stages: only ``cu_seqlens`` and ``max_seqlen`` are
-            needed for attention masking; all other fields are returned as
-            ``None`` with a ``PackedSeqParams`` built directly here.
+          - Middle PP stages also fetch BFD metadata so their MoE routers can
+            reconstruct the padding mask.
           - MTP ranks (``mtp_on_this_rank``) also receive the full batch,
             regardless of pipeline stage.
     """
@@ -107,8 +106,9 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     is_first_last = is_first_or_last_pipeline_stage(vp_stage)
 
     is_packed_sequence = has_cu_seqlens
-    if not is_first_last and not is_packed_sequence and not is_mtp:
-        return None, None, None, None, None, None
+    has_bfd_padding = args.pretraining_packing_strategy == "bfd"
+    if not is_first_last and not is_packed_sequence and not is_mtp and not has_bfd_padding:
+        return None, None, None, None, None, None, None
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
@@ -132,9 +132,9 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         assert max_seqlen.dim() == 1
 
     # For middle pipeline stages with packed sequences, only cu_seqlens and
-    # max_seqlen are needed (for attention masking); skip the full batch.
+    # max_seqlen plus any MoE padding mask are needed; skip the full batch.
     if not is_first_last and is_packed_sequence:
-        return None, None, None, None, None, PackedSeqParams(
+        return None, None, None, None, None, batch.get('padding_mask'), PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
             max_seqlen_q=int(max_seqlen[0].item()),
@@ -165,7 +165,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     else: # Hybrid CP format
         batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
 
-    return (*batch.values(), packed_seq_params)
+    padding_mask = batch.pop('padding_mask', None)
+    return (*batch.values(), padding_mask, packed_seq_params)
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -250,7 +251,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator, vp_stage)
+        tokens, labels, loss_mask, attention_mask, position_ids, padding_mask, packed_seq_params = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
 
     with stimer:
@@ -262,12 +263,14 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
                 schedule_plan = model.build_schedule_plan(
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask,
+                    padding_mask=padding_mask,
                     packed_seq_params=packed_seq_params,
                 )
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:
                 output_tensor = model(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
+                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask,
+                    padding_mask=padding_mask, packed_seq_params=packed_seq_params
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
@@ -279,7 +282,9 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     config = core_transformer_config_from_args(args)
     if parallel_state.get_tensor_model_parallel_rank() != 0:
         return False
-    elif is_packed_sequence:
+    elif is_packed_sequence or args.pretraining_packing_strategy == "bfd":
+        # All PP stages run MoE routers and therefore need BFD's compact
+        # valid-token count. Only TP rank zero builds the local dataset.
         return True
     return (
         is_first_or_last_pipeline_stage(vp_stage)
@@ -317,6 +322,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "reset_position_ids": args.reset_position_ids,
         "reset_attention_mask": args.reset_attention_mask,
         "eod_mask_loss": args.eod_mask_loss,
+        "loss_mask_token_ids": tuple(args.mask_loss_token_ids) if args.mask_loss_token_ids else None,
         "create_attention_mask": args.create_attention_mask_in_dataloader,
         "object_storage_cache_path": args.object_storage_cache_path,
         "mid_level_dataset_surplus": args.mid_level_dataset_surplus,

@@ -340,20 +340,25 @@ class TestQuantileBalancingRouter:
         padding_mask = torch.tensor(
             [[False], [True], [False], [False], [True], [False]], dtype=torch.bool, device="cuda"
         )
-        valid_scores = torch.sigmoid(
-            logits.reshape(-1, self.num_moe_experts)[~padding_mask.reshape(-1)]
+        # Keep the row shape static for CUDA graph capture. The histogram helper
+        # excludes padded rows using the mask without compacting at this call site.
+        all_scores = torch.sigmoid(logits.reshape(-1, self.num_moe_experts))
+        expected_alpha = (
+            (all_scores - router.qb_beta).topk(router.topk + 1, dim=1).values[:, -1]
         )
-        expected_alpha = (valid_scores - router.qb_beta).topk(router.topk + 1, dim=1).values[:, -1]
         captured = {}
         expected_histogram = torch.arange(
             self.num_moe_experts * 16, dtype=torch.int64, device="cuda"
         ).reshape(self.num_moe_experts, 16)
 
-        def fake_compute_qb_histogram(scores, alpha, beta, num_bins):
+        def fake_compute_qb_histogram(scores, alpha, beta, num_bins, padding_mask=None):
             captured["scores"] = scores.detach().clone()
             captured["alpha"] = alpha.detach().clone()
             captured["beta"] = beta.detach().clone()
             captured["num_bins"] = num_bins
+            captured["padding_mask"] = (
+                None if padding_mask is None else padding_mask.detach().clone()
+            )
             return expected_histogram
 
         def fail_all_gather(*args, **kwargs):
@@ -368,10 +373,11 @@ class TestQuantileBalancingRouter:
                 padding_mask=padding_mask.reshape(-1),
             )
 
-        torch.testing.assert_close(captured["scores"], valid_scores)
+        torch.testing.assert_close(captured["scores"], all_scores)
         torch.testing.assert_close(captured["alpha"], expected_alpha)
         torch.testing.assert_close(captured["beta"], router.qb_beta)
         assert captured["num_bins"] == 16
+        assert torch.equal(captured["padding_mask"], padding_mask.reshape(-1))
         assert torch.equal(router.qb_histogram, 2 * expected_histogram)
 
     @pytest.mark.internal

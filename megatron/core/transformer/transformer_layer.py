@@ -955,8 +955,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             num_chunks = min(self.config.mlp_chunks_for_prefill, pre_mlp_layernorm_output.shape[0])
             chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
 
-            # Compute outputs for each chunk
-            outputs = [self.mlp(chunk) for chunk in chunks]
+            # Compute outputs for each chunk. This branch is prefill-only and the
+            # routing padding mask is a training-time BFD artifact, so there is never
+            # one to chunk alongside the hidden states.
+            assert padding_mask is None, "padding_mask is unsupported with MLP prefill chunking"
+            outputs = [self.mlp(chunk, padding_mask=padding_mask) for chunk in chunks]
 
             # Aggregate chunk outputs
             mlp_output = torch.cat([out for out, _ in outputs], dim=0)
@@ -1171,6 +1174,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 .reshape(1, 1, slen_per_cp, seq_length)
                 .tile(micro_batch_size, 1, 1, 1)
             )
+
+        # Capture feeds the layer THIS dict, not the live forward's kwargs, so without a
+        # mask here the masking is simply absent from the captured graph and every replay
+        # routes unmasked. Any correctly shaped tensor will do: TE copies the live mask
+        # into this one on every replay (graph.py, "Copy values from new tensors into
+        # static tensors"). Added only for layers that have actually routed with a mask,
+        # so graphs for non-BFD runs are unchanged.
+        if self.is_moe_layer and self.mlp.routes_with_padding_mask:
+            seq_len, mbs = static_inputs["hidden_states"].shape[:2]
+            static_inputs["padding_mask"] = torch.zeros(
+                (mbs, seq_len), dtype=torch.bool, device=static_inputs["hidden_states"].device
+            )
         return static_inputs
 
     def _get_submodules_under_cudagraphs(self):
@@ -1232,7 +1247,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
             )
         ):
-            hidden_states = self._forward_mlp(hidden_states)
+            hidden_states = self._forward_mlp(
+                hidden_states, padding_mask=kwargs.get("padding_mask", None)
+            )
         if not isinstance(hidden_states, list) and not isinstance(hidden_states, tuple):
             cuda_graph_outputs = [hidden_states]
         else:
@@ -1249,13 +1266,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Hence, `inference_context` and `packed_seq_params` are excluded from input list.
         """
         context = None
+        # Keep the routing mask when attention is outside the captured region. The
+        # static-input setup captured this tensor, so dropping it would make replay
+        # route padded tokens even though eager execution excludes them.
+        padding_mask = kwargs.get("padding_mask", None)
         if (
             self.config.cuda_graph_modules
             and CudaGraphModule.attn not in self.config.cuda_graph_modules
         ):
             hidden_states, context = self._forward_attention(*args, **kwargs)
             args = (hidden_states,)
-            kwargs = {}
+            # Replay must supply every kwarg capture was initialized with, or TE raises.
+            kwargs = {} if padding_mask is None else {"padding_mask": padding_mask}
 
         assert (kwargs.get('inference_context') is None) and (
             kwargs.get('packed_seq_params') is None
@@ -1329,11 +1351,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # If EP overlap is enabled, remaining of mlp will be called as fine_grained_callables
             # and should be skipped here.
             if self.config.overlap_moe_expert_parallel_comm:
-                probs, routing_map = self.mlp.route(hidden_states)
+                probs, routing_map = self.mlp.route(hidden_states, padding_mask)
                 hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
                 nvtx_range_pop(suffix="mlp")
                 return residual, hidden_states, None, probs, shared_expert_output
-            mlp_output_with_bias = self.mlp(hidden_states)
+            mlp_output_with_bias = self.mlp(hidden_states, padding_mask=padding_mask)
             self.mlp.cudagraph_tensor_store.clear()
             nvtx_range_pop(suffix="mlp")
 
@@ -1361,12 +1383,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     hidden_states, residual = hidden_states
 
                 shared_expert_output = self.mlp.shared_experts_compute(hidden_states)
-                probs, routing_map = self.mlp.route(hidden_states)
+                probs, routing_map = self.mlp.route(hidden_states, padding_mask)
                 hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
                 return residual, hidden_states, None, probs, shared_expert_output
 
             # CUDA Graph does not capture the MLP/MoE part at all.
-            output = self._forward_mlp(*cuda_graph_output)
+            output = self._forward_mlp(*cuda_graph_output, padding_mask=padding_mask)
         return output, context
 
     def _get_te_cuda_graph_replay_args(self, *args, **kwargs):

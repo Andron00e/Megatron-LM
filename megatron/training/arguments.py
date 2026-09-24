@@ -1274,6 +1274,20 @@ def validate_args(args, defaults={}):
             'parallelism yet.'
         )
 
+    # TE's `auto` backend picks cuDNN fused attention for THD batches, which is much slower than
+    # flash on the segment shapes BFD packing produces (whole documents). Only `auto` is overridden.
+    if args.attention_backend == AttnBackend.auto and (
+        args.sft or getattr(args, 'dataloader_inter_document_masking', False)
+    ):
+        args.attention_backend = AttnBackend.flash
+        if args.rank == 0:
+            print(
+                '> packed-sequence attention: selecting the flash attention backend '
+                '(cuDNN fused attention is much slower on THD-format batches). '
+                'Pass --attention-backend to override.',
+                flush=True,
+            )
+
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
         args.encoder_seq_length = args.seq_length
@@ -1896,6 +1910,15 @@ def validate_args(args, defaults={}):
                 "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
                 "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
             )
+            if getattr(args, "pretraining_packing_strategy", None) == "bfd":
+                # A BFD MoE graph must be captured after a masked warmup forward;
+                # otherwise TE drops the routing mask on every replay.
+                assert args.cuda_graph_warmup_steps > 0, (
+                    "--cuda-graph-warmup-steps must be > 0 with --pretraining-packing-strategy "
+                    "bfd and --cuda-graph-impl transformer_engine: with 0 the CUDA graphs are "
+                    "captured before any forward and the MoE routing padding mask is silently "
+                    "dropped from every replay."
+                )
     assert not (
         args.cuda_graph_impl == "full_iteration" and args.cuda_graph_modules
     ), '--cuda-graph-modules must be empty when --cuda-graph-impl=full_iteration.'
@@ -3394,6 +3417,8 @@ def _add_data_args(parser):
                        'Relevant with CP.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--mask-loss-token-ids', type=int, nargs='+', default=None,
+                       help='Token IDs whose next-token losses are masked during pretraining.')
     group.add_argument('--dataloader-inter-document-masking', action='store_true',
                        help='Return cu_seqlens marking document boundaries '
                        'within each sample so that attention is restricted '
