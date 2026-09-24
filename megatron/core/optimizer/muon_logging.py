@@ -128,7 +128,13 @@ def _matrix_norm_stats_impl(
     return torch.cat((rms, frobenius, row_quantiles, col_quantiles, rms_means, sparsity))
 
 
-_compiled_matrix_norm_stats = torch.compile(_matrix_norm_stats_impl, dynamic=False)
+# Static shapes compile one graph per distinct matrix shape; hybrid KDA models have more than
+# dynamo's default 8, which silently drops this kernel to eager and makes the fullgraph weight
+# kernel below raise FailOnRecompileLimitHit.
+_STATS_RECOMPILE_LIMIT = 64
+_compiled_matrix_norm_stats = torch._dynamo.config.patch(recompile_limit=_STATS_RECOMPILE_LIMIT)(
+    torch.compile(_matrix_norm_stats_impl, dynamic=False)
+)
 
 
 def _matrix_norm_stats(tensor: torch.Tensor, scale=1.0) -> torch.Tensor:
@@ -378,6 +384,7 @@ def _matrix_weight_stats(
     return near_zero_counts, matrix_weights.float().square().sum(dim=1)
 
 
+@torch._dynamo.config.patch(recompile_limit=_STATS_RECOMPILE_LIMIT)
 @torch.compile(dynamic=False, fullgraph=True)
 def _compiled_matrix_weight_stats(
     matrix_weights: torch.Tensor, thresholds: torch.Tensor
