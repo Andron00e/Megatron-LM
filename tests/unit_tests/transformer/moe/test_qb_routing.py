@@ -81,7 +81,8 @@ class TestQBHistogram:
 
         assert torch.equal(histogram, full_histogram)
         assert torch.equal(
-            histogram.sum(dim=1), torch.full((num_experts,), num_tokens, dtype=torch.int64)
+            histogram.sum(dim=1),
+            torch.full((num_experts,), num_tokens, dtype=torch.int64),
         )
         estimated_beta = recover_qb_beta_from_histogram(histogram, beta, topk)
         required_bias = alpha.unsqueeze(1) - scores
@@ -258,17 +259,29 @@ class TestQuantileBalancingRouter:
             seq_len * batch_size * self.num_moe_experts, dtype=torch.float32, device="cuda"
         ).reshape(seq_len, batch_size, self.num_moe_experts)
         padding_mask = torch.tensor(
-            [[False, False], [True, False], [True, True], [False, True]],
+            [
+                [False, False],
+                [True, False],
+                [True, True],
+                [False, True],
+            ],
             dtype=torch.bool,
             device="cuda",
         )
-        expected_valid_logits = logits.reshape(-1, self.num_moe_experts)[~padding_mask.reshape(-1)]
+        expected_valid_logits = logits.reshape(-1, self.num_moe_experts)[
+            ~padding_mask.reshape(-1)
+        ]
         expected_valid_scores = torch.softmax(expected_valid_logits, dim=-1)
 
         calls = []
 
         def fake_qb_dual_update(scores, topk, beta, update_beta=True):
-            calls.append({"scores": scores.detach().clone(), "update_beta": update_beta})
+            calls.append(
+                {
+                    "scores": scores.detach().clone(),
+                    "update_beta": update_beta,
+                }
+            )
             indices = torch.arange(topk, device=scores.device).expand(scores.shape[0], -1)
             return indices, scores.mean(dim=0)
 
@@ -287,7 +300,8 @@ class TestQuantileBalancingRouter:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_legacy_average_qb_uses_raw_logits(self, monkeypatch):
         config = replace(
-            self.transformer_config, moe_router_quantile_balancing_method="legacy_average"
+            self.transformer_config,
+            moe_router_quantile_balancing_method="legacy_average",
         )
         router = cast(Router, MoELayer(config, self.submodules).router).cuda()
         router.train()
@@ -324,7 +338,9 @@ class TestQuantileBalancingRouter:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_qb_histogram_accumulates_valid_tokens_without_forward_collective(self, monkeypatch):
+    def test_qb_histogram_accumulates_valid_tokens_without_forward_collective(
+        self, monkeypatch
+    ):
         config = replace(
             self.transformer_config,
             moe_router_quantile_balancing_method="histogram",
@@ -334,11 +350,13 @@ class TestQuantileBalancingRouter:
         router = cast(Router, MoELayer(config, self.submodules).router).cuda()
         router.train()
 
-        logits = torch.arange(6 * self.num_moe_experts, dtype=torch.float32, device="cuda").reshape(
-            6, 1, self.num_moe_experts
-        )
+        logits = torch.arange(
+            6 * self.num_moe_experts, dtype=torch.float32, device="cuda"
+        ).reshape(6, 1, self.num_moe_experts)
         padding_mask = torch.tensor(
-            [[False], [True], [False], [False], [True], [False]], dtype=torch.bool, device="cuda"
+            [[False], [True], [False], [False], [True], [False]],
+            dtype=torch.bool,
+            device="cuda",
         )
         # Keep the row shape static for CUDA graph capture. The histogram helper
         # excludes padded rows using the mask without compacting at this call site.
@@ -364,7 +382,9 @@ class TestQuantileBalancingRouter:
         def fail_all_gather(*args, **kwargs):
             raise AssertionError("histogram QB must not all-gather during forward")
 
-        monkeypatch.setattr(router_module, "compute_qb_histogram", fake_compute_qb_histogram)
+        monkeypatch.setattr(
+            router_module, "compute_qb_histogram", fake_compute_qb_histogram
+        )
         monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fail_all_gather)
 
         for _ in range(2):
@@ -382,7 +402,10 @@ class TestQuantileBalancingRouter:
 
     @pytest.mark.internal
     def test_non_qb_router_has_no_qb_buffers(self):
-        config = replace(self.transformer_config, moe_router_load_balancing_type="aux_loss")
+        config = replace(
+            self.transformer_config,
+            moe_router_load_balancing_type="aux_loss",
+        )
         router = MoELayer(config, self.submodules).router
         assert router.qb_beta is None
         assert router.qb_beta_accum is None

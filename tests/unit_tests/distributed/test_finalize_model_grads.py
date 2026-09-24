@@ -276,9 +276,18 @@ class TestUpdateRouterQBBeta:
 
     def test_histogram_update_reduces_once_decodes_centers_and_resets(self, monkeypatch):
         config = _router_qb_config(ema=0.25, method="histogram", num_bins=4)
-        histogram = torch.tensor([[1, 3, 0, 0], [0, 2, 2, 0], [0, 0, 4, 0]], dtype=torch.int64)
+        histogram = torch.tensor(
+            [
+                [1, 3, 0, 0],
+                [0, 2, 2, 0],
+                [0, 0, 4, 0],
+            ],
+            dtype=torch.int64,
+        )
         model = _router_qb_model(
-            config, qb_beta=torch.tensor([0.2, 0.0, -0.2]), qb_histogram=histogram
+            config,
+            qb_beta=torch.tensor([0.2, 0.0, -0.2]),
+            qb_histogram=histogram,
         )
         tp_dp_cp_group = object()
         all_reduce_calls = []
@@ -290,7 +299,9 @@ class TestUpdateRouterQBBeta:
 
         monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
 
-        _update_router_qb_beta([model], config, dp_cp_group=object(), tp_dp_cp_group=tp_dp_cp_group)
+        _update_router_qb_beta(
+            [model], config, dp_cp_group=object(), tp_dp_cp_group=tp_dp_cp_group
+        )
 
         expected = torch.tensor([0.3375, -0.0875, -0.25])
         assert len(all_reduce_calls) == 1
@@ -311,9 +322,15 @@ class TestUpdateRouterQBBeta:
             qb_histogram=torch.zeros((3, 4), dtype=torch.int64),
         )
 
-        monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_reduce",
+            lambda *args, **kwargs: None,
+        )
 
-        _update_router_qb_beta([model], config, dp_cp_group=object(), tp_dp_cp_group=object())
+        _update_router_qb_beta(
+            [model], config, dp_cp_group=object(), tp_dp_cp_group=object()
+        )
 
         torch.testing.assert_close(model.router.qb_beta, torch.tensor([2.0, -1.0, -1.0]))
 

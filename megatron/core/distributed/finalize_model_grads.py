@@ -372,7 +372,9 @@ def _log_microbatch_router_metrics(
     stacked_samples = torch.cat(samples)
     # Pool additive token counts before computing nonlinear violation metrics.
     torch.distributed.all_reduce(
-        stacked_samples, op=torch.distributed.ReduceOp.SUM, group=router_modules[0].tp_cp_group
+        stacked_samples,
+        op=torch.distributed.ReduceOp.SUM,
+        group=router_modules[0].tp_cp_group,
     )
 
     num_layers = config.num_layers
@@ -459,7 +461,8 @@ def _log_global_router_metrics(model: List[torch.nn.Module], config: Transformer
 
     stacked = torch.stack(tokens_per_expert_list, dim=0).clone()
     torch.distributed.all_reduce(
-        stacked, group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)
+        stacked,
+        group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
     )
 
     num_layers = config.num_layers
@@ -540,9 +543,9 @@ def _update_router_qb_beta(
         return
 
     if config.moe_router_quantile_balancing_method == 'histogram':
-        assert (
-            tp_dp_cp_group is not None
-        ), "Histogram quantile balancing requires a TP+DP+CP process group."
+        assert tp_dp_cp_group is not None, (
+            "Histogram quantile balancing requires a TP+DP+CP process group."
+        )
         qb_beta_list = []
         qb_histogram_list = []
         for model_chunk in model:
@@ -559,7 +562,7 @@ def _update_router_qb_beta(
         torch.distributed.all_reduce(
             stacked_histogram,
             op=torch.distributed.ReduceOp.SUM,
-            group=tp_dp_cp_group,  # We need all the tokens from the global batch to estimate the quantile
+            group=tp_dp_cp_group, # We need all the tokens from the global batch to estimate the quantile
         )
 
         estimated_beta = recover_qb_beta_from_histogram(
@@ -568,9 +571,7 @@ def _update_router_qb_beta(
         ema = config.moe_router_quantile_balancing_ema
         stacked_new_beta = ema * stacked_beta + (1.0 - ema) * estimated_beta
 
-        stacked_new_beta = stacked_new_beta - stacked_new_beta.mean(
-            dim=-1, keepdim=True
-        )  # mean center the new beta value
+        stacked_new_beta = stacked_new_beta - stacked_new_beta.mean(dim=-1, keepdim=True) # mean center the new beta value
 
         has_observations = stacked_histogram.sum(dim=(-1, -2)) > 0
         stacked_new_beta = torch.where(
@@ -856,7 +857,10 @@ def finalize_model_grads(
         and not config.moe_router_quantile_balancing_freeze
     ):
         _update_router_qb_beta(
-            model, config, dp_cp_group=dp_cp_group, tp_dp_cp_group=tp_dp_cp_group
+            model,
+            config,
+            dp_cp_group=dp_cp_group,
+            tp_dp_cp_group=tp_dp_cp_group,
         )
 
     _log_router_bias_metrics(model, config)

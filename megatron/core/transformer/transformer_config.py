@@ -45,9 +45,7 @@ logger = logging.getLogger(__name__)
 # host during the combine window). Kept here so the config validation and the offloader agree on the
 # spelling.
 MOE_OFFLOAD_INPUT = "moe_input"  # fp8_x, the permuted expert input (saved on all paths)
-MOE_OFFLOAD_FC1_OUTPUT = (
-    "moe_fc1_output"  # fp8_fc1_output, the gated pre-activation (non-recompute)
-)
+MOE_OFFLOAD_FC1_OUTPUT = "moe_fc1_output"  # fp8_fc1_output, the gated pre-activation (non-recompute)
 MOE_OFFLOAD_ACTIVATION_CHOICES = (MOE_OFFLOAD_INPUT, MOE_OFFLOAD_FC1_OUTPUT)
 
 try:
@@ -1048,9 +1046,9 @@ class TransformerConfig(ModelParallelConfig):
     `moe_router_load_balancing_type` to "none", it preserves the checkpoint's `qb_beta` routing
     decisions. This is useful when fine-tuning a pretrained policy with a frozen router."""
 
-    moe_router_quantile_balancing_method: Literal['average', 'legacy_average', 'histogram'] = (
-        'histogram'
-    )
+    moe_router_quantile_balancing_method: Literal[
+        'average', 'legacy_average', 'histogram'
+    ] = 'histogram'
     """Quantile estimator used by quantile balancing. "average" averages independently computed
     microbatch/rank quantiles in sigmoid/softmax score space. "legacy_average" preserves the
     raw-logit routing and update scale used by older average-QB checkpoints. "histogram"
@@ -1745,9 +1743,7 @@ class TransformerConfig(ModelParallelConfig):
             if self.use_fused_weighted_squared_relu:
                 raise ValueError("pnglu=True is incompatible with use_fused_weighted_squared_relu.")
             if self.moe_use_offloading_experts:
-                assert (
-                    self.moe_use_inplace_fp8_param
-                ), "pnglu=True with offloading experts currently only supports fp8 path"
+                assert self.moe_use_inplace_fp8_param, "pnglu=True with offloading experts currently only supports fp8 path"
             if self.transformer_impl == "inference_optimized":
                 raise ValueError(
                     "pnglu=True is not supported with transformer_impl='inference_optimized' "
@@ -1795,13 +1791,7 @@ class TransformerConfig(ModelParallelConfig):
         if _active_new_activations:
             _active_name = _active_new_activations[0]
             _is_gated = _active_name in (
-                'gxpr',
-                'gxpry',
-                'gxprv2',
-                'gxr2',
-                'xr2glu',
-                'xssglu',
-                'pn3glu',
+                'gxpr', 'gxpry', 'gxprv2', 'gxr2', 'xr2glu', 'xssglu', 'pn3glu',
             )
             if _is_gated and not self.gated_linear_unit:
                 raise ValueError(
@@ -1837,11 +1827,7 @@ class TransformerConfig(ModelParallelConfig):
         # ReGLU (gated relu) has no fused kernel and is not wired into the offloading-experts
         # path (which hardcodes SiLU/SwiGLU); guard so it fails loudly instead of silently
         # running SwiGLU. Same treatment as the learnable-activation offloading guard above.
-        if (
-            self.gated_linear_unit
-            and self.activation_func == F.relu
-            and self.moe_use_offloading_experts
-        ):
+        if self.gated_linear_unit and self.activation_func == F.relu and self.moe_use_offloading_experts:
             raise ValueError(
                 "ReGLU (--reglu) is not wired into the offloading-experts path "
                 "(moe_use_offloading_experts=True)."
@@ -1858,7 +1844,6 @@ class TransformerConfig(ModelParallelConfig):
             from megatron.core.activations import sssglu_act as _sssglu_act
             from megatron.core.activations import lglu_act as _lglu_act
             from megatron.core.activations import situ_act as _situ_act
-
             if self.activation_func == _rlglu_act:
                 assert self.moe_use_inplace_fp8_param, (
                     "RLGLU (--rlglu) with offloading experts is only supported on the fp8 path; "
@@ -1937,10 +1922,9 @@ class TransformerConfig(ModelParallelConfig):
                 f"got {sorted(invalid_violation_metrics)}"
             )
 
-        invalid_inference_violation_metrics = set(self.moe_router_inference_violation_metrics) - {
-            'mbs',
-            'seq',
-        }
+        invalid_inference_violation_metrics = set(
+            self.moe_router_inference_violation_metrics
+        ) - {'mbs', 'seq'}
         if invalid_inference_violation_metrics:
             raise ValueError(
                 "moe_router_inference_violation_metrics entries must be 'mbs' or 'seq'; "
@@ -2016,7 +2000,9 @@ class TransformerConfig(ModelParallelConfig):
                     load_balancing_type not in ["quantile_balancing", "seq_aux_loss"]
                     for load_balancing_type in self.moe_router_load_balancing_type
                 ):
-                    raise ValueError("quantile_balancing can only be combined with seq_aux_loss")
+                    raise ValueError(
+                        "quantile_balancing can only be combined with seq_aux_loss"
+                    )
 
         if "quantile_balancing" in self.moe_router_load_balancing_type:
             valid_qb_methods = {'average', 'legacy_average', 'histogram'}
@@ -2027,8 +2013,13 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.moe_router_quantile_balancing_num_bins <= 0:
                 raise ValueError("moe_router_quantile_balancing_num_bins must be positive")
-            if self.num_moe_experts is not None and self.moe_router_topk >= self.num_moe_experts:
-                raise ValueError("quantile_balancing requires moe_router_topk < num_moe_experts")
+            if (
+                self.num_moe_experts is not None
+                and self.moe_router_topk >= self.num_moe_experts
+            ):
+                raise ValueError(
+                    "quantile_balancing requires moe_router_topk < num_moe_experts"
+                )
 
             if self.moe_router_enable_expert_bias:
                 raise ValueError(
@@ -2509,14 +2500,7 @@ class TransformerConfig(ModelParallelConfig):
             from megatron.core.activations import rlglu_act as _rlglu_act
             from megatron.core.activations import sssglu_act as _sssglu_act
 
-            if self.activation_func not in [
-                F.gelu,
-                F.silu,
-                quick_gelu,
-                sslu,
-                _rlglu_act,
-                _sssglu_act,
-            ]:
+            if self.activation_func not in [F.gelu, F.silu, quick_gelu, sslu, _rlglu_act, _sssglu_act]:
                 raise ValueError(
                     "When bias_activation_fusion is True, activation function should be either "
                     "gelu, swiglu, quick_geglu, ssglu, rlglu, or sssglu"
