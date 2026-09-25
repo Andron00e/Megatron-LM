@@ -1936,6 +1936,13 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         # Iteration and num_floating_point_operations_so_far default to 0.
         return 0, 0
 
+    # Phase (NTP or RL) of the job that wrote this checkpoint, for update_stats' phase switch.
+    saved_args = state_dict.get("args")
+    if saved_args is not None:
+        args.loaded_checkpoint_phase = (
+            "rl" if getattr(saved_args, "perform_rl_step", False) else "ntp"
+        )
+
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
 

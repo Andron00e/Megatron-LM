@@ -50,6 +50,9 @@ Metrics (keys ``update/<metric>/<family>``, and ``update/layers/<L>/<metric>/<fa
                                (the r_eff of ``Neutrino._r_eff_for``), from exact eigenvalues of
                                the Gram matrix, averaged over matrices (every expert is one)
 ``grad-norm``, ``weight-norm`` Frobenius norms of the bucket
+``phase-step``, ``phase-index``, ``phase-rl``
+                               steps since the job start or the last :func:`notify_phase_change`,
+                               number of phase changes in this job, and 1 while the phase is "rl"
 ``bf16-snapshot-floor``        ||W_{t-1} - bf16(W_{t-1})|| / ||W_{t-1}||, only with a bf16
                                snapshot: dW is biased by up to this amount
 
@@ -288,6 +291,8 @@ class UpdateStatsCollector:
 
         self._phase_start: Optional[int] = None
         self._phase_index = 0
+        self._phase_name = "ntp"
+        self._warned_offloaded = False
         self._spectral_pending = False
         self._step = 0
         self._active = False
@@ -375,7 +380,7 @@ class UpdateStatsCollector:
                     continue
                 tp_rank = get_pg_rank(tp_group) if tp_group is not None else 0
                 tp_sharded = (
-                    getattr(param, "tensor_model_parallel", False)
+                    _is_tp_sharded(name, param)
                     and tp_group is not None
                     and get_pg_size(tp_group) > 1
                 )
@@ -513,7 +518,12 @@ class UpdateStatsCollector:
         logger.info(f"update stats: phase change to {name!r}")
         self._phase_start = None
         self._phase_index += 1
+        self._phase_name = name
         self._spectral_pending = True
+
+    def set_phase(self, name: str) -> None:
+        """Name the current phase without starting a new window (logged as ``update/phase-rl``)."""
+        self._phase_name = name
 
     def begin_step(self, iteration: int) -> bool:
         """``iteration`` is the number of completed steps; returns whether this step logs."""
@@ -549,10 +559,39 @@ class UpdateStatsCollector:
         if not self._active:
             return
         self._capture = False
+        if self._offloaded():
+            self._active = False
+            return
         for entry in self.entries:
             self._pre_step(entry)
         if self._spectral:
             self._spectra()
+
+    def _offloaded(self) -> bool:
+        """Main params or optimizer state still on the host (e.g. RL's
+        --rl-offload-optimizer-during-inference between restore points): skip this step. The
+        decision is all-reduced so that no rank enters the step's collectives alone."""
+        local = self._offloaded_local()
+        if self._distributed:
+            flag = torch.tensor([float(local)], device=self.device)
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+            return bool(flag.item())
+        return local
+
+    def _offloaded_local(self) -> bool:
+        for entry in self.entries:
+            momentum = entry.momentum() if entry.grad_ok else None
+            if entry.main_params[0].device != self.device or (
+                momentum is not None and momentum.device != self.device
+            ):
+                if not self._warned_offloaded:
+                    logger.warning(
+                        f"update stats: {entry.name} or its optimizer state is not on "
+                        f"{self.device} (offloaded); skipping update statistics for this step."
+                    )
+                    self._warned_offloaded = True
+                return True
+        return False
 
     def _pre_step(self, entry: _Entry) -> None:
         weight = entry.weight()
@@ -701,6 +740,7 @@ class UpdateStatsCollector:
             )
         stats["update/phase-step"] = self._step - self._phase_start
         stats["update/phase-index"] = self._phase_index
+        stats["update/phase-rl"] = float(self._phase_name == "rl")
         return stats
 
     def _post_step(self, entry: _Entry, tp_vectors):
@@ -970,6 +1010,15 @@ def _stack_grouped_experts(entries: List[_Entry]) -> List[_Entry]:
     return result
 
 
+def _is_tp_sharded(name: str, param: torch.Tensor) -> bool:
+    """TE >= 2.13 no longer marks grouped-GEMM expert weights ``tensor_model_parallel``; Megatron
+    then stamps only ``partition_dim`` on them (TEGroupedLinear, explicit expert comm), so a
+    grouped expert weight with a partition dim is TP-sharded too."""
+    if getattr(param, "tensor_model_parallel", False):
+        return True
+    return re.search(r"\.weight\d+$", name) is not None and getattr(param, "partition_dim", -1) in (0, 1)
+
+
 def _momentum(optimizer, param) -> Optional[torch.Tensor]:
     """First-moment buffer before the step (keys in the module docstring)."""
     state = optimizer.state.get(param)
@@ -1064,6 +1113,12 @@ def notify_phase_change(name: str) -> None:
     """Log every step again for the next ``dense_window`` steps, e.g. when switching NTP <-> RL."""
     if _COLLECTOR is not None:
         _COLLECTOR.notify_phase_change(name)
+
+
+def set_phase(name: str) -> None:
+    """Name the current phase ("ntp" or "rl") without restarting the dense window."""
+    if _COLLECTOR is not None:
+        _COLLECTOR.set_phase(name)
 
 
 def begin_step(iteration: int) -> None:

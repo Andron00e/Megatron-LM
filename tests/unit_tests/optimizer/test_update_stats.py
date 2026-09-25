@@ -38,7 +38,7 @@ try:  # Neutrino exists only in the Neutrino fork
     from megatron.core.optimizer.neutrino import get_megatron_neutrino_optimizer
 except ImportError:
     get_megatron_neutrino_optimizer = None
-from megatron.core.optimizer.update_stats import UpdateStatsCollector
+from megatron.core.optimizer.update_stats import UpdateStatsCollector, _is_tp_sharded
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -139,8 +139,8 @@ def _build_toy(optimizer_name, bf16):
         muon_momentum=0.9,
         muon_use_nesterov=True,
         muon_scale_mode="shape_up",
-        neutrino_k=8,
-        neutrino_metrics_interval=0,
+        # Neutrino's fields exist only where Neutrino does.
+        **(dict(neutrino_k=8, neutrino_metrics_interval=0) if optimizer_name == "neutrino" else {}),
     )
     if optimizer_name == "neutrino":
         optimizer = get_megatron_neutrino_optimizer(config, [model], pg_collection=_pg_collection())
@@ -298,9 +298,28 @@ def test_md_decoupling_with_gain_logging():
         nn.functional.cross_entropy(logits.reshape(-1, 64), tokens.roll(1, 1).reshape(-1)).backward()
         model.finish_grad_sync()
         prev = [p.detach().double().clone() for p in qkv]
+        grads = [p.main_grad.detach().double().clone() for p in qkv]
+        # MDDecoupling's momentum M_{t-1} is optimizer.state[main_param]["exp_avg"].
+        states = [
+            wrapper.optimizer.state.get(p, {}) for wrapper in optimizer.chained_optimizers for p in qkv
+        ]
+        moms = [state["exp_avg"].detach().double().clone() for state in states if "exp_avg" in state]
         collector.before_optimizer_step()
         assert optimizer.step()[0]
         stats = collector.after_optimizer_step(True)
+        if iteration > 0:
+            assert len(moms) == len(qkv)
+            gm = sum((g * m).sum() for g, m in zip(grads, moms))
+            gg = sum(g.square().sum() for g in grads)
+            mm = sum(m.square().sum() for m in moms)
+            assert stats["update/grad-momentum-cos/attention-in"] == pytest.approx(
+                float(gm / (gg * mm).sqrt()), rel=1e-5
+            )
+            assert stats["update/momentum-grad-norm-ratio/attention-in"] == pytest.approx(
+                float((mm / gg).sqrt()), rel=1e-5
+            )
+        else:
+            assert "update/grad-momentum-cos/attention-in" not in stats
         gains = collect_md_gain_stats(optimizer, per_layer=True)
         assert any(key.startswith("muon-md/gains/attention-in/") for key in gains), sorted(gains)
         delta = sum((p.detach().double() - w).square().sum() for p, w in zip(qkv, prev))
@@ -330,6 +349,7 @@ def test_cadence():
     collector.spectral_interval = 25
     assert collector.begin_step(174) and collector._spectral  # step 175: spectra imply logging
     collector.notify_phase_change("rl")
+    assert collector._phase_name == "rl" and collector._phase_index == 1
     active = [step + 1 for step in range(180, 190) if collector.begin_step(step)]
     assert active == [181, 182, 183, 190]
     assert collector.begin_step(180) and collector._spectral is False  # pending consumed at 181
@@ -402,8 +422,13 @@ def _load_full(model, full):
             if expert
             else parallel_state.get_tensor_model_parallel_group()
         )
-        if getattr(param, "tensor_model_parallel", False) and group.size() > 1:
+        if _is_tp_sharded(name, param) and group.size() > 1:
             value = value.chunk(group.size(), dim=param.partition_dim)[group.rank()]
+        assert value.shape == param.shape, (
+            f"{name}: full {tuple(full[source].shape)} -> {tuple(value.shape)} vs local "
+            f"{tuple(param.shape)}; expert={expert} tp={getattr(param, 'tensor_model_parallel', None)} "
+            f"partition_dim={getattr(param, 'partition_dim', None)} group={group.size()}"
+        )
         with torch.no_grad():
             param.copy_(value)
 
@@ -565,4 +590,45 @@ def test_neutrino_moe_layer_wise_smoke():
     assert stats["update/momentum-r-eff/expert-in"] >= 1 - 1e-6
     assert isinstance(stats["update/experts/expert-in/relative/hist"], torch.Tensor)
     assert stats["update/experts/expert-in/relative/hist"].numel() == 2 * 4
+    assert all(math.isfinite(v) for v in stats.values() if not isinstance(v, torch.Tensor))
+
+
+@pytest.mark.skipif(WORLD_SIZE < 4, reason="needs 4 ranks")
+@pytest.mark.skipif(not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers is not installed")
+def test_md_decoupling_moe_layer_wise_smoke():
+    """The rlpt production path: MDDecoupling (Muon + hypersphere + rowcol gains, Adam branch for
+    embedding/norms), layer-wise, EP4, bf16 main params. grad-momentum-cos reads MD's exp_avg."""
+    full = _full_state(True, True)
+    model, config = _build_gpt(1, 4, True, True, full)
+    model = _ddp(model, config, True)
+    optimizer_config = OptimizerConfig(
+        optimizer="md_decoupling",
+        lr=1e-3,
+        matrix_lr=1e-2,
+        gains_lr=1e-3,
+        min_lr=1e-4,
+        weight_decay=0.0,
+        bf16=True,
+        use_distributed_optimizer=False,
+        use_layer_wise_distributed_optimizer=True,
+        clip_grad=0.0,
+        muon_momentum=0.95,
+        muon_use_nesterov=True,
+        muon_scale_mode="shape_up",
+        muon_router_scale_mode="none",
+        hypersphere_mode="row",
+        hypersphere_radius_mode="fan_in",
+        hypersphere_gains_mode="rowcol",
+    )
+    optimizer = get_megatron_mddecoupling_optimizer(
+        optimizer_config, [model], layer_wise_distributed_optimizer=True, pg_collection=_pg_collection()
+    )
+    assert isinstance(optimizer, LayerWiseDistributedOptimizer)
+    stats = _run_gpt(model, optimizer, config, steps=3)[-1]
+    for family in ("attention-in", "attention-out", "expert-in", "expert-out", "router"):
+        assert 0 < stats[f"update/relative/{family}"] < 1, family
+        assert -1 <= stats[f"update/grad-momentum-cos/{family}"] <= 1, family
+        assert stats[f"update/momentum-r-eff/{family}"] >= 1 - 1e-6, family
+    assert -1 <= stats["update/grad-momentum-cos/layernorm-adam"] <= 1
+    assert stats["update/experts/expert-in/grad-momentum-cos/cv"] >= 0
     assert all(math.isfinite(v) for v in stats.values() if not isinstance(v, torch.Tensor))

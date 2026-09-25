@@ -3372,6 +3372,14 @@ def train(
             num_layers=args.num_layers,
             num_experts=args.num_experts,
         )
+        # NTP <-> RL: the phase of this job is --perform-rl-step; the phase of the job that wrote
+        # the loaded checkpoint is read from its args (load_checkpoint). A switch restarts the
+        # dense every-step window and forces a spectral step; job starts always log densely.
+        phase = "rl" if args.perform_rl_step else "ntp"
+        update_stats.set_phase(phase)
+        loaded_phase = getattr(args, "loaded_checkpoint_phase", None)
+        if loaded_phase is not None and loaded_phase != phase:
+            update_stats.notify_phase_change(phase)
     # Disable forward pre-hook to start training to ensure that errors in checkpoint loading
     # or random initialization don't propagate to all ranks in first all-gather (which is a
     # no-op if things work correctly).
