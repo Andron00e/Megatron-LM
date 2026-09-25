@@ -306,6 +306,31 @@ class LoggerConfig:
     )
     """Absolute thresholds used for Muon weight, gradient, and update sparsity logging."""
 
+    log_update_stats: bool = False
+    """If set, log optimizer-agnostic update statistics by parameter family
+    (megatron/core/optimizer/update_stats.py)."""
+
+    update_stats_interval: int | None = None
+    """Update statistics interval. Defaults to log_interval when unset."""
+
+    update_stats_per_layer: bool = False
+    """If set, additionally log update statistics by global layer."""
+
+    update_stats_dense_window: int = 20
+    """Log update statistics every step for this many steps after the job starts or resumes
+    and after update_stats.notify_phase_change()."""
+
+    update_stats_spectral_interval: int = 0
+    """Interval of the stable-rank / momentum r_eff spectra and expert histograms. 0 disables."""
+
+    update_stats_delta_y: bool = False
+    """If set, log the functional change ||X dW^T|| / ||X W^T|| of dense and attention linears
+    (on the spectral cadence when it is set, otherwise on every update-stats step)."""
+
+    update_stats_snapshot_dtype: Literal["bf16", "fp32"] = "fp32"
+    """Dtype of the pre-step weight snapshot. bf16 halves its memory but biases dW by the
+    rounding of W, which is logged as bf16-snapshot-floor."""
+
     log_throughput: bool = False
     """If set, calculate and log throughput per GPU."""
 

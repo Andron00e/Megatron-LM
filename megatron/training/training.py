@@ -193,6 +193,7 @@ from megatron.core.optimizer.muon_logging import (
     collect_muon_stats,
     set_muon_norm_logging,
 )
+from megatron.core.optimizer import update_stats
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -2092,6 +2093,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         tensor_stats=args.muon_log_tensor_stats,
         layer_count=args.num_layers,
     )
+    update_stats.begin_step(iteration)
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
         for model_chunk in model:
@@ -2223,6 +2225,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     skip_reduce_check = args.skip_reduce_check and \
         (args.optimizer == 'md_decoupling' and isinstance(optimizer, LayerWiseDistributedOptimizer))
 
+    update_stats.before_optimizer_step()
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if args.optimizer == 'md_decoupling' and args.check_grad_norm and isinstance(optimizer, LayerWiseDistributedOptimizer):
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step_after_grad_norm(grad_norm)
@@ -2247,6 +2250,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
     if args.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(num_zeros_in_grad)
+    update_stats.after_optimizer_step(update_successful)
 
     # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
@@ -2506,9 +2510,22 @@ def training_log(
     if md_gain_stats:
         if writer:
             for metric_name, metric_value in md_gain_stats.items():
-                writer.add_scalar(metric_name, metric_value, iteration)
+                if isinstance(metric_value, torch.Tensor):
+                    writer.add_histogram(metric_name, metric_value, iteration)
+                else:
+                    writer.add_scalar(metric_name, metric_value, iteration)
         if wandb_writer:
-            wandb_writer.log(md_gain_stats, iteration)
+            wandb_writer.log(
+                {
+                    metric_name: (
+                        wandb_writer.Histogram(metric_value.numpy())
+                        if isinstance(metric_value, torch.Tensor)
+                        else metric_value
+                    )
+                    for metric_name, metric_value in md_gain_stats.items()
+                },
+                iteration,
+            )
 
     # Log MoE metrics.
     if args.num_experts is not None:
@@ -3342,6 +3359,19 @@ def train(
         prof.start()
 
     start_iteration = iteration
+    if args.log_update_stats:
+        update_stats.setup(
+            model,
+            optimizer,
+            interval=args.update_stats_interval or args.log_interval,
+            per_layer=args.update_stats_per_layer,
+            dense_window=args.update_stats_dense_window,
+            spectral_interval=args.update_stats_spectral_interval,
+            delta_y=args.update_stats_delta_y,
+            snapshot_dtype=args.update_stats_snapshot_dtype,
+            num_layers=args.num_layers,
+            num_experts=args.num_experts,
+        )
     # Disable forward pre-hook to start training to ensure that errors in checkpoint loading
     # or random initialization don't propagate to all ranks in first all-gather (which is a
     # no-op if things work correctly).
@@ -3642,6 +3672,9 @@ def train(
                             param_stats=args.muon_log_param_stats,
                         )
                     )
+        optimizer_stats = update_stats.pop_stats()
+        if optimizer_stats:
+            md_gain_stats = {**(md_gain_stats or {}), **optimizer_stats}
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:
