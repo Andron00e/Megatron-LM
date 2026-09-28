@@ -17,8 +17,11 @@ from megatron.core.optimizer.ademamix import AdEMAMix
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.mars import (
     MARS,
+    NORM_STATE_KEYS,
+    collect_norm_stats,
     is_matrix_param,
     marsm_scale_factor,
+    norm_state_like,
     shampoo_shape_factor,
 )
 from megatron.core.optimizer.mu2mars import Mu2MARS
@@ -1155,3 +1158,358 @@ def test_set_missing_step_is_a_no_op_for_optimizers_without_a_step():
     steps = [fresh.state[p]['step'].clone() for p in resumed]
     dist_opt.set_missing_step(26000)
     assert [fresh.state[p]['step'] for p in resumed] == steps
+
+
+# ---- --mars-normalize-update-to-weight-norm: MuonMD's measured-norm match, on the 2-D group ----
+
+
+WEIGHT_NORM_CASES = [(MARS, {}), (Mu2MARS, {}),
+                     (Mu2MARS, {'variant': 'anytime', 'anytime_gamma': 1.0})]
+LOOSE = dict(atol=1e-5, rtol=1e-4)
+
+
+def frobenius(t):
+    return t.detach().double().norm()
+
+
+@pytest.mark.parametrize('cls,kwargs', WEIGHT_NORM_CASES)
+def test_weight_norm_off_leaves_the_state_layout_alone(cls, kwargs):
+    """Default off: no norm keys, so every checkpoint and update path measured so far is as is."""
+    model = make_model()
+    params = list(model.parameters())
+    opt = cls(params, lr=1e-2, **kwargs)
+    set_grads(params, make_grads(model, seed=1))
+    opt.step()
+    assert not opt.normalize_update_to_weight_norm
+    for p in params:
+        assert not set(opt.state[p]) & set(NORM_STATE_KEYS)
+
+
+@pytest.mark.parametrize('cls,kwargs', WEIGHT_NORM_CASES)
+def test_weight_norm_matches_every_matrix_step_to_its_recorded_norm(cls, kwargs):
+    """With wd = 0 every 2-D step has ||dW||_F = lr * ||W_0||_F, at step 1 and still at step 5
+    once the weights have moved: the target is the norm recorded before the first update."""
+    model = make_model()
+    params = list(model.parameters())
+    initial = [p.detach().clone() for p in params]
+    lr = 0.1
+    opt = cls(params, lr=lr, weight_decay=0.0, normalize_update_to_weight_norm=True, **kwargs)
+    for step in range(1, 6):
+        before = [p.detach().clone() for p in params]
+        set_grads(params, make_grads(model, seed=900 + step))
+        opt.step()
+        for p, b, w0 in zip(params, before, initial):
+            delta = b - p.detach()
+            assert torch.isfinite(delta).all()
+            if p.ndim != 2:
+                continue
+            torch.testing.assert_close(frobenius(delta), lr * frobenius(w0), **TOL)
+            torch.testing.assert_close(opt.state[p]['weight_norm'].double(), frobenius(w0), **TOL)
+    for p, w0 in zip(params, initial):
+        if p.ndim == 2:
+            assert abs(frobenius(p) - frobenius(w0)) > 1e-2 * frobenius(w0)
+
+
+@pytest.mark.parametrize('cls,kwargs', WEIGHT_NORM_CASES)
+def test_weight_norm_leaves_the_1d_group_untouched(cls, kwargs):
+    model = make_model()
+    params = list(model.parameters())
+    plain = [p.detach().clone().requires_grad_(True) for p in params]
+    common = dict(lr=1e-2, weight_decay=0.1, eps=1e-8, **kwargs)
+    opt = cls(params, normalize_update_to_weight_norm=True, **common)
+    ref = cls(plain, **common)
+    for step in range(1, 6):
+        grads = make_grads(model, seed=1000 + step)
+        set_grads(params, grads)
+        set_grads(plain, grads)
+        opt.step()
+        ref.step()
+    for p, q in zip(params, plain):
+        if p.ndim == 2:
+            assert not torch.allclose(p.detach(), q.detach())
+        else:
+            torch.testing.assert_close(p.detach(), q.detach(), **TOL)
+
+
+@pytest.mark.parametrize('cls', [MARS, Mu2MARS])
+def test_weight_norm_scales_only_the_update_direction(cls):
+    """The step is lr * (wd * W + U * ||W_0|| / ||U||) with U the plain optimizer's direction:
+    the decoupled decay term is not rescaled, and ||U|| is what update_norm records."""
+    model = make_model()
+    params = list(model.parameters())
+    plain = [p.detach().clone().requires_grad_(True) for p in params]
+    lr, wd = 1e-2, 0.1
+    opt = cls(params, lr=lr, weight_decay=wd, normalize_update_to_weight_norm=True)
+    ref = cls(plain, lr=lr, weight_decay=wd)
+    grads = make_grads(model, seed=1100)
+    set_grads(params, grads)
+    set_grads(plain, grads)
+    before = [p.detach().clone() for p in params]
+    opt.step()
+    ref.step()
+    for p, q, b in zip(params, plain, before):
+        if p.ndim != 2:
+            continue
+        direction = (b - q.detach()) / lr - wd * b
+        scale = frobenius(b) / frobenius(direction)
+        expected = b - lr * (wd * b + direction * scale.float())
+        torch.testing.assert_close(p.detach(), expected, **LOOSE)
+        torch.testing.assert_close(opt.state[p]['update_norm'].double(), frobenius(direction),
+                                   **LOOSE)
+
+
+@pytest.mark.parametrize('cls', [MARS, Mu2MARS])
+def test_weight_norm_is_per_expert(cls):
+    stacked = expert_stack(size_out=6, size_in=4)
+    initial = stacked.detach().clone()
+    lr = 1e-2
+    opt = cls([stacked], lr=lr, weight_decay=0.0, normalize_update_to_weight_norm=True)
+    stacked.grad = grads_like([stacked], seed=1200)[0]
+    opt.step()
+    assert opt.state[stacked]['weight_norm'].shape == (stacked.shape[0],)
+    assert opt.state[stacked]['update_norm'].shape == (stacked.shape[0],)
+    delta = (initial - stacked.detach()).double()
+    for i in range(stacked.shape[0]):
+        torch.testing.assert_close(delta[i].norm(), lr * initial[i].double().norm(), **TOL)
+
+
+@pytest.mark.parametrize('cls', [MARS, Mu2MARS])
+def test_weight_norm_expert_stack_matches_independent_experts(cls):
+    stacked = expert_stack()
+    num_experts = stacked.shape[0]
+    singles = [torch.nn.Parameter(stacked.detach()[i].clone()) for i in range(num_experts)]
+    kwargs = dict(lr=1e-2, weight_decay=0.1, eps=1e-8, clip=0.5,
+                  normalize_update_to_weight_norm=True)
+    opt = cls([stacked], **kwargs)
+    refs = [cls([s], **kwargs) for s in singles]
+    for step in range(1, 6):
+        grad = grads_like([stacked], seed=1300 + step)[0]
+        stacked.grad = grad.clone()
+        opt.step()
+        for i, (single, ref) in enumerate(zip(singles, refs)):
+            single.grad = grad[i].clone()
+            ref.step()
+    for i, single in enumerate(singles):
+        torch.testing.assert_close(stacked.detach()[i], single.detach(), **TOL)
+
+
+@pytest.mark.parametrize('cls,kwargs', WEIGHT_NORM_CASES)
+def test_weight_norm_state_dict_round_trip(cls, kwargs):
+    check_state_dict_round_trip(
+        lambda ps: cls(ps, lr=1e-2, weight_decay=0.1, normalize_update_to_weight_norm=True,
+                       **kwargs)
+    )
+    g = torch.Generator().manual_seed(23)
+    check_state_dict_round_trip(
+        lambda ps: cls(ps, lr=1e-2, weight_decay=0.1, normalize_update_to_weight_norm=True,
+                       **kwargs),
+        params=[expert_stack(), torch.nn.Parameter(torch.randn(5, generator=g))],
+    )
+
+
+def test_weight_norm_resume_keeps_the_recorded_norm_not_the_current_one():
+    """A resumed run scales to the norm its parent recorded at ITS first step. Re-measuring at
+    load would silently change every later update (the F092 failure mode)."""
+    model = make_model()
+    params = list(model.parameters())
+    initial = [p.detach().clone() for p in params]
+    lr = 0.1
+    opt = MARS(params, lr=lr, weight_decay=0.0, normalize_update_to_weight_norm=True)
+    for step in range(1, 4):
+        set_grads(params, grads_like(params, seed=step))
+        opt.step()
+
+    resumed = [p.detach().clone().requires_grad_(True) for p in params]
+    opt2 = MARS(resumed, lr=lr, weight_decay=0.0, normalize_update_to_weight_norm=True)
+    opt2.load_state_dict(copy.deepcopy(opt.state_dict()))
+    for q, w0 in zip(resumed, initial):
+        if q.ndim != 2:
+            continue
+        torch.testing.assert_close(opt2.state[q]['weight_norm'].double(), frobenius(w0), **TOL)
+        assert abs(frobenius(q) - frobenius(w0)) > 1e-2 * frobenius(w0)
+
+    before = [q.detach().clone() for q in resumed]
+    grads = grads_like(params, seed=99)
+    set_grads(params, grads)
+    set_grads(resumed, grads)
+    opt.step()
+    opt2.step()
+    for p, q, b, w0 in zip(params, resumed, before, initial):
+        torch.testing.assert_close(p.detach(), q.detach())
+        if q.ndim == 2:
+            torch.testing.assert_close(frobenius(b - q.detach()), lr * frobenius(w0), **TOL)
+
+
+def test_weight_norm_placeholder_state_is_measured_at_step_zero():
+    """Megatron's --load path preallocates the state (init_state_fn) before the checkpoint fills
+    it. A fresh start that went through the same allocation holds zeros at step 0; those must be
+    measured at the first step, never used as a target (which would zero every matrix update)."""
+    model = make_model()
+    params = list(model.parameters())
+    initial = [p.detach().clone() for p in params]
+    lr = 1e-2
+    opt = MARS(params, lr=lr, weight_decay=0.0, normalize_update_to_weight_norm=True)
+    for p in params:
+        opt.state[p]['step'] = 0
+        for key in ('exp_avg', 'exp_avg_sq', 'last_grad'):
+            opt.state[p][key] = torch.zeros_like(p.data)
+        if is_matrix_param(p):
+            for key in NORM_STATE_KEYS:
+                opt.state[p][key] = norm_state_like(p)
+    set_grads(params, make_grads(model, seed=1400))
+    opt.step()
+    for p, w0 in zip(params, initial):
+        if p.ndim != 2:
+            continue
+        torch.testing.assert_close(opt.state[p]['weight_norm'].double(), frobenius(w0), **TOL)
+        torch.testing.assert_close(frobenius(w0 - p.detach()), lr * frobenius(w0), **TOL)
+
+
+def test_norm_state_like_has_one_scalar_per_matrix():
+    assert norm_state_like(expert_stack()).shape == (3,)
+    assert norm_state_like(torch.nn.Parameter(torch.zeros(4, 3))).shape == ()
+    assert norm_state_like(torch.nn.Parameter(torch.zeros(4, 3))).dtype == torch.float32
+
+
+def test_weight_norm_zero_update_stays_zero_and_finite():
+    """A zero gradient at the first step gives U = 0; the match maps it to zero, not to NaN."""
+    model = make_model()
+    params = list(model.parameters())
+    before = [p.detach().clone() for p in params]
+    opt = MARS(params, lr=1e-2, weight_decay=0.0, normalize_update_to_weight_norm=True)
+    set_grads(params, [torch.zeros_like(p) for p in params])
+    opt.step()
+    for p, b in zip(params, before):
+        assert torch.isfinite(p.detach()).all()
+        torch.testing.assert_close(p.detach(), b)
+        if p.ndim == 2:
+            assert opt.state[p]['update_norm'].item() == 0.0
+
+
+def test_weight_norm_is_deterministic():
+    runs = []
+    for _ in range(2):
+        model = make_model()
+        params = list(model.parameters())
+        opt = MARS(params, lr=1e-2, weight_decay=0.1, normalize_update_to_weight_norm=True)
+        for step in range(1, 6):
+            set_grads(params, make_grads(model, seed=1500 + step))
+            opt.step()
+        runs.append(([p.detach().clone() for p in params],
+                     [opt.state[p]['update_norm'].clone() for p in params if p.ndim == 2]))
+    for a, b in zip(runs[0][0], runs[1][0]):
+        assert torch.equal(a, b)
+    for a, b in zip(runs[0][1], runs[1][1]):
+        assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize('cls', [MARS, Mu2MARS])
+def test_weight_norm_rejects_a_fixed_target_alongside(cls):
+    g = torch.Generator().manual_seed(35)
+    with pytest.raises(ValueError, match='two targets'):
+        cls([torch.nn.Parameter(torch.randn(4, 3, generator=g))], lr=1e-2, muon_rms_target=0.2,
+            normalize_update_to_weight_norm=True)
+
+
+@pytest.mark.parametrize('mars_type', ['mars-adamw', 'mars-lion', 'mars-shampoo', 'mars-muon'])
+def test_weight_norm_supersedes_the_inner_optimizer_scale(mars_type):
+    """As in MuonMD, the measured-norm match removes every scalar factor the inner step carries
+    (Lion's unit entries, shampoo's and MARS-M's shape factors): all land on lr * ||W_0||_F."""
+    g = torch.Generator().manual_seed(36)
+    matrix = torch.nn.Parameter(torch.randn(8, 4, generator=g))
+    w0 = matrix.detach().clone()
+    lr = 1e-2
+    opt = MARS([matrix], lr=lr, weight_decay=0.0, mars_type=mars_type,
+               normalize_update_to_weight_norm=True)
+    matrix.grad = grads_like([matrix], seed=37)[0]
+    opt.step()
+    torch.testing.assert_close(frobenius(w0 - matrix.detach()), lr * frobenius(w0), **TOL)
+
+
+def test_collect_norm_stats_reports_per_shape_means():
+    """Equal-weighted per-matrix means, globally and per shape, from the recorded state; nothing
+    when the flag is off; found through Megatron's chained/mixed-precision wrappers."""
+    model = make_model()
+    params = list(model.parameters())
+    opt = MARS(params, lr=1e-2, weight_decay=0.1, normalize_update_to_weight_norm=True)
+    assert collect_norm_stats(opt) == {}
+    set_grads(params, make_grads(model, seed=1600))
+    opt.step()
+    stats = collect_norm_stats(opt)
+    matrices = [p for p in params if p.ndim == 2]
+    shapes = [f'{p.shape[0]}x{p.shape[1]}' for p in matrices]
+    assert shapes == ['5x6', '4x5']
+    assert set(stats) == {f'mars/{name}{suffix}' for name in ('weight-rms', 'update-rms',
+                                                             'update-scale')
+                          for suffix in ['', *(f'/{s}' for s in shapes)]}
+    per_matrix = {}
+    for p, shape in zip(matrices, shapes):
+        w, u = opt.state[p]['weight_norm'].item(), opt.state[p]['update_norm'].item()
+        per_matrix[shape] = (w / math.sqrt(p.numel()), u / math.sqrt(p.numel()), w / u)
+        assert stats[f'mars/weight-rms/{shape}'] == pytest.approx(per_matrix[shape][0])
+        assert stats[f'mars/update-rms/{shape}'] == pytest.approx(per_matrix[shape][1])
+        assert stats[f'mars/update-scale/{shape}'] == pytest.approx(per_matrix[shape][2])
+    for i, name in enumerate(('weight-rms', 'update-rms', 'update-scale')):
+        assert stats[f'mars/{name}'] == pytest.approx(
+            sum(v[i] for v in per_matrix.values()) / len(per_matrix))
+    assert all(math.isfinite(v) for v in stats.values())
+
+    wrapped = SimpleNamespace(chained_optimizers=[SimpleNamespace(optimizer=opt)])
+    assert collect_norm_stats(wrapped) == stats
+    plain = MARS([p.detach().clone().requires_grad_(True) for p in params], lr=1e-2)
+    assert collect_norm_stats(plain) == {}
+
+
+@pytest.mark.parametrize('cls', [MARS, Mu2MARS])
+def test_sharded_norm_state_checkpoints_the_norms_as_objects(cls):
+    """Under --ckpt-format torch_dist every state key goes through optim_state_to_sharding_state,
+    which asserts a param-shaped tensor unless the optimizer's hook claims the key: the recorded
+    norms become ShardedObjects under the param's key and replica id, everything else falls
+    through to the param-shaped path."""
+    from megatron.core.dist_checkpointing.mapping import ShardedObject
+
+    model_param = SimpleNamespace(key='decoder.layers.0.mlp.linear_fc1.weight', replica_id=(0, 0, 3))
+    value = torch.tensor(2.5)
+    for key in NORM_STATE_KEYS:
+        obj = cls.build_sharded_optimizer_state(model_param, value, key, f'optimizer.state.{key}')
+        assert isinstance(obj, ShardedObject)
+        assert obj.key == f'optimizer.state.{key}.{model_param.key}'
+        assert obj.data is value
+        assert obj.replica_id == (0, 0, 3)
+        assert (obj.global_shape, obj.global_offset) == ((1,), (0,))
+    for key in ('exp_avg', 'exp_avg_sq', 'last_grad', 'mu_avg', 'w'):
+        assert cls.build_sharded_optimizer_state(model_param, value, key, 'p') is None
+
+
+def test_weight_norm_state_goes_through_optim_state_to_sharding_state():
+    """The real torch_dist conversion: param-shaped keys become ShardedTensors that follow the
+    model param, the norms become ShardedObjects, and nothing trips the shape assertion."""
+    from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
+    from megatron.core.dist_checkpointing.optimizer import optim_state_to_sharding_state
+
+    params = [expert_stack(), torch.nn.Parameter(torch.randn(4, 3)),
+              torch.nn.Parameter(torch.randn(3))]
+    opt = MARS(params, lr=1e-2, weight_decay=0.1, normalize_update_to_weight_norm=True)
+    set_grads(params, grads_like(params, seed=1700))
+    opt.step()
+    state_dict = opt.state_dict()
+    id_map = {
+        i: ShardedTensor.from_rank_offsets(f'param{i}', p.detach(), replica_id=(0, 0, 1))
+        for i, p in enumerate(params)
+    }
+    optim_state_to_sharding_state(
+        state_dict, id_map, exclude_keys='step', state_sharding_fn=MARS.build_sharded_optimizer_state
+    )
+    for i, p in enumerate(params):
+        sharded = state_dict['state'][i]
+        expected = {'exp_avg', 'exp_avg_sq', 'last_grad'} | (
+            set(NORM_STATE_KEYS) if is_matrix_param(p) else set())
+        assert set(sharded) == expected
+        for key in set(NORM_STATE_KEYS) & set(sharded):
+            assert isinstance(sharded[key], ShardedObject)
+            assert sharded[key].key == f'optimizer.state.{key}.param{i}'
+            assert sharded[key].replica_id == (0, 0, 1)
+            assert sharded[key].data.shape == p.shape[:-2]
+        for key in expected - set(NORM_STATE_KEYS):
+            assert isinstance(sharded[key], ShardedTensor)
+            assert sharded[key].local_shape == tuple(p.shape)

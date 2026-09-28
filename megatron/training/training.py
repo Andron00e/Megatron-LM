@@ -198,6 +198,7 @@ try:
     from _research.variants.neutrinomd import get_megatron_neutrinomd_optimizer
 except ImportError:
     get_megatron_neutrinomd_optimizer = None
+from megatron.core.optimizer.mars import collect_norm_stats as collect_mars_norm_stats
 from megatron.core.optimizer.muon_logging import (
     collect_md_gain_stats,
     collect_muon_stats,
@@ -3586,6 +3587,9 @@ def train(
                     log_sparsity=args.log_muon_sparsity,
                     log_param_rms=args.log_muon_param_rms,
                 )
+        if args.optimizer in ('mars', 'mu2mars') and args.mars_normalize_update_to_weight_norm:
+            if iteration % (args.muon_log_interval or args.log_interval) == 0:
+                md_gain_stats = collect_mars_norm_stats(optimizer)
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:

@@ -63,7 +63,7 @@ from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_versio
 from .ademamix import AdEMAMix
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
-from .mars import MARS, is_matrix_param
+from .mars import MARS, NORM_STATE_KEYS, is_matrix_param, norm_state_like
 from .mu2mars import Mu2MARS
 from .optimizer import (
     ChainedOptimizer,
@@ -617,6 +617,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 "optimize_1d": config.mars_optimize_1d,
                 "lr_1d": config.mars_lr_1d,
                 "muon_rms_target": config.mars_muon_rms_target,
+                "normalize_update_to_weight_norm": config.mars_normalize_update_to_weight_norm,
                 "betas_1d": (config.adam_beta1, config.adam_beta2),
             }
             if config.optimizer == 'mars':
@@ -649,6 +650,11 @@ def _get_megatron_optimizer_based_on_param_groups(
                             # and only exists for params Mu2MARS keeps off the AdamW path.
                             if anytime_w and (opt.optimize_1d or is_matrix_param(p)):
                                 opt.state[p]['w'] = p.data.clone().float()
+                            # The recorded norms exist for matrix params only; a load fills
+                            # them, a fresh start measures them at step 0.
+                            if opt.normalize_update_to_weight_norm and is_matrix_param(p):
+                                for key in NORM_STATE_KEYS:
+                                    opt.state[p][key] = norm_state_like(p)
 
         elif config.optimizer == 'ademamix':
             optimizer = AdEMAMix(

@@ -40,7 +40,17 @@ import math
 
 import torch
 
-from .mars import adamw_denom, exists, is_matrix_param, mars_correction, muon_rms_scale
+from .mars import (
+    adamw_denom,
+    exists,
+    is_matrix_param,
+    mars_correction,
+    matrix_norms,
+    muon_rms_scale,
+    norm_state_like,
+    scale_update_to_weight_norm,
+    sharded_norm_state,
+)
 
 
 def update_fn(
@@ -63,6 +73,8 @@ def update_fn(
     variant,
     anytime_gamma,
     muon_rms_target,
+    weight_norm,
+    update_norm,
     is_matrix,
     optimize_1d,
     lr_1d_factor,
@@ -80,6 +92,8 @@ def update_fn(
             update = m_hat.div(denom)
             if muon_rms_target is not None and is_matrix:
                 update = muon_rms_scale(update, muon_rms_target)
+            if weight_norm is not None and is_matrix:
+                update = scale_update_to_weight_norm(update, weight_norm, update_norm)
             w.add_(-lr * torch.mul(w, wd).add(update))
             p.data.mul_(1.0 - anytime_gamma).add_(w, alpha=anytime_gamma)
         else:
@@ -88,6 +102,8 @@ def update_fn(
             update = mu_hat.div(denom)
             if muon_rms_target is not None and is_matrix:
                 update = muon_rms_scale(update, muon_rms_target)
+            if weight_norm is not None and is_matrix:
+                update = scale_update_to_weight_norm(update, weight_norm, update_norm)
             p.data.add_(-lr * torch.mul(p.data, wd).add(update))
     else:
         beta1_1d, beta2_1d = betas_1d
@@ -114,6 +130,7 @@ class Mu2MARS(torch.optim.Optimizer):
         variant="ema",
         anytime_gamma=0.1,
         muon_rms_target=None,
+        normalize_update_to_weight_norm=False,
         optimize_1d=False,
         lr_1d=None,
         betas_1d=(0.9, 0.95),
@@ -129,6 +146,11 @@ class Mu2MARS(torch.optim.Optimizer):
             raise ValueError("Invalid variant: {}".format(variant))
         if not 0.0 < anytime_gamma <= 1.0:
             raise ValueError("Invalid anytime_gamma: {}".format(anytime_gamma))
+        if normalize_update_to_weight_norm and muon_rms_target is not None:
+            raise ValueError(
+                "normalize_update_to_weight_norm and muon_rms_target are two targets for the "
+                "same matrix update RMS; set one."
+            )
         defaults = dict(
             lr=lr,
             betas=betas,
@@ -146,9 +168,12 @@ class Mu2MARS(torch.optim.Optimizer):
         self.variant = variant
         self.anytime_gamma = anytime_gamma
         self.muon_rms_target = muon_rms_target
+        self.normalize_update_to_weight_norm = normalize_update_to_weight_norm
         self.optimize_1d = optimize_1d
         self.lr_1d_factor = 1.0 if lr_1d is None else lr_1d / lr
         self.betas_1d = betas_1d
+
+    build_sharded_optimizer_state = staticmethod(sharded_norm_state)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -189,6 +214,11 @@ class Mu2MARS(torch.optim.Optimizer):
                     group["weight_decay"],
                     group["betas"],
                 )
+                is_matrix = is_matrix_param(p)
+                if self.normalize_update_to_weight_norm and is_matrix and state["step"] == 0:
+                    # See mars.py: measured once, before the first decay/update.
+                    state["weight_norm"] = matrix_norms(p.data)
+                    state["update_norm"] = norm_state_like(p)
 
                 state["step"] += 1
                 self.update_fn(
@@ -211,7 +241,9 @@ class Mu2MARS(torch.optim.Optimizer):
                     self.variant,
                     self.anytime_gamma,
                     self.muon_rms_target,
-                    is_matrix=is_matrix_param(p),
+                    state.get("weight_norm"),
+                    state.get("update_norm"),
+                    is_matrix=is_matrix,
                     optimize_1d=self.optimize_1d,
                     lr_1d_factor=self.lr_1d_factor,
                     betas_1d=self.betas_1d,

@@ -119,6 +119,87 @@ def muon_rms_scale(update, target):
     return update.mul(target / rms.clamp(min=1e-12))
 
 
+NORM_STATE_KEYS = ("weight_norm", "update_norm")
+
+
+def matrix_norms(x):
+    """Frobenius norm of each matrix: a 0-dim tensor, or [local_experts] for a stack."""
+    if x.ndim == 3:
+        return x.flatten(1).norm(dim=1)
+    return x.norm()
+
+
+def norm_state_like(p):
+    """One fp32 scalar per matrix of `p`, the shape of its recorded norms."""
+    return torch.zeros(p.shape[:-2], dtype=torch.float32, device=p.device)
+
+
+def scale_update_to_weight_norm(update, weight_norm, update_norm):
+    """Rescale each matrix's update to the Frobenius norm recorded for its weight (per expert for
+    a stack), a zero update staying zero, and record the update's own norm in `update_norm`.
+
+    md_decoupling's --md-normalize-update-to-weight-norm (`_scale_update_to_fixed_norm`,
+    `_normalize_muon_update_blocks`): the update's MEASURED norm is matched to the weight norm
+    cached at the first step, which supersedes every scalar factor -- there Muon's shape factor,
+    here the RMS an AdamW-type update happens to have. lr is then the relative step
+    ||dW||_F / ||W_0||_F of every matrix, whatever its shape or init.
+    """
+    update_norm.copy_(matrix_norms(update))
+    scale = torch.where(update_norm > 0, weight_norm / update_norm, torch.zeros_like(update_norm))
+    if update.ndim == 3:
+        scale = scale.view(-1, 1, 1)
+    return update.mul(scale)
+
+
+def sharded_norm_state(model_param, value, state_key, prefix):
+    """dist-checkpointing hook (Float16OptimizerWithFloat16Params.sharded_state_dict): the recorded
+    norms are one scalar per matrix, not param-shaped, so they go into the checkpoint as objects
+    under the param's key. None sends every other key down the param-shaped path."""
+    if state_key not in NORM_STATE_KEYS:
+        return None
+    from megatron.core.dist_checkpointing.mapping import ShardedObject
+
+    return ShardedObject(
+        f"{prefix}.{model_param.key}", value, (1,), (0,), replica_id=model_param.replica_id
+    )
+
+
+@torch.no_grad()
+def collect_norm_stats(optimizer):
+    """Recorded weight RMS, measured update RMS and their ratio (the multiplier the match applies
+    to the update), as equal-weighted per-matrix means, globally and per matrix shape.
+
+    muon_logging's conventions and sink: one value per matrix (per expert for a stack), read from
+    replicated state so nothing is reduced, returned as the md_gain_stats dict that training_log
+    writes to TensorBoard and W&B.
+    """
+    wrapped = getattr(optimizer, "chained_optimizers", (optimizer,))
+    per_shape = {}
+    for opt in (getattr(w, "optimizer", w) for w in wrapped):
+        if not getattr(opt, "normalize_update_to_weight_norm", False):
+            continue
+        for p, state in opt.state.items():
+            if "weight_norm" not in state:
+                continue
+            w, u = state["weight_norm"].flatten(), state["update_norm"].flatten()
+            sqrt_numel = math.sqrt(p.shape[-2] * p.shape[-1])
+            rows = per_shape.setdefault(f"{p.shape[-2]}x{p.shape[-1]}", [])
+            rows.append(
+                torch.stack(
+                    (w / sqrt_numel, u / sqrt_numel, torch.where(u > 0, w / u, torch.zeros_like(u)))
+                )
+            )
+    if not per_shape:
+        return {}
+    per_shape = {shape: torch.cat(rows, dim=1) for shape, rows in per_shape.items()}
+    stats = {}
+    for i, name in enumerate(("weight-rms", "update-rms", "update-scale")):
+        stats[f"mars/{name}"] = torch.cat([v[i] for v in per_shape.values()]).mean().item()
+        for shape, v in per_shape.items():
+            stats[f"mars/{name}/{shape}"] = v[i].mean().item()
+    return stats
+
+
 def update_fn(
     p,
     grad,
@@ -135,6 +216,8 @@ def update_fn(
     clip,
     mars_type,
     muon_rms_target,
+    weight_norm,
+    update_norm,
     is_matrix,
     optimize_1d,
     lr_1d_factor,
@@ -162,6 +245,8 @@ def update_fn(
             update = exp_avg.div(denom)
         if muon_rms_target is not None and is_matrix:
             update = muon_rms_scale(update, muon_rms_target)
+        if weight_norm is not None and is_matrix:
+            update = scale_update_to_weight_norm(update, weight_norm, update_norm)
         p.data.add_(-lr * torch.mul(p.data, wd).add(update))
     else:
         beta1_1d, beta2_1d = betas_1d
@@ -181,6 +266,12 @@ class MARS(torch.optim.Optimizer):
     max(1, d_out/d_in)**0.5, with 1-D params still on AdamW) or ``mars-muon`` (MARS-M,
     arXiv:2510.21800: Newton-Schulz orthogonalization of the corrected momentum times
     0.2 * sqrt(max(d_out, d_in)), the Moonlight/Muon scale, with 1-D params still on AdamW).
+
+    ``normalize_update_to_weight_norm`` is MuonMD's --md-normalize-update-to-weight-norm on the
+    matrix group: each matrix's ||W||_F is recorded at its first step (state ``weight_norm``) and
+    every later update direction is rescaled to that norm (its measured norm kept in
+    ``update_norm``), superseding whatever scale the inner optimizer gave it. The decoupled
+    weight-decay term and the 1-D/embedding/output params are never touched.
     """
 
     def __init__(
@@ -194,6 +285,7 @@ class MARS(torch.optim.Optimizer):
         clip=1.0,
         mars_type="mars-adamw",
         muon_rms_target=None,
+        normalize_update_to_weight_norm=False,
         optimize_1d=False,
         lr_1d=None,
         betas_1d=(0.9, 0.95),
@@ -206,6 +298,11 @@ class MARS(torch.optim.Optimizer):
             raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
         if not 0.0 <= betas[1] < 1.0:
             raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
+        if normalize_update_to_weight_norm and muon_rms_target is not None:
+            raise ValueError(
+                "normalize_update_to_weight_norm and muon_rms_target are two targets for the "
+                "same matrix update RMS; set one."
+            )
         assert mars_type in ["mars-adamw", "mars-lion", "mars-shampoo", "mars-muon"], (
             "MARS type not supported"
         )
@@ -231,9 +328,12 @@ class MARS(torch.optim.Optimizer):
         self.clip = clip
         self.mars_type = mars_type
         self.muon_rms_target = muon_rms_target
+        self.normalize_update_to_weight_norm = normalize_update_to_weight_norm
         self.optimize_1d = optimize_1d
         self.lr_1d_factor = 1.0 if lr_1d is None else lr_1d / lr
         self.betas_1d = betas_1d
+
+    build_sharded_optimizer_state = staticmethod(sharded_norm_state)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -266,6 +366,12 @@ class MARS(torch.optim.Optimizer):
                 exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
                 last_grad = state["last_grad"]
                 lr, wd, (beta1, beta2) = group["lr"], group["weight_decay"], group["betas"]
+                is_matrix = is_matrix_param(p)
+                if self.normalize_update_to_weight_norm and is_matrix and state["step"] == 0:
+                    # Measured once, before the first decay/update, like MuonMD's
+                    # _cache_fixed_weight_norms; a checkpoint carries it from then on.
+                    state["weight_norm"] = matrix_norms(p.data)
+                    state["update_norm"] = norm_state_like(p)
 
                 state["step"] += 1
                 self.update_fn(
@@ -284,7 +390,9 @@ class MARS(torch.optim.Optimizer):
                     self.clip,
                     self.mars_type,
                     self.muon_rms_target,
-                    is_matrix=is_matrix_param(p),
+                    state.get("weight_norm"),
+                    state.get("update_norm"),
+                    is_matrix=is_matrix,
                     optimize_1d=self.optimize_1d,
                     lr_1d_factor=self.lr_1d_factor,
                     betas_1d=self.betas_1d,

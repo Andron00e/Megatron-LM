@@ -1584,6 +1584,10 @@ def validate_args(args, defaults={}):
             f"{args.optimizer} reads every 3D param as a grouped expert stack "
             "[local_experts, out, in]; a Mamba/GDN/KDA depthwise conv1d weight is 3D too and "
             "would be optimized as a stack of 1-row matrices.")
+        if args.mars_normalize_update_to_weight_norm:
+            assert args.tensor_model_parallel_size == 1 and args.expert_model_parallel_size == 1, (
+                "--mars-normalize-update-to-weight-norm records one norm per LOCAL matrix and "
+                "checkpoints it under the param's key alone, which TP/EP shards would share.")
 
     # DiLoCo / SNOO / mu^2-DiLoCo check. Between syncs the K workers hold different params while
     # the checkpoint is saved from one DP replica, so a save at i % H != 0 would silently discard
@@ -3233,6 +3237,17 @@ def _add_training_args(parser):
                        'top of the LR schedule. When unset those params track --lr.')
     group.add_argument('--mars-optimize-1d', action='store_true',
                        help='Run 1D params through the MARS/Mu2MARS rule instead of AdamW.')
+    group.add_argument('--mars-normalize-update-to-weight-norm', action='store_true',
+                       help='--md-normalize-update-to-weight-norm for the mars/mu2mars matrix '
+                       'group (2D, or per expert for a 3D stack): record each matrix\'s ||W||_F '
+                       'once, at its first step, and rescale every later update direction to '
+                       'that measured norm, so lr is the relative step ||dW||/||W_0|| of every '
+                       'matrix whatever its shape, init or inner optimizer (the recorded norms '
+                       'ride in the checkpoint; the recorded/measured RMS and their ratio are '
+                       'logged as mars/* at --muon-log-interval). The decoupled weight-decay '
+                       'term and 1D/embedding/output params are never touched. Off by default; '
+                       'exclusive with --mars-muon-rms-target, which fixes the RMS to a constant '
+                       'instead of the weight\'s own.')
     group.add_argument('--mars-muon-rms-target', type=float, default=None,
                        help='Rescale the matrix (2D, or per-expert for a 3D stack) update of '
                        'mars/mu2mars to this RMS, which is what Muon does to its own update: '

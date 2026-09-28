@@ -499,6 +499,12 @@ class OptimizerConfig:
     what muon_scale_mode='spectral' times muon_extra_scale_factor does to an orthogonalized
     update. None leaves the update alone; 1D/embedding/output params are never touched."""
 
+    mars_normalize_update_to_weight_norm: bool = False
+    """MuonMD's md_normalize_update_to_weight_norm on the mars/mu2mars matrix group: record
+    each matrix's ||W||_F at its first step and rescale every later update to that norm, so the
+    relative step per matrix is lr. 1D/embedding/output params and the weight-decay term are
+    never touched; exclusive with mars_muon_rms_target."""
+
     mars_clip: float = 1.0
     """L2-norm clip applied to the MARS corrected gradient c_t, per parameter tensor."""
 
