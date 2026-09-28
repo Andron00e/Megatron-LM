@@ -3215,9 +3215,12 @@ def _add_training_args(parser):
                        help='Scale of the MARS variance-reduction term, '
                        'gamma * beta1 / (1 - beta1) * (g_t - g_{t-1}).')
     group.add_argument('--mars-type', type=str, default='mars-adamw',
-                       choices=['mars-adamw'],
-                       help='Which version of the MARS framework to use. Only the AdamW inner '
-                       'optimizer is ported; mars-lion/mars-shampoo are not.')
+                       choices=['mars-adamw', 'mars-lion', 'mars-shampoo'],
+                       help='Inner optimizer the MARS framework applies to the corrected '
+                       'gradient c_t: mars-adamw, mars-lion (sign of the corrected momentum, no '
+                       'second moment) or mars-shampoo (Newton-Schulz orthogonalization times '
+                       'max(1, d_out/d_in)**0.5 on 2D/3D params, AdamW on 1D). '
+                       '--optimizer mu2mars ignores this flag.')
     group.add_argument('--mars-clip', type=float, default=1.0,
                        help='L2-norm clip on the MARS/Mu2MARS corrected gradient c_t, per '
                        'parameter tensor.')
@@ -3227,6 +3230,16 @@ def _add_training_args(parser):
                        'top of the LR schedule. When unset those params track --lr.')
     group.add_argument('--mars-optimize-1d', action='store_true',
                        help='Run 1D params through the MARS/Mu2MARS rule instead of AdamW.')
+    group.add_argument('--mars-muon-rms-target', type=float, default=None,
+                       help='Rescale the matrix (2D, or per-expert for a 3D stack) update of '
+                       'mars/mu2mars to this RMS, which is what Muon does to its own update: '
+                       '--muon-scale-mode spectral is sqrt(max(d_out, d_in)), cancelling the RMS '
+                       'of a semi-orthogonal matrix, so a Muon update lands at RMS = '
+                       '--muon-extra-scale-factor (0.2 here) at every shape, while an AdamW-type '
+                       'update keeps whatever RMS its second moment gives it. Unset (default) '
+                       'leaves the update alone. 1D/embedding/output params are never touched, '
+                       'and it is rejected with --mars-type mars-shampoo, which sets its own '
+                       'update scale.')
     group.add_argument('--mu2mars-beta1', type=float, default=0.025,
                        help='Inner EMA coefficient for Mu2MARS. With --mu2mars-gamma 1 this is '
                        'the STORM correction weight, not a momentum.')

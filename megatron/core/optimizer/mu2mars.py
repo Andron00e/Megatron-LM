@@ -40,7 +40,7 @@ import math
 
 import torch
 
-from .mars import adamw_denom, exists, is_matrix_param, mars_correction
+from .mars import adamw_denom, exists, is_matrix_param, mars_correction, muon_rms_scale
 
 
 def update_fn(
@@ -62,6 +62,7 @@ def update_fn(
     clip,
     variant,
     anytime_gamma,
+    muon_rms_target,
     is_matrix,
     optimize_1d,
     lr_1d_factor,
@@ -76,12 +77,18 @@ def update_fn(
         denom = exp_avg_sq.sqrt().mul(1 / math.sqrt(1.0 - beta2**step)).add(eps)
         if variant == "anytime":
             m_hat = exp_avg.div(1.0 - beta1**step)
-            w.add_(-lr * torch.mul(w, wd).add(m_hat.div(denom)))
+            update = m_hat.div(denom)
+            if muon_rms_target is not None and is_matrix:
+                update = muon_rms_scale(update, muon_rms_target)
+            w.add_(-lr * torch.mul(w, wd).add(update))
             p.data.mul_(1.0 - anytime_gamma).add_(w, alpha=anytime_gamma)
         else:
             mu_avg.mul_(beta3).add_(exp_avg.div(1.0 - beta1**step), alpha=1.0 - beta3)
             mu_hat = mu_avg.div(1.0 - beta3**step)
-            p.data.add_(-lr * torch.mul(p.data, wd).add(mu_hat.div(denom)))
+            update = mu_hat.div(denom)
+            if muon_rms_target is not None and is_matrix:
+                update = muon_rms_scale(update, muon_rms_target)
+            p.data.add_(-lr * torch.mul(p.data, wd).add(update))
     else:
         beta1_1d, beta2_1d = betas_1d
         exp_avg.mul_(beta1_1d).add_(grad, alpha=1 - beta1_1d)
@@ -106,6 +113,7 @@ class Mu2MARS(torch.optim.Optimizer):
         clip=1.0,
         variant="ema",
         anytime_gamma=0.1,
+        muon_rms_target=None,
         optimize_1d=False,
         lr_1d=None,
         betas_1d=(0.9, 0.95),
@@ -137,6 +145,7 @@ class Mu2MARS(torch.optim.Optimizer):
         self.clip = clip
         self.variant = variant
         self.anytime_gamma = anytime_gamma
+        self.muon_rms_target = muon_rms_target
         self.optimize_1d = optimize_1d
         self.lr_1d_factor = 1.0 if lr_1d is None else lr_1d / lr
         self.betas_1d = betas_1d
@@ -201,6 +210,7 @@ class Mu2MARS(torch.optim.Optimizer):
                     self.clip,
                     self.variant,
                     self.anytime_gamma,
+                    self.muon_rms_target,
                     is_matrix=is_matrix_param(p),
                     optimize_1d=self.optimize_1d,
                     lr_1d_factor=self.lr_1d_factor,

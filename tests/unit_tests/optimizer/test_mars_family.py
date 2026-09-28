@@ -15,7 +15,7 @@ import torch
 
 from megatron.core.optimizer.ademamix import AdEMAMix
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.optimizer.mars import MARS, is_matrix_param
+from megatron.core.optimizer.mars import MARS, is_matrix_param, shampoo_shape_factor
 from megatron.core.optimizer.mu2mars import Mu2MARS
 
 TOL = dict(atol=1e-6, rtol=1e-6)
@@ -429,6 +429,180 @@ def check_state_dict_round_trip(make_opt, params=None):
         torch.testing.assert_close(p.detach(), q.detach())
     for p, q in zip(params, resumed):
         assert opt.state[p]['step'] == opt2.state[q]['step'] == 4
+
+
+# ---- mars_type: the lion and shampoo inner optimizers ----
+
+
+def ref_mars_lion_step(states, grads, step, lr, wd, betas, eps, gamma, clip, betas_1d):
+    """MARS-Lion: the sign of the corrected momentum, no second moment, no bias correction."""
+    beta1, beta2 = betas
+    for st, grad in zip(states, grads):
+        g = grad.flatten().double().tolist()
+        if st['ndim'] == 2:
+            c = corrected(st, g, beta1, gamma, clip)
+            for i in range(len(g)):
+                st['m'][i] = beta1 * st['m'][i] + (1.0 - beta1) * c[i]
+                sign = 0.0 if st['m'][i] == 0.0 else math.copysign(1.0, st['m'][i])
+                st['p'][i] -= lr * (wd * st['p'][i] + sign)
+        else:
+            for i in range(len(g)):
+                ref_adamw_element(st, i, g[i], lr, wd, *betas_1d, eps, step)
+        st['lg'] = g
+
+
+def test_mars_lion_matches_reference():
+    model = make_model()
+    params = list(model.parameters())
+    states = as_state(params)
+    lr, wd, eps, gamma, clip = 1e-3, 0.1, 1e-8, 0.025, 1.0
+    betas, betas_1d = (0.95, 0.99), (0.9, 0.95)
+    opt = MARS(params, lr=lr, betas=betas, eps=eps, weight_decay=wd, gamma=gamma, clip=clip,
+               mars_type='mars-lion', betas_1d=betas_1d)
+    for step in range(1, 11):
+        grads = make_grads(model, seed=step)
+        set_grads(params, grads)
+        opt.step()
+        ref_mars_lion_step(states, grads, step, lr, wd, betas, eps, gamma, clip, betas_1d)
+    assert_matches(params, states)
+
+
+def test_mars_lion_moves_every_matrix_weight_by_exactly_lr():
+    """With wd = 0 the 2-D step is a pure sign vector, so every element moves by lr."""
+    model = make_model()
+    params = list(model.parameters())
+    before = [p.detach().clone() for p in params]
+    lr = 1e-3
+    opt = MARS(params, lr=lr, weight_decay=0.0, mars_type='mars-lion')
+    set_grads(params, make_grads(model, seed=7))
+    opt.step()
+    for p, b in zip(params, before):
+        if p.ndim != 2:
+            continue
+        step = (b - p.detach()).abs()
+        assert torch.isfinite(step).all()
+        torch.testing.assert_close(step, torch.full_like(step, lr), **TOL)
+
+
+def test_mars_shampoo_orthogonalizes_the_matrix_update():
+    """The 2-D update is Newton-Schulz's U S' V^T times max(1, d_out/d_in)**0.5, so its singular
+    values sit around that factor; 1-D params stay on the reference's AdamW branch."""
+    g = torch.Generator().manual_seed(31)
+    matrix = torch.nn.Parameter(torch.randn(8, 4, generator=g))
+    vector = torch.nn.Parameter(torch.randn(6, generator=g))
+    params = [matrix, vector]
+    plain = [q.detach().clone().requires_grad_(True) for q in params]
+    lr = 1e-2
+    opt = MARS(params, lr=lr, weight_decay=0.0, mars_type='mars-shampoo')
+    ref = MARS(plain, lr=lr, weight_decay=0.0)
+    before = matrix.detach().clone()
+    grads = grads_like(params, seed=32)
+    set_grads(params, grads)
+    set_grads(plain, grads)
+    opt.step()
+    ref.step()
+    update = (before - matrix.detach()) / lr
+    assert torch.isfinite(update).all()
+    factor = shampoo_shape_factor(matrix)
+    svals = torch.linalg.svdvals(update.double())
+    assert svals.min() > 0.4 * factor and svals.max() < 1.6 * factor
+    torch.testing.assert_close(vector.detach(), plain[1].detach(), **TOL)
+    assert not torch.allclose(matrix.detach(), plain[0].detach())
+
+
+def test_mars_shampoo_expert_stack_matches_independent_experts():
+    """Newton-Schulz and its pre-scaling are per expert, so a stack moves as separate matrices."""
+    stacked = expert_stack(size_out=6, size_in=4)
+    num_experts = stacked.shape[0]
+    singles = [torch.nn.Parameter(stacked.detach()[i].clone()) for i in range(num_experts)]
+    kwargs = dict(lr=1e-2, weight_decay=0.1, eps=1e-8, clip=0.5, mars_type='mars-shampoo')
+    opt = MARS([stacked], **kwargs)
+    refs = [MARS([s], **kwargs) for s in singles]
+    for step in range(1, 6):
+        grad = grads_like([stacked], seed=600 + step)[0]
+        stacked.grad = grad.clone()
+        opt.step()
+        for i, (single, ref) in enumerate(zip(singles, refs)):
+            single.grad = grad[i].clone()
+            ref.step()
+    assert torch.isfinite(stacked.detach()).all()
+    for i, single in enumerate(singles):
+        torch.testing.assert_close(stacked.detach()[i], single.detach(), **TOL)
+
+
+def test_unknown_mars_type_is_rejected():
+    g = torch.Generator().manual_seed(33)
+    with pytest.raises(AssertionError, match='MARS type'):
+        MARS([torch.nn.Parameter(torch.randn(4, 3, generator=g))], lr=1e-2, mars_type='mars-adam')
+
+
+# ---- --mars-muon-rms-target: Muon's per-matrix update RMS, on the 2-D group only ----
+
+
+@pytest.mark.parametrize('cls,kwargs', [(MARS, {}), (Mu2MARS, {}),
+                                        (Mu2MARS, {'variant': 'anytime', 'anytime_gamma': 1.0})])
+def test_muon_rms_target_sets_the_matrix_update_rms(cls, kwargs):
+    target, lr = 0.2, 1e-2
+    model = make_model()
+    params = list(model.parameters())
+    before = [p.detach().clone() for p in params]
+    opt = cls(params, lr=lr, weight_decay=0.0, muon_rms_target=target, **kwargs)
+    set_grads(params, make_grads(model, seed=41))
+    opt.step()
+    matrices = [p for p in params if p.ndim == 2]
+    assert matrices
+    for p, b in zip(params, before):
+        step = b - p.detach()
+        assert torch.isfinite(step).all()
+        if p.ndim != 2:
+            continue
+        rms = step.double().norm() / math.sqrt(p.numel())
+        torch.testing.assert_close(rms, torch.tensor(lr * target, dtype=torch.float64), **TOL)
+
+
+@pytest.mark.parametrize('cls,kwargs', [(MARS, {}), (Mu2MARS, {}),
+                                        (Mu2MARS, {'variant': 'anytime'})])
+def test_muon_rms_target_leaves_the_1d_group_untouched(cls, kwargs):
+    """One flag, one group: the 2-D params must move differently and the 1-D params identically."""
+    model = make_model()
+    params = list(model.parameters())
+    plain = [p.detach().clone().requires_grad_(True) for p in params]
+    common = dict(lr=1e-2, weight_decay=0.1, eps=1e-8, **kwargs)
+    opt = cls(params, muon_rms_target=0.2, **common)
+    ref = cls(plain, **common)
+    for step in range(1, 6):
+        grads = make_grads(model, seed=700 + step)
+        set_grads(params, grads)
+        set_grads(plain, grads)
+        opt.step()
+        ref.step()
+    for p, q in zip(params, plain):
+        if p.ndim == 2:
+            assert not torch.allclose(p.detach(), q.detach())
+        else:
+            torch.testing.assert_close(p.detach(), q.detach(), **TOL)
+
+
+@pytest.mark.parametrize('cls', [MARS, Mu2MARS])
+def test_muon_rms_target_is_per_expert(cls):
+    target, lr = 0.2, 1e-2
+    stacked = expert_stack(size_out=6, size_in=4)
+    before = stacked.detach().clone()
+    opt = cls([stacked], lr=lr, weight_decay=0.0, muon_rms_target=target)
+    stacked.grad = grads_like([stacked], seed=800)[0]
+    opt.step()
+    step = (before - stacked.detach()).double()
+    for i in range(stacked.shape[0]):
+        rms = step[i].norm() / math.sqrt(step[i].numel())
+        torch.testing.assert_close(rms, torch.tensor(lr * target, dtype=torch.float64), **TOL)
+
+
+def test_muon_rms_target_is_rejected_with_shampoo():
+    """mars-shampoo already fixes its own update scale; two scalings would silently compose."""
+    g = torch.Generator().manual_seed(34)
+    with pytest.raises(ValueError, match='mars-shampoo'):
+        MARS([torch.nn.Parameter(torch.randn(4, 3, generator=g))], lr=1e-2,
+             mars_type='mars-shampoo', muon_rms_target=0.2)
 
 
 def expert_stack(num_experts=3, size_out=5, size_in=4, seed=11):

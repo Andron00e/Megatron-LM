@@ -4,7 +4,9 @@ Source: https://github.com/AGI-Arena/MARS
 
 Ported from Andron00e/Megatron-LM origin/muon (f3dfe32f1). Only the approximate variant is
 implemented: the exact one needs a second forward/backward on the same batch at the previous
-iterate, which train_step cannot provide.
+iterate, which train_step cannot provide. All three inner optimizers of the framework are
+here (mars_type: mars-adamw, mars-lion, mars-shampoo), written from the reference
+implementation's own update_fn.
 """
 
 # Copyright (c) 2024 Bytedance Ltd. and/or its affiliates
@@ -59,6 +61,52 @@ def adamw_denom(exp_avg_sq, beta1, beta2, step, eps):
     return exp_avg_sq.sqrt().mul(1 / math.sqrt(bias_correction2)).add(eps).mul(bias_correction1)
 
 
+def newton_schulz(m, steps=5, eps=1e-7):
+    """Quintic Newton-Schulz orthogonalization, the inner step of mars-shampoo.
+
+    An expert stack is orthogonalized one expert at a time -- the batched matmuls do that for
+    free, and the pre-scaling is per expert so a quiet expert is not left under-iterated.
+    """
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    if m.ndim == 3:
+        scale = m.flatten(1).norm(dim=1).view(-1, 1, 1)
+    else:
+        scale = m.norm()
+    x = m.div(scale + eps)
+    transposed = m.shape[-2] > m.shape[-1]
+    if transposed:
+        x = x.transpose(-2, -1)
+    for _ in range(steps):
+        xxt = x @ x.transpose(-2, -1)
+        bx = xxt @ x
+        x = a * x + b * bx + c * xxt @ bx
+    if transposed:
+        x = x.transpose(-2, -1)
+    return x
+
+
+def shampoo_shape_factor(p):
+    """max(1, d_out/d_in)**0.5, the aspect correction the MARS reference applies after
+    orthogonalizing (Muon's `shape_scaling` mode, not the `spectral` one)."""
+    return max(1.0, p.shape[-2] / p.shape[-1]) ** 0.5
+
+
+def muon_rms_scale(update, target):
+    """Rescale each matrix's update to root-mean-square `target`, per expert for a stack.
+
+    This is what Muon's scale factor does to an orthogonalized update: `spectral` is
+    sqrt(max(d_out, d_in)), which cancels the 1/sqrt(max(d_out, d_in)) RMS of a semi-orthogonal
+    matrix, so the update leaves Muon at RMS = --muon-extra-scale-factor whatever its shape.
+    An AdamW-type update instead carries whatever RMS the second moment gives it, which is why
+    multiplying it by Muon's own factor would be sqrt(max(d_out, d_in)) too large.
+    """
+    if update.ndim == 3:
+        rms = update.flatten(1).norm(dim=1).view(-1, 1, 1) / math.sqrt(update[0].numel())
+    else:
+        rms = update.norm() / math.sqrt(update.numel())
+    return update.mul(target / rms.clamp(min=1e-12))
+
+
 def update_fn(
     p,
     grad,
@@ -73,6 +121,8 @@ def update_fn(
     step,
     gamma,
     clip,
+    mars_type,
+    muon_rms_target,
     is_matrix,
     optimize_1d,
     lr_1d_factor,
@@ -82,9 +132,20 @@ def update_fn(
     if optimize_1d or is_matrix:
         c_t = mars_correction(grad, last_grad, beta1, gamma, clip)
         exp_avg.mul_(beta1).add_(c_t, alpha=1.0 - beta1)
-        exp_avg_sq.mul_(beta2).addcmul_(c_t, c_t, value=1.0 - beta2)
-        denom = adamw_denom(exp_avg_sq, beta1, beta2, step, eps)
-        p.data.add_(-lr * torch.mul(p.data, wd).add(exp_avg.div(denom)))
+        if mars_type == "mars-lion":
+            update = exp_avg.sign()
+        elif mars_type == "mars-shampoo" and is_matrix:
+            update = newton_schulz(exp_avg.div(1.0 - beta1**step), eps=eps).mul_(
+                shampoo_shape_factor(p)
+            )
+        else:
+            # mars-adamw, and the 1-D params of mars-shampoo, which the reference keeps on AdamW.
+            exp_avg_sq.mul_(beta2).addcmul_(c_t, c_t, value=1.0 - beta2)
+            denom = adamw_denom(exp_avg_sq, beta1, beta2, step, eps)
+            update = exp_avg.div(denom)
+        if muon_rms_target is not None and is_matrix:
+            update = muon_rms_scale(update, muon_rms_target)
+        p.data.add_(-lr * torch.mul(p.data, wd).add(update))
     else:
         beta1_1d, beta2_1d = betas_1d
         exp_avg.mul_(beta1_1d).add_(grad, alpha=1 - beta1_1d)
@@ -95,7 +156,13 @@ def update_fn(
 
 
 class MARS(torch.optim.Optimizer):
-    """MARS (arXiv:2411.10438), approximate variant, with AdamW on non-matrix params."""
+    """MARS (arXiv:2411.10438), approximate variant, with AdamW on non-matrix params.
+
+    ``mars_type`` picks the inner optimizer applied to the corrected gradient, exactly as in
+    the reference implementation: ``mars-adamw``, ``mars-lion`` (the sign of the corrected
+    momentum, no second moment) or ``mars-shampoo`` (Newton-Schulz orthogonalization times
+    max(1, d_out/d_in)**0.5, with 1-D params still on AdamW).
+    """
 
     def __init__(
         self,
@@ -107,6 +174,7 @@ class MARS(torch.optim.Optimizer):
         gamma=0.025,
         clip=1.0,
         mars_type="mars-adamw",
+        muon_rms_target=None,
         optimize_1d=False,
         lr_1d=None,
         betas_1d=(0.9, 0.95),
@@ -119,7 +187,14 @@ class MARS(torch.optim.Optimizer):
             raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
         if not 0.0 <= betas[1] < 1.0:
             raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
-        assert mars_type in ["mars-adamw"], "MARS type not supported"
+        assert mars_type in ["mars-adamw", "mars-lion", "mars-shampoo"], (
+            "MARS type not supported"
+        )
+        if mars_type == "mars-shampoo" and muon_rms_target is not None:
+            raise ValueError(
+                "mars-shampoo already fixes the matrix update scale with its own "
+                "orthogonalization and shape factor; muon_rms_target would apply a second one."
+            )
         defaults = dict(
             lr=lr,
             betas=betas,
@@ -136,6 +211,7 @@ class MARS(torch.optim.Optimizer):
         self.gamma = gamma
         self.clip = clip
         self.mars_type = mars_type
+        self.muon_rms_target = muon_rms_target
         self.optimize_1d = optimize_1d
         self.lr_1d_factor = 1.0 if lr_1d is None else lr_1d / lr
         self.betas_1d = betas_1d
@@ -187,6 +263,8 @@ class MARS(torch.optim.Optimizer):
                     state["step"],
                     self.gamma,
                     self.clip,
+                    self.mars_type,
+                    self.muon_rms_target,
                     is_matrix=is_matrix_param(p),
                     optimize_1d=self.optimize_1d,
                     lr_1d_factor=self.lr_1d_factor,

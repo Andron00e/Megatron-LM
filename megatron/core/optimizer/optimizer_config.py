@@ -491,7 +491,13 @@ class OptimizerConfig:
     """Scale of the MARS variance-reduction term gamma * beta1 / (1 - beta1) * (g_t - g_{t-1})."""
 
     mars_type: str = 'mars-adamw'
-    """Which version of the MARS framework to use. Only 'mars-adamw' is ported."""
+    """Inner optimizer the MARS framework applies to the corrected gradient: 'mars-adamw',
+    'mars-lion' or 'mars-shampoo'. Ignored by mu2mars."""
+
+    mars_muon_rms_target: Optional[float] = None
+    """RMS the matrix (2D / per-expert 3D) update of mars and mu2mars is rescaled to, mirroring
+    what muon_scale_mode='spectral' times muon_extra_scale_factor does to an orthogonalized
+    update. None leaves the update alone; 1D/embedding/output params are never touched."""
 
     mars_clip: float = 1.0
     """L2-norm clip applied to the MARS corrected gradient c_t, per parameter tensor."""

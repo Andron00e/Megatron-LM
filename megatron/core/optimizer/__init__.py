@@ -616,6 +616,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 "clip": config.mars_clip,
                 "optimize_1d": config.mars_optimize_1d,
                 "lr_1d": config.mars_lr_1d,
+                "muon_rms_target": config.mars_muon_rms_target,
                 "betas_1d": (config.adam_beta1, config.adam_beta2),
             }
             if config.optimizer == 'mars':
