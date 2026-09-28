@@ -551,6 +551,11 @@ try:
                 prompt_tokens = tokenizer.tokenize(
                     "\n".join([message["content"] for message in messages])
                 )
+                # Tokenizers that add special tokens end the text with EOD; generating after it
+                # starts a new document instead of continuing the prompt.
+                eod = getattr(tokenizer, "eod", None)
+                while eod is not None and len(prompt_tokens) > 0 and prompt_tokens[-1] == eod:
+                    prompt_tokens = prompt_tokens[:-1]
         except Exception as e:
             logger.error(f"{traceback.format_exc()}")
             return Response(f"Error processing 'messages': {e}", status=500)
@@ -586,6 +591,9 @@ try:
                     prompt_tokens = [tokenizer.bos] + prompt_tokens
 
             max_tokens = req.get("max_completion_tokens", None) or req.get("max_tokens", None)
+            stop = req.get("stop", None)
+            if isinstance(stop, str):
+                stop = [stop]
 
             sampling_params = SamplingParams(
                 temperature=temperature,
@@ -596,6 +604,7 @@ try:
                 num_tokens_to_generate=(int(max_tokens) if max_tokens is not None else None),
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 add_BOS=add_BOS,
+                stop_words=stop,
             )
         except ValueError as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)

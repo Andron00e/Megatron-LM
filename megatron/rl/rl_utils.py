@@ -974,6 +974,10 @@ def maybe_log_training_metrics(
     tb_writer = get_tensorboard_writer()
     if tb_writer:
         tb_writer.add_scalar('mean_reward', np.mean([np.mean(g) for g in group_stats.rewards]), current_iteration)
+        # Train/inference logprob agreement (pi_old from the training forward vs the engine).
+        for key in ('mean_piold_to_inf_prob', 'mean_inf_train_prob_abs_diff'):
+            if getattr(group_stats, key, None) is not None:
+                tb_writer.add_scalar(key, getattr(group_stats, key), current_iteration)
     if not wandb_writer:
         return
 
@@ -1376,7 +1380,8 @@ def prepare_data_for_update(
                     forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
                 )
 
-            dtype = (
+            # Logprobs come out in the logit dtype: fp32 under --output-logit-dtype fp32.
+            dtype = args.logit_dtype or (
                 torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
             )
 

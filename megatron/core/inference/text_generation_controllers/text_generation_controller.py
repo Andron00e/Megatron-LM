@@ -241,6 +241,11 @@ class TextGenerationController:
 
         while prompt_tokens and prompt_tokens[0] == tokenizer.bos:
             prompt_tokens.pop(0)
+        # Tokenizers that add special tokens also append EOD, which would end the prompt (or a stop
+        # word) as a finished document.
+        eod = getattr(tokenizer, "eod", None)
+        while eod is not None and prompt_tokens and prompt_tokens[-1] == eod:
+            prompt_tokens.pop()
 
         if add_BOS:
             prompt_tokens = [tokenizer.bos] + prompt_tokens

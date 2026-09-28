@@ -1353,7 +1353,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     if is_chunked_prefill:
                         pass
                     elif is_prefill:
-                        request.generated_log_probs.append(request_log_probs[-1])
+                        # Empty when a stop word was the first generated token and was trimmed.
+                        if request_log_probs:
+                            request.generated_log_probs.append(request_log_probs[-1])
                     else:
                         request.generated_log_probs.extend(request_log_probs)
                 else:
