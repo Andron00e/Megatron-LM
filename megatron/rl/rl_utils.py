@@ -1286,7 +1286,10 @@ def prepare_data_for_update(
         with nvtx_range("rl/compute-group-stats", time=True):
             group_stats = compute_group_stats(rollouts, tokenizer, args.seq_length)
             # TODO(vitalyk): why do we need global_advantages here? go inside packing
-            advantages = global_advantages = torch.tensor(group_stats.advantages, dtype=dtype).cuda()
+            # Same dtype as the logprobs (fp32 with --output-logit-dtype fp32).
+            advantages = global_advantages = torch.tensor(
+                group_stats.advantages, dtype=args.logit_dtype or dtype
+            ).cuda()
 
         # Now split the rollouts across the data parallel ranks for training
         # This needs to be done at this point because we are about to calculate logprobs

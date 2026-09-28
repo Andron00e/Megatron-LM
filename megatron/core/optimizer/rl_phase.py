@@ -73,9 +73,16 @@ def set_adam_hparams(
     beta2: Optional[float] = None,
     eps: Optional[float] = None,
 ) -> None:
-    """Override Adam betas / eps on every Adam-style param group and on the md_decoupling gains."""
+    """Override Adam betas / eps on every Adam-style param group and on the md_decoupling gains.
+
+    md_decoupling Muon groups read these values only in plain-AdamW mode; otherwise they are left
+    as they are.
+    """
     for opt in base_optimizers(optimizer):
+        muon_groups = _is_md(opt) and not opt.plain_adamw
         for group in opt.param_groups:
+            if muon_groups and group.get("use_orthogonal_updates", False):
+                continue
             if "betas" in group:
                 old1, old2 = group["betas"]
                 group["betas"] = (

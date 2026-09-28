@@ -33,9 +33,10 @@ from megatron.rl import GenericGenerationArgs
 from megatron.rl.agent.api import TokenRollout
 from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
 
-# Sequential position per item stream. train_rl.py rebuilds the agent for every rollout collection
-# (without --rl-partial-rollouts), so the position must outlive the instance.
+# Sequential position and sampling RNG per item stream. train_rl.py rebuilds the agent for every
+# rollout collection (without --rl-partial-rollouts), so both must outlive the instance.
 _SEQUENTIAL_POSITION: dict = {}
+_STREAM_RNG: dict = {}
 
 
 class ReasoningGymAgent(RewardOnlyAgent):
@@ -52,7 +53,7 @@ class ReasoningGymAgent(RewardOnlyAgent):
         prompts_file: str | None = None,
         sequential: bool = False,
         probe_output: str | None = None,
-        stop: list[str] | None = ("\n\n",),
+        stop: list[str] | None = ("\n\n", "\n\n\n", "\nQuestion:"),
         **kwargs,
     ):
         """
@@ -71,6 +72,8 @@ class ReasoningGymAgent(RewardOnlyAgent):
             probe_output: Append {problem_id, rewards, responses (first 200 characters), entry} per
                 group to this JSONL file.
             stop: Stop sequences for generation (None: generate until EOD or the length limit).
+                Matching is on token ids, so "\n\n\n" (its own token) and a next "\nQuestion:"
+                block are listed next to the blank line.
             Paths may contain environment variables ($VAR).
         """
         super().__init__(**kwargs)
@@ -97,6 +100,7 @@ class ReasoningGymAgent(RewardOnlyAgent):
             with open(os.path.expandvars(prompts_file)) as f:
                 self._entries = [json.loads(line)["entry"] for line in f if line.strip()]
         self._stream = repr((self.tasks, seed, size, prompts_file))
+        self._rng = _STREAM_RNG.setdefault(self._stream, random.Random(self._stream))
         self._probe_responses = {}
 
     def _item(self, split: str, task_idx: int, idx: int) -> dict:
@@ -110,15 +114,15 @@ class ReasoningGymAgent(RewardOnlyAgent):
             if self.sequential:
                 i = self._advance() % len(self._entries)
             else:
-                i = random.randrange(len(self._entries))
+                i = self._rng.randrange(len(self._entries))
             return dict(self._entries[i])
         split = "validation" if validation else "train"
         if self.sequential:
             k = self._advance()
             task_idx, idx = k % len(self.tasks), k // len(self.tasks)
         else:
-            task_idx = random.choices(range(len(self.tasks)), weights=self._weights)[0]
-            idx = random.randrange(self.size)
+            task_idx = self._rng.choices(range(len(self.tasks)), weights=self._weights)[0]
+            idx = self._rng.randrange(self.size)
         return self._item(split, task_idx, idx)
 
     def _advance(self) -> int:

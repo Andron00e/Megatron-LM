@@ -38,7 +38,10 @@ Metrics (keys ``update/<metric>/<family>``, and ``update/layers/<L>/<metric>/<fa
                                mean/std of the row (column) norms of dW, pooled over the bucket.
                                Alex Hagele's ``update_steps`` logged the pre-lr update direction;
                                this is the realized, lr-scaled step.
-``grad-momentum-cos``          cos(G_t, M_{t-1}); ``momentum-grad-norm-ratio`` = ||M||/||G||. M is
+``grad-momentum-cos``          cos(G_t, M_{t-1}); ``momentum-grad-norm-ratio`` = ||M||/||c G||, with
+                               c = min(1, clip_grad / ||G_total||) the step's clip coefficient, i.e.
+                               against the clipped gradient that enters M (MDDecoupling's gain
+                               rescaling of the gradient is not applied). M is
                                the first-moment buffer before the step: Neutrino and Muon
                                ``momentum_buffer`` (Neutrino's error-feedback buffer is not part
                                of M), Dion ``momentum``, MDDecoupling/NeutrinoMD and Adam
@@ -673,7 +676,7 @@ class UpdateStatsCollector:
     # post-step: dW, reductions, formatting
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def after_optimizer_step(self, update_successful: bool = True) -> Dict:
+    def after_optimizer_step(self, update_successful: bool = True, grad_scale: float = 1.0) -> Dict:
         if not self._active:
             return {}
         self._active = False
@@ -732,6 +735,7 @@ class UpdateStatsCollector:
         stats = self._format(
             flat[: buffer.numel()].view(self.num_scopes, len(_FAMILIES), _N_STATS).tolist(),
             row_max.view(self.num_scopes, len(_FAMILIES)).tolist(),
+            grad_scale,
         )
         if expert_numel:
             self._format_experts(
@@ -845,7 +849,7 @@ class UpdateStatsCollector:
             results.append((entry, num, den))
         return results
 
-    def _format(self, buffer, row_max) -> Dict[str, float]:
+    def _format(self, buffer, row_max, grad_scale: float = 1.0) -> Dict[str, float]:
         stats = {}
         for scope in range(self.num_scopes):
             prefix = "update" if scope == 0 else f"update/layers/{scope - 1}"
@@ -877,7 +881,7 @@ class UpdateStatsCollector:
                         out["grad-tangential-fraction"] = tangential / math.sqrt(s[_GG])
                 if s[_MM] > 0 and s[_GGM] > 0:
                     out["grad-momentum-cos"] = s[_GM] / math.sqrt(s[_GGM] * s[_MM])
-                    out["momentum-grad-norm-ratio"] = math.sqrt(s[_MM] / s[_GGM])
+                    out["momentum-grad-norm-ratio"] = math.sqrt(s[_MM] / s[_GGM]) / grad_scale
                 if s[_ROW_RATIO_N] > 0:
                     out["per-neuron-relative/mean"] = s[_ROW_RATIO] / s[_ROW_RATIO_N]
                     out["per-neuron-relative/max"] = row_max[scope][family_index]
@@ -1131,10 +1135,13 @@ def before_optimizer_step() -> None:
         _COLLECTOR.before_optimizer_step()
 
 
-def after_optimizer_step(update_successful: bool) -> None:
+def after_optimizer_step(update_successful: bool, grad_scale: float = 1.0) -> None:
+    """grad_scale: the factor gradient clipping applied to G this step (1 if not clipped)."""
     global _LAST_STATS
     if _COLLECTOR is not None:
-        _LAST_STATS = _COLLECTOR.after_optimizer_step(update_successful) or _LAST_STATS
+        _LAST_STATS = (
+            _COLLECTOR.after_optimizer_step(update_successful, grad_scale) or _LAST_STATS
+        )
 
 
 def pop_stats() -> Dict:

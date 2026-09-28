@@ -632,3 +632,19 @@ def test_md_decoupling_moe_layer_wise_smoke():
     assert -1 <= stats["update/grad-momentum-cos/layernorm-adam"] <= 1
     assert stats["update/experts/expert-in/grad-momentum-cos/cv"] >= 0
     assert all(math.isfinite(v) for v in stats.values() if not isinstance(v, torch.Tensor))
+
+
+def test_momentum_grad_norm_ratio_is_against_the_clipped_gradient():
+    from types import SimpleNamespace
+
+    from megatron.core.optimizer import update_stats as us
+
+    buffer = [[[0.0] * us._N_STATS for _ in us._FAMILIES]]
+    s = buffer[0][0]
+    s[us._PARAMS], s[us._MM], s[us._GGM], s[us._GM] = 1.0, 4.0, 16.0, 2.0
+    row_max = [[0.0] * len(us._FAMILIES)]
+    family = us._FAMILIES[0]
+    for grad_scale, ratio in ((1.0, 0.5), (0.25, 2.0)):
+        stats = us.UpdateStatsCollector._format(SimpleNamespace(num_scopes=1), buffer, row_max, grad_scale)
+        assert stats[f"update/momentum-grad-norm-ratio/{family}"] == pytest.approx(ratio)
+        assert stats[f"update/grad-momentum-cos/{family}"] == pytest.approx(2.0 / 8.0)

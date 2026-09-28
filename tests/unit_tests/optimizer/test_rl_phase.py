@@ -167,6 +167,12 @@ def test_set_learning_rates_routes_groups():
     assert external.param_groups[0]["eps"] == 1e-15
     assert md.gains_betas[1] == 0.95 and md.gains_eps == 1e-15
 
+    # Out of plain-AdamW mode the Muon groups (which do not read them) keep their Adam values.
+    rl_phase.set_plain_adamw(chained, False)
+    rl_phase.set_adam_hparams(chained, beta2=0.5, eps=1e-8)
+    assert md.param_groups[0]["beta2"] == 0.95 and md.param_groups[0]["eps"] == 1e-15
+    assert md.param_groups[1]["beta2"] == 0.5 and md.param_groups[1]["eps"] == 1e-8
+
 
 def test_warmup_scale():
     assert rl_phase.warmup_scale(0, 0) == 1.0
@@ -175,20 +181,29 @@ def test_warmup_scale():
     assert rl_phase.warmup_scale(100, 15) == 1.0
 
 
-def test_weight_snapshot_restore_round_trip():
+def test_weight_snapshot_restore_round_trip_carries_gains_not_gain_moments():
     model = [torch.nn.Linear(4, 3), torch.nn.BatchNorm1d(3)]
-    masters = [[torch.randn(3, 4)], [torch.randn(3)]]
+    master = _param(0)
+    md = _md([master])
+    _step(md, [master], 0)  # creates the gains and their moments
     optimizer = SimpleNamespace(
-        chained_optimizers=[SimpleNamespace(fp32_from_float16_groups=masters)]
+        chained_optimizers=[SimpleNamespace(fp32_from_float16_groups=[[master]], optimizer=md)]
     )
-    snapshot = [t.detach().clone() for t in _weight_tensors(model, optimizer)]
-    with torch.no_grad():
-        for t in _weight_tensors(model, optimizer):
-            t.add_(1)
+    tensors = _weight_tensors(model, optimizer)
+    assert any(t is md.state[master][k] for t in tensors for k in ("row_gain", "col_gain"))
+    snapshot = [t.detach().clone() for t in tensors]
 
+    _step(md, [master], 1)  # moves the master, the gains and the gain moments
+    moments = {k: md.state[master][k].clone() for k in GAIN_MOMENTS}
+    with torch.no_grad():
+        for chunk in model:
+            for t in list(chunk.parameters()) + list(chunk.buffers()):
+                t.add_(1)
     restore_weights_snapshot(model, optimizer, snapshot)
 
     for tensor, saved in zip(_weight_tensors(model, optimizer), snapshot):
         torch.testing.assert_close(tensor, saved, rtol=0, atol=0)
+    for key in GAIN_MOMENTS:
+        torch.testing.assert_close(md.state[master][key], moments[key], rtol=0, atol=0)
     with pytest.raises(AssertionError):
         restore_weights_snapshot(model, optimizer, snapshot[:-1])
