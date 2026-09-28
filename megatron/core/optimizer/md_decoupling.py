@@ -550,10 +550,12 @@ class _MDDecouplingBase(torch.optim.Optimizer):
     def _plain_adamw_step(self):
         """AdamW on p itself (gains stay baked in), no projection, no Muon, no gain update.
 
-        Uses group lr / beta1 / beta2 / eps / weight_decay and its own moments and step counter,
-        so exp_avg, exp_avg_sq, the gains, their moments and group["step"] are left as they are.
+        Uses group lr / beta1 / beta2 / eps / weight_decay and its own moments and bias-correction
+        step, so exp_avg, exp_avg_sq, the gains and their moments are left as they are.
+        group["step"] still advances: ChainedOptimizer requires one step count across its optimizers.
         """
         for group in self.param_groups:
+            group["step"] += 1
             group["plain_adamw_step"] = group.get("plain_adamw_step", 0) + 1
             step = group["plain_adamw_step"]
             beta1, beta2 = group["beta1"], group["beta2"]

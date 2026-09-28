@@ -125,7 +125,8 @@ def test_plain_adamw_matches_torch_adamw_and_leaves_md_state():
         _step(torch_adamw, [reference], seed)
         torch.testing.assert_close(param.detach(), reference.detach(), rtol=1e-6, atol=1e-7)
 
-    assert md.param_groups[0]["step"] == md_step
+    # The group step advances in lockstep with the chained optimizers; the MD state does not move.
+    assert md.param_groups[0]["step"] == md_step + 4
     for key, value in md_state[id(param)].items():
         torch.testing.assert_close(md.state[param][key], value, rtol=0, atol=0)
     assert md.param_groups[0]["plain_adamw_step"] == 4
