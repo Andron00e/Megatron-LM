@@ -2393,7 +2393,9 @@ def training_log(
     energy_monitor = get_energy_monitor()
 
     # On first iteration, log stats but don't reset accumulators so normal interval stats remain accurate.
-    should_reset = not is_first_iteration
+    # A first iteration that ends an interval (always with --log-interval 1) resets as usual; otherwise
+    # the next line would print the average of both iterations.
+    should_reset = not is_first_iteration or iteration % args.log_interval == 0
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
