@@ -34,7 +34,7 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
-from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.optimizer import DistributedOptimizer, rl_phase
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_torch_version, is_torch_min_version
@@ -2162,8 +2162,15 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     return iteration, num_floating_point_operations_so_far
 
 
+_GAIN_KEYS = ("row_gain", "col_gain", "flat_gain")
+
+
 def _weight_tensors(model, optimizer):
-    """Model params and buffers, then the fp32 master params this rank's optimizer holds."""
+    """Model params and buffers, the fp32 master params and the md_decoupling gains this rank holds.
+
+    The md_decoupling gains (the magnitudes of the hypersphere params) live in the optimizer state
+    of the fp32 master params they scale; their Adam moments are not weights and are not included.
+    """
     tensors = []
     for chunk in model:
         tensors.extend(chunk.parameters())
@@ -2172,18 +2179,55 @@ def _weight_tensors(model, optimizer):
     for opt in getattr(optimizer, "chained_optimizers", None) or [optimizer]:
         for group in getattr(opt, "fp32_from_float16_groups", None) or []:
             tensors.extend(group)
+    for opt in rl_phase.base_optimizers(optimizer):
+        for group in opt.param_groups:
+            for param in group["params"]:
+                state = opt.state.get(param, {})
+                tensors.extend(state[key] for key in _GAIN_KEYS if key in state)
     return tensors
+
+
+def _checkpoint_iteration(load_dir):
+    """Iteration in load_dir's tracker file, or None if load_dir holds no checkpoint."""
+    if load_dir is None or not isfile(get_checkpoint_tracker_filename(load_dir)):
+        return None
+    return read_metadata(get_checkpoint_tracker_filename(load_dir))[0]
 
 
 def load_weights_snapshot(model, optimizer, checkpointing_context=None, **load_kwargs):
     """Load the --load-weights-from checkpoint and return CPU copies of its weights and its phase.
 
-    The copies cover the model params and buffers and the fp32 master params, which live in the
-    optimizer state; restore them with restore_weights_snapshot after the --load checkpoint is
-    loaded. The optimizer and RNG state this load also brings in are overwritten by that load.
+    The copies cover the model params and buffers, the fp32 master params and the md_decoupling
+    gains, which live in the optimizer state; restore them with restore_weights_snapshot after the
+    --load checkpoint is loaded. Everything else this load brings in (optimizer moments, including
+    the gain moments, and RNG state) is overwritten by that load.
+
+    The --load-weights-from checkpoint must come from an RL phase that started at the --load
+    checkpoint's iteration: that is the RL -> NTP handoff. If --load is already past it (a requeue
+    or resubmission of the return job), the weights were spliced in before and (None, None) is
+    returned.
     """
     args = get_args()
-    print_rank_0(f'> loading weights from {args.load_weights_from} (optimizer, scheduler, '
+    weights_dir = args.load_weights_from
+    if _checkpoint_iteration(weights_dir) is None:
+        raise RuntimeError(f'--load-weights-from {weights_dir}: no checkpoint (no tracker file)')
+    load_iteration = _checkpoint_iteration(args.load)
+    common_state, _, _, _ = _load_base_checkpoint(weights_dir, args, rank0=True)
+    saved_args = (common_state or {}).get("args")
+    rl_start = getattr(saved_args, "rl_phase_start_iteration", None)
+    if not getattr(saved_args, "perform_rl_step", False) or rl_start is None:
+        raise RuntimeError(f'--load-weights-from {weights_dir}: not an RL-phase checkpoint')
+    if load_iteration != rl_start:
+        if load_iteration is not None and load_iteration > rl_start:
+            print_rank_0(f'> --load-weights-from: {args.load} is at iteration {load_iteration}, past '
+                         f'the RL phase start {rl_start}; the RL weights are already in, not loading '
+                         f'{weights_dir}')
+            return None, None
+        raise RuntimeError(
+            f'--load-weights-from {weights_dir}: its RL phase started at iteration {rl_start}, '
+            f'but --load {args.load} is at iteration {load_iteration}'
+        )
+    print_rank_0(f'> loading weights from {weights_dir} (optimizer moments, scheduler, '
                  f'iteration and data position come from {args.load})')
     load_checkpoint(model, optimizer, None, load_arg='load_weights_from',
                     checkpointing_context=checkpointing_context, **load_kwargs)
@@ -2195,7 +2239,7 @@ def load_weights_snapshot(model, optimizer, checkpointing_context=None, **load_k
 
 @torch.no_grad()
 def restore_weights_snapshot(model, optimizer, snapshot):
-    """Copy a load_weights_snapshot back into the model params/buffers and fp32 master params."""
+    """Copy a load_weights_snapshot back into the model params/buffers, fp32 masters and gains."""
     tensors = _weight_tensors(model, optimizer)
     assert len(tensors) == len(snapshot), (len(tensors), len(snapshot))
     for tensor, saved in zip(tensors, snapshot):

@@ -2125,7 +2125,8 @@ def setup_rl_phase_optimizer(args, optimizer):
         f"matrix_lr={args.rl_matrix_lr}, gains_lr={args.rl_gains_lr}, "
         f"warmup={args.rl_lr_warmup_steps}, wd={args.rl_weight_decay}, "
         f"adam_beta2={args.rl_adam_beta2}, adam_eps={args.rl_adam_eps}, "
-        f"freeze_gains={args.md_freeze_gains}"
+        f"freeze_gains={args.md_freeze_gains}, train_iters={args.train_iters}, "
+        f"exit_interval={args.exit_interval}"
     )
 
 
@@ -2307,7 +2308,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
     if args.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(num_zeros_in_grad)
-    update_stats.after_optimizer_step(update_successful)
+    grad_scale = 1.0
+    if args.clip_grad > 0 and grad_norm is not None and float(grad_norm) > 0:
+        # The factor clip_grad_norm applied to the gradients (megatron.core.optimizer.clip_grads).
+        grad_scale = min(1.0, args.clip_grad / (float(grad_norm) + 1.0e-6))
+    update_stats.after_optimizer_step(update_successful, grad_scale)
 
     # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
@@ -2315,16 +2320,14 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         unwrapped_model.update_momentum(args.curr_iteration)
 
     # Update learning rate.
-    if update_successful:
-        if args.perform_rl_step and args.rl_lr is not None:
-            # RL phase on its own LR: the pretraining scheduler is left where the phase began.
-            _set_rl_phase_lr(args, optimizer, iteration + 1)
-        else:
-            increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
-            opt_param_scheduler.step(increment=increment)
-        skipped_iter = 0
-    else:
-        skipped_iter = 1
+    if args.perform_rl_step and args.rl_lr is not None:
+        # RL phase on its own LR, indexed by iteration (which advances on skipped updates too);
+        # the pretraining scheduler is left where the phase began.
+        _set_rl_phase_lr(args, optimizer, iteration + 1)
+    elif update_successful:
+        increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
+        opt_param_scheduler.step(increment=increment)
+    skipped_iter = 0 if update_successful else 1
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 2:
@@ -3441,6 +3444,11 @@ def train(
         loaded_phase = getattr(args, "loaded_checkpoint_phase", None)
         if loaded_phase is not None and loaded_phase != phase:
             update_stats.notify_phase_change(phase)
+    if args.perform_rl_step and iteration >= args.train_iters:
+        raise RuntimeError(
+            f"RL job at iteration {iteration} would run no steps: train_iters is "
+            f"{args.train_iters} (train samples / global batch size); raise --train-samples"
+        )
     if args.perform_rl_step and optimizer is not None:
         setup_rl_phase_optimizer(args, optimizer)
     elif optimizer is not None and getattr(args, "loaded_checkpoint_phase", None) == "rl":
