@@ -164,6 +164,8 @@ from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint, save_grads
 from megatron.training.checkpointing import checkpoint_exists
 from megatron.training.checkpointing import get_loaded_iteration
+from megatron.training.checkpointing import load_weights_snapshot, restore_weights_snapshot
+from megatron.core.optimizer import rl_phase
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
@@ -1975,15 +1977,29 @@ def setup_model_and_optimizer(
         )
         timers('load-checkpoint', log_level=0).start(barrier=True)
 
+        skip_load_to_model_and_opt = (
+            HAVE_FSDP2 and getattr(args, "use_torch_fsdp2", False) and args.ckpt_format == "torch_dist"
+        )
+        weights_snapshot = None
+        if args.load_weights_from is not None:
+            weights_snapshot, weights_phase = load_weights_snapshot(
+                model,
+                optimizer,
+                checkpointing_context=checkpointing_context,
+                skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+            )
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
             model,
             optimizer,
             opt_param_scheduler,
             checkpointing_context=checkpointing_context,
-            skip_load_to_model_and_opt=HAVE_FSDP2
-            and getattr(args, "use_torch_fsdp2", False)
-            and args.ckpt_format == "torch_dist",
+            skip_load_to_model_and_opt=skip_load_to_model_and_opt,
         )
+        if weights_snapshot is not None:
+            restore_weights_snapshot(model, optimizer, weights_snapshot)
+            del weights_snapshot
+            # The weights define the phase switch for update_stats (RL -> NTP after an RL phase).
+            args.loaded_checkpoint_phase = weights_phase
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics(
@@ -2070,6 +2086,47 @@ def _pipeline_shape_args(args, micro_batch_size=None):
     if is_packed and micro_batch_size > 1:
         return args.seq_length * micro_batch_size, 1
     return args.seq_length, micro_batch_size
+
+
+def _set_rl_phase_lr(args, optimizer, iteration):
+    """Decoupled RL LR for the step after `iteration` completed iterations."""
+    steps_done = iteration - args.rl_phase_start_iteration
+    rl_phase.set_learning_rates(
+        optimizer,
+        lr=args.rl_lr,
+        matrix_lr=args.rl_matrix_lr,
+        gains_lr=args.rl_gains_lr,
+        weight_decay=args.rl_weight_decay,
+        scale=rl_phase.warmup_scale(steps_done, args.rl_lr_warmup_steps),
+    )
+
+
+def setup_rl_phase_optimizer(args, optimizer):
+    """Apply the RL-phase optimizer policy (--rl-*) after the checkpoint is loaded.
+
+    An RL job that starts from a pretraining checkpoint starts a new RL phase at the loaded
+    iteration; an RL job that resumes an RL checkpoint continues the phase recorded there.
+    """
+    entering = getattr(args, "loaded_checkpoint_phase", None) != "rl"
+    start = None if entering else getattr(args, "loaded_rl_phase_start_iteration", None)
+    args.rl_phase_start_iteration = args.iteration if start is None else start
+    if args.rl_optimizer == 'adam':
+        rl_phase.set_plain_adamw(optimizer, True)
+    if entering and args.rl_optimizer_state == 'reset':
+        rl_phase.reset_moments(optimizer)
+    if args.rl_adam_beta2 is not None or args.rl_adam_eps is not None:
+        rl_phase.set_adam_hparams(optimizer, beta2=args.rl_adam_beta2, eps=args.rl_adam_eps)
+    if args.rl_lr is not None:
+        _set_rl_phase_lr(args, optimizer, args.iteration)
+    print_rank_0(
+        f"> RL phase from iteration {args.rl_phase_start_iteration} "
+        f"({'new' if entering else 'resumed'}): optimizer={args.rl_optimizer}, "
+        f"state={args.rl_optimizer_state if entering else 'loaded'}, lr={args.rl_lr}, "
+        f"matrix_lr={args.rl_matrix_lr}, gains_lr={args.rl_gains_lr}, "
+        f"warmup={args.rl_lr_warmup_steps}, wd={args.rl_weight_decay}, "
+        f"adam_beta2={args.rl_adam_beta2}, adam_eps={args.rl_adam_eps}, "
+        f"freeze_gains={args.md_freeze_gains}"
+    )
 
 
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
@@ -2259,8 +2316,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update learning rate.
     if update_successful:
-        increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
-        opt_param_scheduler.step(increment=increment)
+        if args.perform_rl_step and args.rl_lr is not None:
+            # RL phase on its own LR: the pretraining scheduler is left where the phase began.
+            _set_rl_phase_lr(args, optimizer, iteration + 1)
+        else:
+            increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
+            opt_param_scheduler.step(increment=increment)
         skipped_iter = 0
     else:
         skipped_iter = 1
@@ -3380,6 +3441,14 @@ def train(
         loaded_phase = getattr(args, "loaded_checkpoint_phase", None)
         if loaded_phase is not None and loaded_phase != phase:
             update_stats.notify_phase_change(phase)
+    if args.perform_rl_step and optimizer is not None:
+        setup_rl_phase_optimizer(args, optimizer)
+    elif optimizer is not None and getattr(args, "loaded_checkpoint_phase", None) == "rl":
+        # Pretraining after an RL phase: RL-phase Adam betas/eps may have been saved with the
+        # optimizer param groups; go back to this job's.
+        rl_phase.set_adam_hparams(
+            optimizer, beta1=args.adam_beta1, beta2=args.adam_beta2, eps=args.adam_eps
+        )
     # Disable forward pre-hook to start training to ensure that errors in checkpoint loading
     # or random initialization don't propagate to all ranks in first all-gather (which is a
     # no-op if things work correctly).

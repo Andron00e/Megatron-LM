@@ -1693,6 +1693,17 @@ def validate_args(args, defaults={}):
             '--no-load-optim with --skip-train --perform-rl-step skips the optimizer; ' \
             '--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload).'
 
+    # RL-phase optimizer policy.
+    if args.rl_matrix_lr is None:
+        args.rl_matrix_lr = args.rl_lr
+    if args.rl_gains_lr is None:
+        args.rl_gains_lr = args.rl_lr
+    if args.rl_lr is None and (args.rl_matrix_lr is not None or args.rl_gains_lr is not None):
+        assert False, '--rl-matrix-lr / --rl-gains-lr need --rl-lr (the Adam-branch RL LR).'
+    if args.rl_optimizer == 'adam':
+        assert args.optimizer == 'md_decoupling', '--rl-optimizer adam requires --optimizer md_decoupling.'
+        assert args.rl_lr is not None, '--rl-optimizer adam requires --rl-lr.'
+
     if args.muon_split_mla_per_head:
         assert args.optimizer in ['muon', 'dist_muon', 'md_decoupling'], (
             "--muon-split-mla-per-head is only used by muon, dist_muon, and md_decoupling; "
@@ -2866,6 +2877,37 @@ def _add_rl_args(parser):
     group.add_argument('--rl-inference-parsers', nargs='*', default=[],
                        help='List of response parsers to enable for RL inference '
                             '(e.g. --rl-inference-parsers deepseek-r1-reasoning qwen3-coder-tool).')
+    group.add_argument('--rl-lr', type=float, default=None,
+                       help='RL-phase learning rate, decoupled from the pretraining schedule. '
+                       'When this or --rl-matrix-lr / --rl-gains-lr is set, RL steps use a linear '
+                       'warmup over --rl-lr-warmup-steps and then a constant LR, and the '
+                       'pretraining LR scheduler is not stepped (its state is saved unchanged). '
+                       'Applies to Adam-branch params (md_decoupling embedding/LM head, chained '
+                       'Adam) and to every param under --rl-optimizer adam.')
+    group.add_argument('--rl-matrix-lr', type=float, default=None,
+                       help='RL-phase LR of the md_decoupling Muon-branch (direction) params. '
+                       'Defaults to --rl-lr.')
+    group.add_argument('--rl-gains-lr', type=float, default=None,
+                       help='RL-phase LR of the md_decoupling per-axis gains. Defaults to --rl-lr.')
+    group.add_argument('--rl-lr-warmup-steps', type=int, default=0,
+                       help='Linear warmup of the decoupled RL LR over this many RL steps, counted '
+                       'from the iteration at which the RL phase started.')
+    group.add_argument('--rl-weight-decay', type=float, default=0.0,
+                       help='Weight decay during RL phases with a decoupled RL LR (all groups and '
+                       'the md_decoupling gains).')
+    group.add_argument('--rl-optimizer-state', type=str, default='keep', choices=['keep', 'reset'],
+                       help='Optimizer state when an RL job starts from a pretraining checkpoint: '
+                       'keep the loaded moments, or reset (zero) the Muon momentum, Adam moments, '
+                       'gain moments and step counters. Resuming an RL checkpoint never resets.')
+    group.add_argument('--rl-adam-beta2', type=float, default=None,
+                       help='RL-phase Adam beta2 for Adam-branch params and the md_decoupling gains.')
+    group.add_argument('--rl-adam-eps', type=float, default=None,
+                       help='RL-phase Adam eps for Adam-branch params and the md_decoupling gains.')
+    group.add_argument('--rl-optimizer', type=str, default='default', choices=['default', 'adam'],
+                       help='default: the pretraining optimizer. adam: plain AdamW on every param '
+                       'during RL (md_decoupling only), with its own moments; the md_decoupling '
+                       'state (momentum, gains, gain moments) is left untouched. Requires a '
+                       'decoupled RL LR.')
     return parser
 
 def _add_training_args(parser):
@@ -3051,6 +3093,9 @@ def _add_training_args(parser):
                        help='Drop the 1e-8 clamp_min on phi(g) when recovering the bare weight in '
                        'md_decoupling gains. Makes recover/apply exact for nonzero direct gains, '
                        'including small or negative gains.')
+    group.add_argument('--md-freeze-gains', action='store_true', default=False,
+                       help='Freeze the md_decoupling per-axis gains (no update, moments left as '
+                       'they are); the direction params still step.')
     group.add_argument('--use-orthogonal-updates',
                        action=argparse.BooleanOptionalAction, default=True,
                        help='Use Muon-style orthogonalized updates for matrix params under '

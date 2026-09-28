@@ -493,6 +493,13 @@ class CheckpointConfig:
     load_rng: bool = True
     """Do not load rng state when loading checkpoint."""
 
+    load_weights_from: str | None = None
+    """Checkpoint directory whose weights (model params and fp32 master params) replace those of
+    the --load checkpoint after it is loaded. Everything else (optimizer state, LR scheduler,
+    iteration, consumed samples, RNG) comes from --load. Used to resume pretraining after an RL
+    phase: --load the pre-RL pretraining checkpoint, take the weights from the RL checkpoint.
+    Both checkpoints must share TP/PP/EP/DP with this job."""
+
     non_persistent_save_interval: int | None = None
     """Number of iterations between non-persistent saves."""
 

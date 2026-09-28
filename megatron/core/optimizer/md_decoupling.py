@@ -460,6 +460,9 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         self.normalize_update_to_weight_norm = normalize_update_to_weight_norm
         self.extra_scale_factor = extra_scale_factor
         self._fixed_weight_norms: Dict[torch.Tensor, tuple[torch.Tensor, ...]] = {}
+        # Runtime switch (not checkpointed): step every param with a plain AdamW on the
+        # gain-baked weight and its own state (plain_adamw_*), leaving the MD state untouched.
+        self.plain_adamw = False
 
         self.pg_collection = pg_collection
         self.tp_mode = tp_mode
@@ -529,6 +532,10 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        if self.plain_adamw:
+            self._plain_adamw_step()
+            return loss
+
         for group in self.param_groups:
             group["step"] += 1
             if "momentum_beta" not in group:  # Old checkpoint compat.
@@ -538,6 +545,35 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                     self._param_step(p, group)
 
         return loss
+
+    @torch.no_grad()
+    def _plain_adamw_step(self):
+        """AdamW on p itself (gains stay baked in), no projection, no Muon, no gain update.
+
+        Uses group lr / beta1 / beta2 / eps / weight_decay and its own moments and step counter,
+        so exp_avg, exp_avg_sq, the gains, their moments and group["step"] are left as they are.
+        """
+        for group in self.param_groups:
+            group["plain_adamw_step"] = group.get("plain_adamw_step", 0) + 1
+            step = group["plain_adamw_step"]
+            beta1, beta2 = group["beta1"], group["beta2"]
+            bias_correction1 = 1.0 - beta1**step
+            bias_correction2 = 1.0 - beta2**step
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if "plain_adamw_exp_avg" not in state:
+                    state["plain_adamw_exp_avg"] = torch.zeros_like(p)
+                    state["plain_adamw_exp_avg_sq"] = torch.zeros_like(p)
+                exp_avg = state["plain_adamw_exp_avg"]
+                exp_avg_sq = state["plain_adamw_exp_avg_sq"]
+                exp_avg.lerp_(p.grad, 1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(p.grad, p.grad, value=1 - beta2)
+                if group["weight_decay"] != 0:
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group["eps"])
+                p.addcdiv_(exp_avg, denom, value=-group["lr"] / bias_correction1)
 
     def _param_step(self, p, group):
         grad = p.grad
@@ -1336,6 +1372,8 @@ class MDDecoupling(_MDDecouplingBase):
         # "softplus" uses phi(g)=softplus(g). Applied uniformly to row/col/flat.
         gain_parametrization: Literal["direct", "softplus"] = "direct",
         gains_no_clamp_min: bool = False,
+        # Gains get no update (and their moments stay as they are); direction params still step.
+        freeze_gains: bool = False,
         **kwargs,
     ):
         self.hypersphere_gains_mode = (
@@ -1359,6 +1397,10 @@ class MDDecoupling(_MDDecouplingBase):
         self.gains_eps = gains_eps
         self.gains_weight_decay = gains_weight_decay
         self.gain_parametrization = gain_parametrization
+        self.freeze_gains = freeze_gains
+        # Runtime override (not checkpointed): absolute gains LR used verbatim instead of the
+        # schedule-derived one (RL phases, which do not follow the pretraining schedule).
+        self.gains_lr_override: Optional[float] = None
         super().__init__(params, **kwargs)
         # Gain state is initialized lazily at first step (see step() → _maybe_init_gain_state).
         # Eager init here would write entries into self.state keyed by the bf16 model param, but
@@ -1557,7 +1599,7 @@ class MDDecoupling(_MDDecouplingBase):
 
     @torch.no_grad()
     def step(self, closure=None):
-        if self.hypersphere_gains_mode is None:
+        if self.hypersphere_gains_mode is None or self.plain_adamw:
             return super().step(closure)
 
         loss = None
@@ -1670,7 +1712,7 @@ class MDDecoupling(_MDDecouplingBase):
 
     @torch.no_grad()
     def _gains_step(self, p, group, gain_grads):
-        if not gain_grads:
+        if not gain_grads or self.freeze_gains:
             return
         state = self.state[p]
         step = group["step"]
@@ -1687,7 +1729,9 @@ class MDDecoupling(_MDDecouplingBase):
         # so gains decay gains_lr -> gains_min_lr exactly like a real param group (and honour
         # --min-lr-mode absolute, i.e. a fixed gains_min_lr floor — NOT the gains_lr * lr/max_lr
         # rescaling, which would floor at gains_lr * min_lr/max_lr and ignore min_lr).
-        if self.gains_lr is None:
+        if self.gains_lr_override is not None:
+            lr = self.gains_lr_override
+        elif self.gains_lr is None:
             lr = group["lr"]
         else:
             gmax = group.get("max_lr", group["lr"])
@@ -2203,6 +2247,7 @@ def get_megatron_mddecoupling_optimizer(
         gains_weight_decay=config.weight_decay,
         gain_parametrization=config.gain_parametrization,
         gains_no_clamp_min=config.gains_no_clamp_min,
+        freeze_gains=config.md_freeze_gains,
     )
 
     optimizers = []

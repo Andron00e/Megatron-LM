@@ -438,6 +438,10 @@ class OptimizerConfig:
     through 1e-8 or flipping sign. Setting this makes the recover/apply round-trip exact for any
     nonzero gain, letting direct gains go small or negative. No-op for 'softplus' (phi(g)>0)."""
 
+    md_freeze_gains: bool = False
+    """Freeze the MDDecoupling per-axis gains: they get no update and their Adam moments are left
+    as they are; the direction (hypersphere) params still step."""
+
     use_layer_wise_distributed_optimizer: bool = False
     """If true, wrap the optimizer with LayerWiseDistributedOptimizer to shard optimizer state
     over the data-parallel group (used by md_decoupling instead of the standard distributed

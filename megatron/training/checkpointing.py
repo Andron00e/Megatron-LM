@@ -1942,6 +1942,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         args.loaded_checkpoint_phase = (
             "rl" if getattr(saved_args, "perform_rl_step", False) else "ntp"
         )
+        args.loaded_rl_phase_start_iteration = getattr(saved_args, "rl_phase_start_iteration", None)
 
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
@@ -2159,6 +2160,47 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 log_printed = True
 
     return iteration, num_floating_point_operations_so_far
+
+
+def _weight_tensors(model, optimizer):
+    """Model params and buffers, then the fp32 master params this rank's optimizer holds."""
+    tensors = []
+    for chunk in model:
+        tensors.extend(chunk.parameters())
+        # nn.Module.buffers: Megatron's DDP wrapper shadows .buffers with its grad buffers.
+        tensors.extend(buffer for buffer in torch.nn.Module.buffers(chunk) if buffer is not None)
+    for opt in getattr(optimizer, "chained_optimizers", None) or [optimizer]:
+        for group in getattr(opt, "fp32_from_float16_groups", None) or []:
+            tensors.extend(group)
+    return tensors
+
+
+def load_weights_snapshot(model, optimizer, checkpointing_context=None, **load_kwargs):
+    """Load the --load-weights-from checkpoint and return CPU copies of its weights and its phase.
+
+    The copies cover the model params and buffers and the fp32 master params, which live in the
+    optimizer state; restore them with restore_weights_snapshot after the --load checkpoint is
+    loaded. The optimizer and RNG state this load also brings in are overwritten by that load.
+    """
+    args = get_args()
+    print_rank_0(f'> loading weights from {args.load_weights_from} (optimizer, scheduler, '
+                 f'iteration and data position come from {args.load})')
+    load_checkpoint(model, optimizer, None, load_arg='load_weights_from',
+                    checkpointing_context=checkpointing_context, **load_kwargs)
+    if checkpointing_context is not None:
+        checkpointing_context.pop("load_strategy", None)
+    snapshot = [t.detach().to("cpu", copy=True) for t in _weight_tensors(model, optimizer)]
+    return snapshot, getattr(args, "loaded_checkpoint_phase", None)
+
+
+@torch.no_grad()
+def restore_weights_snapshot(model, optimizer, snapshot):
+    """Copy a load_weights_snapshot back into the model params/buffers and fp32 master params."""
+    tensors = _weight_tensors(model, optimizer)
+    assert len(tensors) == len(snapshot), (len(tensors), len(snapshot))
+    for tensor, saved in zip(tensors, snapshot):
+        assert tensor.shape == saved.shape, (tensor.shape, saved.shape)
+        tensor.copy_(saved)
 
 
 def _to_dtensor(wrapped_model, model_state_dict):
