@@ -1,0 +1,20 @@
+# reasoning_gym procedural tasks, few-shot "Question/Answer" raw-text prompts for base models
+# (examples/rl/environments/reasoning_gym). `config` holds each task's reasoning_gym difficulty
+# knobs; the defaults below are the easy end for early pretraining checkpoints.
+- agent_type: examples.rl.environments.reasoning_gym.reasoning_gym_agent.ReasoningGymAgent
+  agent_args:
+    tasks:
+      - name: basic_arithmetic
+        weight: 1.0
+        config: {min_terms: 2, max_terms: 2, min_digits: 1, max_digits: 2, operators: ["+", "-"], allow_parentheses: false, allow_negation: false}
+      - name: chain_sum
+        weight: 1.0
+        config: {min_terms: 2, max_terms: 3, min_digits: 1, max_digits: 1}
+      - name: leg_counting
+        weight: 0.5
+        config: {min_animals: 1, max_animals: 2, max_instances: 3}
+    num_shots: 3
+    format_reward: 0.0
+    # prompts_file: ${RG_PROMPTS_FILE}   # filter_pass_rate.py output (0 < pass@k < 1 prompts)
+  weight: 1.0
+  evaluation_only: false

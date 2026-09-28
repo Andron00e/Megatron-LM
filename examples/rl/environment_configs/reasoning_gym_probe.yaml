@@ -1,0 +1,19 @@
+# Pass-rate probe for reasoning_gym.yaml: run train_rl.py --perform-rl-step --skip-train with
+# --grpo-group-size k (e.g. 16) and no --grpo-filter-groups-with-same-reward. Every prompt is
+# visited once, in order, and its k rewards go to $RG_PROBE_OUTPUT; then
+#   python examples/rl/environments/reasoning_gym/filter_pass_rate.py $RG_PROBE_OUTPUT <out>.jsonl
+# keeps the prompts with 0 < pass rate < 1 (use them with prompts_file in reasoning_gym.yaml).
+- agent_type: examples.rl.environments.reasoning_gym.reasoning_gym_agent.ReasoningGymAgent
+  agent_args:
+    tasks:
+      - name: basic_arithmetic
+        config: {min_terms: 2, max_terms: 2, min_digits: 1, max_digits: 2, operators: ["+", "-"], allow_parentheses: false, allow_negation: false}
+      - name: chain_sum
+        config: {min_terms: 2, max_terms: 3, min_digits: 1, max_digits: 1}
+      - name: leg_counting
+        config: {min_animals: 1, max_animals: 2, max_instances: 3}
+    num_shots: 3
+    sequential: true
+    probe_output: ${RG_PROBE_OUTPUT}
+  weight: 1.0
+  evaluation_only: false
