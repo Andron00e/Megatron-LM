@@ -15,7 +15,12 @@ import torch
 
 from megatron.core.optimizer.ademamix import AdEMAMix
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.optimizer.mars import MARS, is_matrix_param, shampoo_shape_factor
+from megatron.core.optimizer.mars import (
+    MARS,
+    is_matrix_param,
+    marsm_scale_factor,
+    shampoo_shape_factor,
+)
 from megatron.core.optimizer.mu2mars import Mu2MARS
 
 TOL = dict(atol=1e-6, rtol=1e-6)
@@ -536,6 +541,193 @@ def test_unknown_mars_type_is_rejected():
         MARS([torch.nn.Parameter(torch.randn(4, 3, generator=g))], lr=1e-2, mars_type='mars-adam')
 
 
+# ---- mars_type mars-muon: MARS-M (arXiv:2510.21800, Algorithm 2) ----
+
+
+def ref_mars_muon_step(states, grads, step, lr, wd, beta1, eps, gamma, clip, betas_1d):
+    """MARS-M written from Algorithm 2: M_t = beta M_{t-1} + (1 - beta) Clip(C_t, clip), no bias
+    correction, then X_{t+1} = X_t - lr (0.2 sqrt(max(m, n)) NewtonSchulz(M_t) + wd X_t); 1-D
+    params on AdamW. The exact polar factor U V^T stands in for Newton-Schulz here, so the
+    reference returns per-matrix (m_t, U V^T) for the caller to compare directions against."""
+    out = {}
+    for idx, (st, grad) in enumerate(zip(states, grads)):
+        g = grad.flatten().double().tolist()
+        if st['ndim'] == 2:
+            c = corrected(st, g, beta1, gamma, clip)
+            for i in range(len(g)):
+                st['m'][i] = beta1 * st['m'][i] + (1.0 - beta1) * c[i]
+            m = torch.tensor(st['m'], dtype=torch.float64).view(grad.shape)
+            u, _, vh = torch.linalg.svd(m, full_matrices=False)
+            out[idx] = (m, u @ vh)
+            # p is not advanced here: the direction check below is what the update is held to.
+        else:
+            for i in range(len(g)):
+                ref_adamw_element(st, i, g[i], lr, wd, *betas_1d, eps, step)
+        st['lg'] = g
+    return out
+
+
+def assert_polar_aligned(update, polar, factor):
+    """update == factor * U S' V^T for the reference's U V^T and some positive diagonal S' (what
+    the quintic Newton-Schulz delivers, S' in roughly [0.7, 1.3]): then update @ polar^T / factor
+    = U S' U^T is symmetric positive definite and the singular values of update / factor are S'."""
+    a = update.double() @ polar.T / factor
+    torch.testing.assert_close(a, a.T, atol=1e-4, rtol=1e-4)
+    assert torch.linalg.eigvalsh((a + a.T) / 2).min() > 0.3
+    svals = torch.linalg.svdvals(update.double() / factor)
+    assert svals.min() > 0.5 and svals.max() < 1.5
+
+
+def test_mars_muon_matches_reference():
+    model = make_model()
+    params = list(model.parameters())
+    states = as_state(params)
+    lr, wd, eps, gamma, clip = 1e-3, 0.1, 1e-8, 0.025, 1.0
+    beta1, betas_1d = 0.95, (0.9, 0.95)
+    opt = MARS(params, lr=lr, betas=(beta1, 0.99), eps=eps, weight_decay=wd, gamma=gamma,
+               clip=clip, mars_type='mars-muon', betas_1d=betas_1d)
+    for step in range(1, 6):
+        grads = make_grads(model, seed=step)
+        before = [p.detach().clone() for p in params]
+        set_grads(params, grads)
+        opt.step()
+        refs = ref_mars_muon_step(states, grads, step, lr, wd, beta1, eps, gamma, clip, betas_1d)
+        for idx, (m, polar) in refs.items():
+            p = params[idx]
+            torch.testing.assert_close(opt.state[p]['exp_avg'].double(), m, **TOL)
+            update = (before[idx] - p.detach()) / lr - wd * before[idx]
+            assert_polar_aligned(update, polar, marsm_scale_factor(p))
+    for p, st in zip(params, states):
+        if p.ndim != 2:
+            torch.testing.assert_close(
+                p.detach().double().flatten(), torch.tensor(st['p'], dtype=torch.float64), **TOL
+            )
+
+
+def test_mars_muon_orthogonalizes_the_matrix_update():
+    """The 2-D update is Newton-Schulz's U S' V^T times 0.2 sqrt(max(d_out, d_in)), so its singular
+    values sit around that factor and its RMS around 0.2; shapes are preserved and 1-D params stay
+    on the reference's AdamW branch, bit-identical to mars-adamw's."""
+    g = torch.Generator().manual_seed(35)
+    tall = torch.nn.Parameter(torch.randn(8, 4, generator=g))
+    wide = torch.nn.Parameter(torch.randn(3, 9, generator=g))
+    vector = torch.nn.Parameter(torch.randn(6, generator=g))
+    params = [tall, wide, vector]
+    plain = [q.detach().clone().requires_grad_(True) for q in params]
+    lr = 1e-2
+    opt = MARS(params, lr=lr, weight_decay=0.0, mars_type='mars-muon')
+    ref = MARS(plain, lr=lr, weight_decay=0.0)
+    before = [p.detach().clone() for p in params]
+    grads = grads_like(params, seed=36)
+    set_grads(params, grads)
+    set_grads(plain, grads)
+    opt.step()
+    ref.step()
+    for p, b in zip(params[:2], before[:2]):
+        assert p.shape == b.shape
+        update = (b - p.detach()) / lr
+        assert torch.isfinite(update).all()
+        factor = marsm_scale_factor(p)
+        assert factor == 0.2 * math.sqrt(max(p.shape))
+        svals = torch.linalg.svdvals(update.double())
+        assert svals.min() > 0.5 * factor and svals.max() < 1.5 * factor
+        rms = update.double().norm() / math.sqrt(p.numel())
+        assert 0.5 * 0.2 < rms < 1.5 * 0.2
+    torch.testing.assert_close(vector.detach(), plain[2].detach(), **TOL)
+    assert not torch.allclose(tall.detach(), plain[0].detach())
+
+
+def test_mars_muon_update_rms_is_the_muon_arm_scale_at_600m_shapes():
+    """0.2 sqrt(max(d_out, d_in)) is --muon-scale-mode spectral times --muon-extra-scale-factor
+    0.2, the mu2 Muon arm's recipe: the matrix update leaves at RMS ~0.2 at every 600m-llama
+    shape (F137), where the bare factor is 32-75x."""
+    g = torch.Generator().manual_seed(37)
+    lr = 1e-3
+    for shape in [(1024, 1024), (2048, 1024), (5632, 1024), (1024, 2816)]:
+        p = torch.nn.Parameter(torch.randn(*shape, generator=g) * 0.02)
+        opt = MARS([p], lr=lr, weight_decay=0.0, mars_type='mars-muon')
+        p.grad = torch.randn(*shape, generator=g) * 1e-3
+        before = p.detach().clone()
+        opt.step()
+        rms = ((before - p.detach()) / lr).double().norm() / math.sqrt(p.numel())
+        assert 0.7 * 0.2 < rms < 1.3 * 0.2, (shape, rms)
+
+
+def test_mars_muon_expert_stack_matches_independent_experts():
+    stacked = expert_stack(size_out=6, size_in=4)
+    num_experts = stacked.shape[0]
+    singles = [torch.nn.Parameter(stacked.detach()[i].clone()) for i in range(num_experts)]
+    kwargs = dict(lr=1e-2, weight_decay=0.1, eps=1e-8, clip=0.5, mars_type='mars-muon')
+    opt = MARS([stacked], **kwargs)
+    refs = [MARS([s], **kwargs) for s in singles]
+    for step in range(1, 6):
+        grad = grads_like([stacked], seed=900 + step)[0]
+        stacked.grad = grad.clone()
+        opt.step()
+        for i, (single, ref) in enumerate(zip(singles, refs)):
+            single.grad = grad[i].clone()
+            ref.step()
+    assert torch.isfinite(stacked.detach()).all()
+    for i, single in enumerate(singles):
+        torch.testing.assert_close(stacked.detach()[i], single.detach(), **TOL)
+
+
+def test_mars_muon_is_deterministic():
+    model = make_model()
+    params = list(model.parameters())
+    twin = [p.detach().clone().requires_grad_(True) for p in params]
+    kwargs = dict(lr=1e-2, weight_decay=0.1, mars_type='mars-muon')
+    opt, opt_twin = MARS(params, **kwargs), MARS(twin, **kwargs)
+    for step in range(1, 6):
+        grads = make_grads(model, seed=1000 + step)
+        set_grads(params, grads)
+        set_grads(twin, grads)
+        opt.step()
+        opt_twin.step()
+    for p, q in zip(params, twin):
+        assert torch.equal(p.detach(), q.detach())
+        assert torch.equal(opt.state[p]['exp_avg'], opt_twin.state[q]['exp_avg'])
+
+
+def test_mars_muon_zero_gradient_is_finite():
+    """A zero momentum hits Newton-Schulz's 1e-7 pre-normalization, not a division by zero."""
+    model = make_model()
+    params = list(model.parameters())
+    before = [p.detach().clone() for p in params]
+    opt = MARS(params, lr=1e-2, weight_decay=0.0, mars_type='mars-muon')
+    set_grads(params, [torch.zeros_like(p) for p in params])
+    opt.step()
+    for p, b in zip(params, before):
+        assert torch.isfinite(p.detach()).all()
+        torch.testing.assert_close(p.detach(), b, **TOL)
+
+
+def test_mars_muon_state_dict_round_trip():
+    """F088/F092: the step and every declared state key survive save/load, on a matrix, an expert
+    stack and a vector alike."""
+    g = torch.Generator().manual_seed(38)
+    params = [
+        torch.nn.Parameter(torch.randn(5, 4, generator=g)),
+        expert_stack(),
+        torch.nn.Parameter(torch.randn(5, generator=g)),
+    ]
+    make_opt = lambda ps: MARS(ps, lr=1e-2, weight_decay=0.1, mars_type='mars-muon')
+    opt = make_opt(params)
+    for step in range(1, 4):
+        set_grads(params, grads_like(params, seed=step))
+        opt.step()
+    resumed = [p.detach().clone().requires_grad_(True) for p in params]
+    opt2 = make_opt(resumed)
+    opt2.load_state_dict(copy.deepcopy(opt.state_dict()))
+    for p, q in zip(params, resumed):
+        assert set(opt.state[p]) == set(opt2.state[q]) == {'step', 'exp_avg', 'exp_avg_sq',
+                                                            'last_grad'}
+        assert opt.state[p]['step'] == opt2.state[q]['step'] == 3
+        for key in ('exp_avg', 'exp_avg_sq', 'last_grad'):
+            torch.testing.assert_close(opt.state[p][key], opt2.state[q][key])
+    check_state_dict_round_trip(make_opt, params=params)
+
+
 # ---- --mars-muon-rms-target: Muon's per-matrix update RMS, on the 2-D group only ----
 
 
@@ -597,12 +789,13 @@ def test_muon_rms_target_is_per_expert(cls):
         torch.testing.assert_close(rms, torch.tensor(lr * target, dtype=torch.float64), **TOL)
 
 
-def test_muon_rms_target_is_rejected_with_shampoo():
-    """mars-shampoo already fixes its own update scale; two scalings would silently compose."""
+@pytest.mark.parametrize('mars_type', ['mars-shampoo', 'mars-muon'])
+def test_muon_rms_target_is_rejected_with_an_orthogonalizing_inner_step(mars_type):
+    """mars-shampoo and mars-muon fix their own update scale; two scalings would silently compose."""
     g = torch.Generator().manual_seed(34)
-    with pytest.raises(ValueError, match='mars-shampoo'):
+    with pytest.raises(ValueError, match=mars_type):
         MARS([torch.nn.Parameter(torch.randn(4, 3, generator=g))], lr=1e-2,
-             mars_type='mars-shampoo', muon_rms_target=0.2)
+             mars_type=mars_type, muon_rms_target=0.2)
 
 
 def expert_stack(num_experts=3, size_out=5, size_in=4, seed=11):

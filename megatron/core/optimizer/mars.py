@@ -6,7 +6,8 @@ Ported from Andron00e/Megatron-LM origin/muon (f3dfe32f1). Only the approximate 
 implemented: the exact one needs a second forward/backward on the same batch at the previous
 iterate, which train_step cannot provide. All three inner optimizers of the framework are
 here (mars_type: mars-adamw, mars-lion, mars-shampoo), written from the reference
-implementation's own update_fn.
+implementation's own update_fn, plus MARS-M (mars_type: mars-muon, arXiv:2510.21800), written
+from Algorithm 2 of that paper and the reference MARS_M/optimizers/mars_m.py.
 """
 
 # Copyright (c) 2024 Bytedance Ltd. and/or its affiliates
@@ -91,6 +92,17 @@ def shampoo_shape_factor(p):
     return max(1.0, p.shape[-2] / p.shape[-1]) ** 0.5
 
 
+def marsm_scale_factor(p):
+    """0.2 * sqrt(max(d_out, d_in)), the Moonlight factor MARS-M applies after orthogonalizing
+    (arXiv:2510.21800, Algorithm 2 line 7; `adjust_lr_for_muon` in the reference mars_m.py).
+
+    It is this tree's Muon recipe, `--muon-scale-mode spectral` times `--muon-extra-scale-factor
+    0.2`: a semi-orthogonal d_out x d_in matrix has RMS 1/sqrt(max(d_out, d_in)), so the update
+    leaves at RMS ~0.2 whatever the shape, like the Muon arm's and unlike an AdamW-type update.
+    """
+    return 0.2 * math.sqrt(max(p.shape[-2], p.shape[-1]))
+
+
 def muon_rms_scale(update, target):
     """Rescale each matrix's update to root-mean-square `target`, per expert for a stack.
 
@@ -138,8 +150,13 @@ def update_fn(
             update = newton_schulz(exp_avg.div(1.0 - beta1**step), eps=eps).mul_(
                 shampoo_shape_factor(p)
             )
+        elif mars_type == "mars-muon" and is_matrix:
+            # MARS-M orthogonalizes the raw momentum: no bias correction (Newton-Schulz is scale
+            # invariant up to its 1e-7 pre-normalization, which the reference keeps too).
+            update = newton_schulz(exp_avg).mul_(marsm_scale_factor(p))
         else:
-            # mars-adamw, and the 1-D params of mars-shampoo, which the reference keeps on AdamW.
+            # mars-adamw, and the 1-D params of mars-shampoo/mars-muon, which the reference keeps
+            # on AdamW.
             exp_avg_sq.mul_(beta2).addcmul_(c_t, c_t, value=1.0 - beta2)
             denom = adamw_denom(exp_avg_sq, beta1, beta2, step, eps)
             update = exp_avg.div(denom)
@@ -160,8 +177,10 @@ class MARS(torch.optim.Optimizer):
 
     ``mars_type`` picks the inner optimizer applied to the corrected gradient, exactly as in
     the reference implementation: ``mars-adamw``, ``mars-lion`` (the sign of the corrected
-    momentum, no second moment) or ``mars-shampoo`` (Newton-Schulz orthogonalization times
-    max(1, d_out/d_in)**0.5, with 1-D params still on AdamW).
+    momentum, no second moment), ``mars-shampoo`` (Newton-Schulz orthogonalization times
+    max(1, d_out/d_in)**0.5, with 1-D params still on AdamW) or ``mars-muon`` (MARS-M,
+    arXiv:2510.21800: Newton-Schulz orthogonalization of the corrected momentum times
+    0.2 * sqrt(max(d_out, d_in)), the Moonlight/Muon scale, with 1-D params still on AdamW).
     """
 
     def __init__(
@@ -187,12 +206,12 @@ class MARS(torch.optim.Optimizer):
             raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
         if not 0.0 <= betas[1] < 1.0:
             raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
-        assert mars_type in ["mars-adamw", "mars-lion", "mars-shampoo"], (
+        assert mars_type in ["mars-adamw", "mars-lion", "mars-shampoo", "mars-muon"], (
             "MARS type not supported"
         )
-        if mars_type == "mars-shampoo" and muon_rms_target is not None:
+        if mars_type in ("mars-shampoo", "mars-muon") and muon_rms_target is not None:
             raise ValueError(
-                "mars-shampoo already fixes the matrix update scale with its own "
+                f"{mars_type} already fixes the matrix update scale with its own "
                 "orthogonalization and shape factor; muon_rms_target would apply a second one."
             )
         defaults = dict(

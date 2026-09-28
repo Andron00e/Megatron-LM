@@ -3215,11 +3215,14 @@ def _add_training_args(parser):
                        help='Scale of the MARS variance-reduction term, '
                        'gamma * beta1 / (1 - beta1) * (g_t - g_{t-1}).')
     group.add_argument('--mars-type', type=str, default='mars-adamw',
-                       choices=['mars-adamw', 'mars-lion', 'mars-shampoo'],
+                       choices=['mars-adamw', 'mars-lion', 'mars-shampoo', 'mars-muon'],
                        help='Inner optimizer the MARS framework applies to the corrected '
                        'gradient c_t: mars-adamw, mars-lion (sign of the corrected momentum, no '
-                       'second moment) or mars-shampoo (Newton-Schulz orthogonalization times '
-                       'max(1, d_out/d_in)**0.5 on 2D/3D params, AdamW on 1D). '
+                       'second moment), mars-shampoo (Newton-Schulz orthogonalization times '
+                       'max(1, d_out/d_in)**0.5 on 2D/3D params, AdamW on 1D) or mars-muon '
+                       '(MARS-M, arXiv:2510.21800: Newton-Schulz orthogonalization of the '
+                       'corrected momentum times 0.2*sqrt(max(d_out, d_in)), i.e. Muon\'s '
+                       'spectral scale times 0.2, on 2D/3D params, AdamW on 1D). '
                        '--optimizer mu2mars ignores this flag.')
     group.add_argument('--mars-clip', type=float, default=1.0,
                        help='L2-norm clip on the MARS/Mu2MARS corrected gradient c_t, per '
@@ -3238,8 +3241,8 @@ def _add_training_args(parser):
                        '--muon-extra-scale-factor (0.2 here) at every shape, while an AdamW-type '
                        'update keeps whatever RMS its second moment gives it. Unset (default) '
                        'leaves the update alone. 1D/embedding/output params are never touched, '
-                       'and it is rejected with --mars-type mars-shampoo, which sets its own '
-                       'update scale.')
+                       'and it is rejected with --mars-type mars-shampoo and mars-muon, which '
+                       'set their own update scale.')
     group.add_argument('--mu2mars-beta1', type=float, default=0.025,
                        help='Inner EMA coefficient for Mu2MARS. With --mu2mars-gamma 1 this is '
                        'the STORM correction weight, not a momentum.')

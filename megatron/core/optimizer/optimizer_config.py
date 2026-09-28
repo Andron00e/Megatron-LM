@@ -492,7 +492,7 @@ class OptimizerConfig:
 
     mars_type: str = 'mars-adamw'
     """Inner optimizer the MARS framework applies to the corrected gradient: 'mars-adamw',
-    'mars-lion' or 'mars-shampoo'. Ignored by mu2mars."""
+    'mars-lion', 'mars-shampoo' or 'mars-muon' (MARS-M). Ignored by mu2mars."""
 
     mars_muon_rms_target: Optional[float] = None
     """RMS the matrix (2D / per-expert 3D) update of mars and mu2mars is rescaled to, mirroring
