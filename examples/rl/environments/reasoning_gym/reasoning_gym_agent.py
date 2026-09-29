@@ -59,7 +59,8 @@ class ReasoningGymAgent(RewardOnlyAgent):
         """
         Args:
             tasks: [{name, weight (default 1), config (reasoning_gym dataset kwargs, i.e. the
-                difficulty knobs)}]. Default: basic_arithmetic with its default config.
+                difficulty knobs), id (default: name; names problem ids, so one task can appear
+                at several difficulties)}]. Default: basic_arithmetic with its default config.
             size: Items per task in the training stream (and in the disjoint validation stream).
             seed: Base seed of the item streams.
             num_shots: Few-shot examples per prompt, from the task of the question.
@@ -95,6 +96,8 @@ class ReasoningGymAgent(RewardOnlyAgent):
                 for task in self.tasks
             ]
         self._weights = [float(task.get("weight", 1.0)) for task in self.tasks]
+        self._ids = [task.get("id", task["name"]) for task in self.tasks]
+        assert len(set(self._ids)) == len(self._ids), f"duplicate task ids {self._ids}"
         self._entries = None
         if prompts_file is not None:
             with open(os.path.expandvars(prompts_file)) as f:
@@ -105,7 +108,7 @@ class ReasoningGymAgent(RewardOnlyAgent):
 
     def _item(self, split: str, task_idx: int, idx: int) -> dict:
         entry = self._datasets[split][task_idx][idx]
-        entry["problem_id"] = f"{self.tasks[task_idx]['name']}:{split}:{idx}"
+        entry["problem_id"] = f"{self._ids[task_idx]}:{split}:{idx}"
         entry["task_idx"] = task_idx
         return entry
 
@@ -229,7 +232,7 @@ class ReasoningGymAgent(RewardOnlyAgent):
 
     def _probe_entry(self, problem_id: str) -> dict:
         name, split, idx = problem_id.rsplit(":", 2)
-        task_idx = [task["name"] for task in self.tasks].index(name)
+        task_idx = self._ids.index(name)
         entry = self._item(split, task_idx, int(idx))
         entry.pop("task_idx")
         return entry
