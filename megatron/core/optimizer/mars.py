@@ -153,14 +153,23 @@ def scale_update_to_weight_norm(update, weight_norm, update_norm):
 
 def sharded_norm_state(model_param, value, state_key, prefix):
     """dist-checkpointing hook (Float16OptimizerWithFloat16Params.sharded_state_dict): the recorded
-    norms are one scalar per matrix, not param-shaped, so they go into the checkpoint as objects
-    under the param's key. None sends every other key down the param-shaped path."""
+    norms are one scalar per matrix, not param-shaped, so they go into the checkpoint the way
+    MuonMD's flat gains do (md_decoupling.build_sharded_optimizer_state): a ShardedTensor that
+    drops the two matrix axes and keeps the param's prepended layer axis and its expert axis, so
+    the 16 layers sharing one key are told apart by global_offset (a ShardedObject with a fixed
+    (1,)/(0,) shape collides, F142). None sends every other key down the param-shaped path."""
     if state_key not in NORM_STATE_KEYS:
         return None
-    from megatron.core.dist_checkpointing.mapping import ShardedObject
+    from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
+    from megatron.core.dist_checkpointing.optimizer import make_sharded_optimizer_tensor_for_axes
 
-    return ShardedObject(
-        f"{prefix}.{model_param.key}", value, (1,), (0,), replica_id=model_param.replica_id
+    from .md_decoupling import _build_md_gain_factory, _md_gain_retained_axes
+
+    key = f"{prefix}.{model_param.key}"
+    if isinstance(model_param, ShardedTensorFactory):
+        return _build_md_gain_factory(model_param, value, "flat", key)
+    return make_sharded_optimizer_tensor_for_axes(
+        model_param, value, key, _md_gain_retained_axes("flat", len(model_param.local_shape))
     )
 
 

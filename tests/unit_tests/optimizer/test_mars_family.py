@@ -1461,30 +1461,39 @@ def test_collect_norm_stats_reports_per_shape_means():
 
 
 @pytest.mark.parametrize('cls', [MARS, Mu2MARS])
-def test_sharded_norm_state_checkpoints_the_norms_as_objects(cls):
+def test_sharded_norm_state_projects_the_norms_like_muonmd_flat_gains(cls):
     """Under --ckpt-format torch_dist every state key goes through optim_state_to_sharding_state,
     which asserts a param-shaped tensor unless the optimizer's hook claims the key: the recorded
-    norms become ShardedObjects under the param's key and replica id, everything else falls
-    through to the param-shaped path."""
-    from megatron.core.dist_checkpointing.mapping import ShardedObject
+    norms become ShardedTensors that keep the param's prepended layer axis and drop the two
+    matrix axes (MuonMD's flat gain, md_decoupling.build_sharded_optimizer_state), everything
+    else falls through to the param-shaped path."""
+    from megatron.core.dist_checkpointing.mapping import ShardedTensor
 
-    model_param = SimpleNamespace(key='decoder.layers.0.mlp.linear_fc1.weight', replica_id=(0, 0, 3))
+    p = torch.nn.Parameter(torch.randn(4, 3))
+    model_param = ShardedTensor.from_rank_offsets(
+        'decoder.layers.mlp.linear_fc1.weight', p.detach(), (0, 5, 16), replica_id=(0, 0, 3),
+        prepend_axis_num=1,
+    )
     value = torch.tensor(2.5)
     for key in NORM_STATE_KEYS:
-        obj = cls.build_sharded_optimizer_state(model_param, value, key, f'optimizer.state.{key}')
-        assert isinstance(obj, ShardedObject)
-        assert obj.key == f'optimizer.state.{key}.{model_param.key}'
-        assert obj.data is value
-        assert obj.replica_id == (0, 0, 3)
-        assert (obj.global_shape, obj.global_offset) == ((1,), (0,))
+        sh_ten = cls.build_sharded_optimizer_state(
+            model_param, value, key, f'optimizer.state.{key}'
+        )
+        assert isinstance(sh_ten, ShardedTensor)
+        assert sh_ten.key == f'optimizer.state.{key}.{model_param.key}'
+        assert sh_ten.data is value
+        assert sh_ten.replica_id == (0, 0, 3)
+        assert (sh_ten.global_shape, sh_ten.global_offset) == ((16,), (5,))
+        assert (sh_ten.local_shape, sh_ten.prepend_axis_num) == ((), 1)
     for key in ('exp_avg', 'exp_avg_sq', 'last_grad', 'mu_avg', 'w'):
         assert cls.build_sharded_optimizer_state(model_param, value, key, 'p') is None
 
 
 def test_weight_norm_state_goes_through_optim_state_to_sharding_state():
     """The real torch_dist conversion: param-shaped keys become ShardedTensors that follow the
-    model param, the norms become ShardedObjects, and nothing trips the shape assertion."""
-    from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
+    model param, the norms become projected ShardedTensors, and nothing trips the shape
+    assertion."""
+    from megatron.core.dist_checkpointing.mapping import ShardedTensor
     from megatron.core.dist_checkpointing.optimizer import optim_state_to_sharding_state
 
     params = [expert_stack(), torch.nn.Parameter(torch.randn(4, 3)),
@@ -1505,11 +1514,175 @@ def test_weight_norm_state_goes_through_optim_state_to_sharding_state():
         expected = {'exp_avg', 'exp_avg_sq', 'last_grad'} | (
             set(NORM_STATE_KEYS) if is_matrix_param(p) else set())
         assert set(sharded) == expected
-        for key in set(NORM_STATE_KEYS) & set(sharded):
-            assert isinstance(sharded[key], ShardedObject)
+        for key in expected:
+            assert isinstance(sharded[key], ShardedTensor)
             assert sharded[key].key == f'optimizer.state.{key}.param{i}'
             assert sharded[key].replica_id == (0, 0, 1)
-            assert sharded[key].data.shape == p.shape[:-2]
+        for key in set(NORM_STATE_KEYS) & set(sharded):
+            assert sharded[key].local_shape == p.shape[:-2]
+            assert sharded[key].global_shape == p.shape[:-2]
         for key in expected - set(NORM_STATE_KEYS):
-            assert isinstance(sharded[key], ShardedTensor)
             assert sharded[key].local_shape == tuple(p.shape)
+
+
+# ---- F142: the norms of 16 layers share one key and must not collide at save ----
+#
+# A transformer layer's ShardedTensor key carries no layer index; TransformerBlock prepends a
+# layer axis (0, layer, num_layers) instead, so anything derived from the key alone collides
+# across layers. Only validate_sharding_integrity, which runs inside dist_checkpointing.save
+# (save_preprocess), sees that, and only with more than one layer. The torch_dist writer itself
+# is CUDA-bound, so the round trip below exchanges tensors by (key, global_offset), which is the
+# identity the writer stores them under; the F141 GPU protocol remains the acceptance test.
+
+NUM_LAYERS = 16
+LAYER_PARAM_KINDS = ('2d', '2d-swiglu', 'expert-stack')
+
+
+@pytest.fixture
+def single_rank_gloo():
+    import torch.distributed as dist
+
+    dist.init_process_group('gloo', store=dist.HashStore(), rank=0, world_size=1)
+    try:
+        yield
+    finally:
+        dist.destroy_process_group()
+
+
+def layer_slots(kind):
+    """(layer, expert chunk) per param: one matrix per layer, or, for the expert stack, the two
+    EP ranks' stacks of one layer held side by side so one rank covers the whole expert axis."""
+    chunks = (0, 1) if kind == 'expert-stack' else (None,)
+    return [(layer, chunk) for layer in range(NUM_LAYERS) for chunk in chunks]
+
+
+def layer_params(kind, scale, seed=42):
+    """Layer i scaled by scale * (i + 1) so every layer's recorded norm is distinct."""
+    g = torch.Generator().manual_seed(seed)
+    shape = (3, 8, 4) if kind == 'expert-stack' else (8, 4)
+    return [
+        torch.nn.Parameter(torch.randn(shape, generator=g) * (scale * (layer + 1)))
+        for layer, _ in layer_slots(kind)
+    ]
+
+
+def layer_sharded_param(kind, p, layer, chunk):
+    from megatron.core.dist_checkpointing.mapping import ShardedTensor
+    from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
+
+    layer_axis = (0, layer, NUM_LAYERS)
+    if kind == 'expert-stack':
+        return ShardedTensor.from_rank_offsets(
+            'decoder.layers.mlp.experts.weight1', p.detach(), layer_axis, (1, chunk, 2),
+            replica_id=(0, 0, 0), prepend_axis_num=1,
+        )
+    sh_ten = ShardedTensor.from_rank_offsets(
+        'decoder.layers.mlp.linear_fc1.weight', p.detach(), layer_axis, replica_id=(0, 0, 0),
+        prepend_axis_num=1,
+    )
+    return apply_swiglu_sharded_factory(sh_ten, (layer_axis,)) if kind == '2d-swiglu' else sh_ten
+
+
+def stepped_layer_stack(kind, scale, hook=MARS.build_sharded_optimizer_state):
+    """A MARS optimizer over NUM_LAYERS layers, one step in, and its sharded state dict as
+    Float16OptimizerWithFloat16Params.sharded_state_dict builds it."""
+    from megatron.core.dist_checkpointing.optimizer import optim_state_to_sharding_state
+
+    params = layer_params(kind, scale)
+    opt = MARS(params, lr=1e-2, weight_decay=0.1, normalize_update_to_weight_norm=True)
+    set_grads(params, grads_like(params, seed=7))
+    opt.step()
+    state_dict = opt.state_dict()
+    id_map = {
+        i: layer_sharded_param(kind, p, *slot)
+        for i, (p, slot) in enumerate(zip(params, layer_slots(kind)))
+    }
+    optim_state_to_sharding_state(state_dict, id_map, exclude_keys='step', state_sharding_fn=hook)
+    return opt, params, state_dict
+
+
+def sharded_leaves(sharded_state_dict):
+    from megatron.core.dist_checkpointing.dict_utils import nested_values
+    from megatron.core.dist_checkpointing.mapping import ShardedTensor
+
+    return [t for t in nested_values(sharded_state_dict) if isinstance(t, ShardedTensor)]
+
+
+@pytest.mark.parametrize('kind', LAYER_PARAM_KINDS)
+def test_norm_state_of_every_layer_passes_validate_sharding_integrity(single_rank_gloo, kind):
+    from megatron.core.dist_checkpointing.state_dict_utils import save_preprocess
+
+    _, params, state_dict = stepped_layer_stack(kind, scale=1.0)
+    sharded_part, _ = save_preprocess(state_dict, validate_access_integrity=True)
+    slots = layer_slots(kind)
+    experts = params[0].shape[0] if kind == 'expert-stack' else None
+    for key in NORM_STATE_KEYS:
+        prefix = f'optimizer.state.{key}.'
+        norms = [t for t in sharded_leaves(sharded_part) if t.key.startswith(prefix)]
+        assert len(norms) == len(slots)
+        assert len({(t.key, t.global_offset) for t in norms}) == len(slots)
+        if experts is None:
+            assert {t.global_shape for t in norms} == {(NUM_LAYERS,)}
+            assert sorted(t.global_offset for t in norms) == [(layer,) for layer, _ in slots]
+        else:
+            assert {t.global_shape for t in norms} == {(NUM_LAYERS, 2 * experts)}
+            assert sorted(t.global_offset for t in norms) == [
+                (layer, chunk * experts) for layer, chunk in slots
+            ]
+
+
+@pytest.mark.parametrize('kind', ('2d', '2d-swiglu'))
+def test_layer_collision_is_what_validate_sharding_integrity_rejects(single_rank_gloo, kind):
+    """The test above has teeth: the pre-fix hook, a ShardedObject keyed on the layer-less
+    param key with a fixed (1,)/(0,) shape, fails save_preprocess with the exact error the
+    600m smokes 3552482/3552483 died with."""
+    from megatron.core.dist_checkpointing.core import CheckpointingException
+    from megatron.core.dist_checkpointing.mapping import ShardedObject
+    from megatron.core.dist_checkpointing.state_dict_utils import save_preprocess
+
+    def pre_fix_hook(model_param, value, state_key, prefix):
+        if state_key not in NORM_STATE_KEYS:
+            return None
+        return ShardedObject(
+            f'{prefix}.{model_param.key}', value, (1,), (0,), replica_id=model_param.replica_id
+        )
+
+    _, _, state_dict = stepped_layer_stack(kind, scale=1.0, hook=pre_fix_hook)
+    with pytest.raises(CheckpointingException, match='Duplicate ShardedObject keys'):
+        save_preprocess(state_dict, validate_access_integrity=True)
+
+
+@pytest.mark.parametrize('kind', LAYER_PARAM_KINDS)
+def test_norm_state_round_trip_lands_on_the_right_layer(single_rank_gloo, kind):
+    """Save side and load side are two optimizers over different weights, so a norm that came
+    back merely present, or re-measured from the resumed weights (F092), is told apart from
+    the one recorded by the same layer of the saving run."""
+    from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace, merge
+    from megatron.core.dist_checkpointing.mapping import ShardedTensor, apply_factory_merges
+    from megatron.core.dist_checkpointing.state_dict_utils import load_preprocess, save_preprocess
+    from megatron.core.dist_checkpointing.utils import extract_sharded_base
+
+    saved_opt, saved_params, saved_state_dict = stepped_layer_stack(kind, scale=1.0)
+    sharded_part, common = save_preprocess(saved_state_dict, validate_access_integrity=True)
+    store = {(t.key, t.global_offset): t.data.clone() for t in sharded_leaves(sharded_part)}
+
+    opt, params, state_dict = stepped_layer_stack(kind, scale=0.1)
+    requested, nonpersistent, factories = load_preprocess(state_dict)
+    requested, _ = extract_sharded_base(requested)
+    missing = {(t.key, t.global_offset) for t in sharded_leaves(requested)} - set(store)
+    assert not missing
+    dict_list_map_inplace(
+        lambda t: store[(t.key, t.global_offset)] if isinstance(t, ShardedTensor) else t, requested
+    )
+    loaded = merge(copy.deepcopy(common), nonpersistent)
+    merge(loaded, requested)
+    loaded = apply_factory_merges(loaded, factories)
+    opt.load_state_dict(loaded)
+
+    for i, (p, q) in enumerate(zip(saved_params, params)):
+        recorded = saved_opt.state[p]['weight_norm']
+        assert torch.equal(opt.state[q]['weight_norm'], recorded)
+        assert torch.equal(opt.state[q]['update_norm'], saved_opt.state[p]['update_norm'])
+        assert not torch.allclose(opt.state[q]['weight_norm'], q.detach().flatten(-2).norm(dim=-1))
+        other = saved_params[(i + 1) % len(saved_params)]
+        assert not torch.allclose(recorded, saved_opt.state[other]['weight_norm'])
